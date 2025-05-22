@@ -1,11 +1,32 @@
 #!/bin/sh
+
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-# Source this file to setup the test suite environment
-BASEDIR=$(pwd)
-export BASEDIR
-TOOLS=$(pwd)/utils
-export TOOLS
-SUITES=$(pwd)/suites
-export SUITES
+# Dynamically walk up to find the repo root containing both suites/ and utils/
+INIT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$INIT_DIR"
+
+while [ "$ROOT_DIR" != "/" ]; do
+    if [ -d "$ROOT_DIR/suites" ] && [ -d "$ROOT_DIR/utils" ]; then
+        break
+    fi
+    ROOT_DIR=$(dirname "$ROOT_DIR")
+done
+
+# Validate discovery
+if [ ! -d "$ROOT_DIR/suites" ] || [ ! -d "$ROOT_DIR/utils" ]; then
+    echo "[ERROR] Could not detect testkit root from init_env!" >&2
+    exit 1
+fi
+
+export ROOT_DIR
+export TOOLS="$ROOT_DIR/utils"
+export __RUNNER_SUITES_DIR="$ROOT_DIR/suites"
+export __RUNNER_UTILS_BIN_DIR="$ROOT_DIR/common"
+
+echo "[INFO] init_env loaded."
+echo "[INFO] ROOT_DIR=$ROOT_DIR"
+echo "[INFO] TOOLS=$TOOLS"
+echo "[INFO] __RUNNER_SUITES_DIR=$__RUNNER_SUITES_DIR"
+echo "[INFO] __RUNNER_UTILS_BIN_DIR=$__RUNNER_UTILS_BIN_DIR"
