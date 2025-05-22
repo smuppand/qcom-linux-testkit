@@ -1,0 +1,4 @@
+# Enabled kernel selftest suites
+timers
+futex
+watchdog
