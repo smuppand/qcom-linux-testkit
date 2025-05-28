@@ -1,0 +1,20 @@
+# enabled_tests.list for ARM64 selftests (mixed folder and binary)
+# Example: run only thread_test and settime_test in timers/
+# The line 'timers' will run all standard tests in timers/
+# The lines 'timers/thread_test' and 'timers/settime_test' run these binaries explicitly, even if not covered by timers/ directory run
+breakpoints
+capabilities
+cgroup
+clone3
+core
+timers
+timers/thread_test
+timers/settime_test
+futex
+kcmp
+net/nettest
+pidfd
+proc
+seccomp
+user
+vm
