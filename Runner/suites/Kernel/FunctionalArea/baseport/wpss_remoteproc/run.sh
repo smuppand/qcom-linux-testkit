@@ -39,59 +39,37 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
 
-log_info "=== Detecting and validating WPSS remoteproc instance ==="
- 
-log_info "Looking for remoteproc device exposing WPSS..."
-wpss_path=""
-for node in /sys/class/remoteproc/remoteproc*; do
-    [ -f "$node/name" ] || continue
-    name=$(cat "$node/name" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    if echo "$name" | grep -qi "wpss"; then
-        wpss_path="$node"
-        break
-    fi
-done
- 
-if [ -z "$wpss_path" ]; then
-    log_skip "WPSS remoteproc node not found"
+rproc_path=$(find_remoteproc_node_by_name wpss)
+if [ -z "$rproc_path" ]; then
+    log_skip "Remoteproc for wpss not found"
     echo "$TESTNAME SKIP" > "$res_file"
     exit 0
 fi
- 
-log_info "Found WPSS remoteproc node at: $wpss_path"
-firmware=$(cat "$wpss_path/firmware" 2>/dev/null)
-log_info "WPSS firmware: $firmware"
- 
-# Capture state before any change
-orig_state=$(cat "$wpss_path/state" 2>/dev/null)
-log_info "Original state: $orig_state"
- 
-log_info "Attempting to stop WPSS..."
-if echo stop > "$wpss_path/state" 2>/dev/null; then
-    sleep 1
-    new_state=$(cat "$wpss_path/state" 2>/dev/null)
-    if [ "$new_state" != "offline" ]; then
-        log_warn "Expected offline state after stop, got: $new_state"
-    fi
-else
-    log_warn "Could not stop WPSS; may already be offline"
-fi
- 
-log_info "Attempting to start WPSS..."
-if echo start > "$wpss_path/state" 2>/dev/null; then
-    sleep 1
-    final_state=$(cat "$wpss_path/state" 2>/dev/null)
-    if [ "$final_state" = "running" ]; then
-        log_pass "WPSS remoteproc started successfully"
-        echo "$TESTNAME PASS" > "$res_file"
-    else
-        log_fail "WPSS remoteproc failed to start, state: $final_state"
-        echo "$TESTNAME FAIL" > "$res_file"
-        exit 1
-    fi
-else
-    log_fail "Failed to write 'start' to $wpss_path/state"
+log_info "Using remoteproc node: $rproc_path"
+
+if ! check_remoteproc_state "$rproc_path" "running"; then
+    log_fail "wpss not in 'running' state initially"
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
+
+log_info "Stopping wpss..."
+if ! stop_remoteproc "$rproc_path"; then
+    log_fail "Failed to stop wpss"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 1
+else
+    log_pass "wpss stopped successfully"
+fi
+
+log_info "Starting wpss..."
+if ! start_remoteproc "$rproc_path"; then
+    log_fail "Failed to start wpss"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 1
+else
+    log_pass "wpss started successfully"
+    echo "$TESTNAME PASS" > "$res_file"
+fi
+
+log_info "------------------- Completed $TESTNAME -------------------"

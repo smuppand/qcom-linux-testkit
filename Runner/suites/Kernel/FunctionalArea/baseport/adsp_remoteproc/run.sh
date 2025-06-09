@@ -39,53 +39,37 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
 
-# Get the firmware output and find the position of adsp
-log_info "Checking for firmware"
-firmware_output=$(cat /sys/class/remoteproc/remoteproc*/firmware)
-adsp_position=$(echo "$firmware_output" | grep -n "adsp" | cut -d: -f1)
+rproc_path=$(find_remoteproc_node_by_name adsp)
+if [ -z "$rproc_path" ]; then
+    log_skip "Remoteproc for adsp not found"
+    echo "$TESTNAME SKIP" > "$res_file"
+    exit 0
+fi
+log_info "Using remoteproc node: $rproc_path"
 
-# Adjust the position to match the remoteproc numbering (starting from 0)
-remoteproc_number=$((adsp_position - 1))
-
-# Construct the remoteproc path based on the adsp position
-remoteproc_path="/sys/class/remoteproc/remoteproc${remoteproc_number}"
-log_info "Remoteproc node is $remoteproc_path"
-# Execute command 1 and check if the output is "running"
-state1=$(cat ${remoteproc_path}/state)
-
-if [ "$state1" != "running" ]; then
-    log_fail "$TESTNAME : Test Failed"
-    echo "$TESTNAME FAIL" > "$test_path/$TESTNAME.res"
+if ! check_remoteproc_state "$rproc_path" "running"; then
+    log_fail "adsp not in 'running' state initially"
+    echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
 
-# Execute command 2 (no output expected)
-log_info "Stopping remoteproc"
-echo stop > ${remoteproc_path}/state
-
-# Execute command 3 and check if the output is "offline"
-state3=$(cat ${remoteproc_path}/state)
-if [ "$state3" != "offline" ]; then
-    log_fail "adsp stop failed"
-    echo "$TESTNAME FAIL" > "$test_path/$TESTNAME.res"
+log_info "Stopping adsp..."
+if ! stop_remoteproc "$rproc_path"; then
+    log_fail "Failed to stop adsp"
+    echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 else
-    log_pass "adsp stop successful"
+    log_pass "adsp stopped successfully"
 fi
-log_info "Restarting remoteproc"
-# Execute command 4 (no output expected)
-echo start > ${remoteproc_path}/state
 
-# Execute command 5 and check if the output is "running"
-state5=$(cat ${remoteproc_path}/state)
-if [ "$state5" != "running" ]; then
-    log_fail "adsp start failed"
-    echo "$TESTNAME FAIL" > "$res_file" 
+log_info "Starting adsp..."
+if ! start_remoteproc "$rproc_path"; then
+    log_fail "Failed to start adsp"
+    echo "$TESTNAME FAIL" > "$res_file"
     exit 1
+else
+    log_pass "adsp started successfully"
+    echo "$TESTNAME PASS" > "$res_file"
 fi
 
-# If all checks pass, print "PASS"
-echo "adsp PASS"
-log_pass "adsp PASS"
-echo "$TESTNAME PASS" > "$res_file"
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
+log_info "------------------- Completed $TESTNAME -------------------"

@@ -39,51 +39,37 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
 
-# Get the firmware output and find the position of cdsp
-log_info "Get the firmware output and find the position of cdsp"
-firmware_output=$(cat /sys/class/remoteproc/remoteproc*/firmware)
-cdsp_position=$(echo "$firmware_output" | grep -n "cdsp" | cut -d: -f1)
-
-# Adjust the position to match the remoteproc numbering (starting from 0)
-remoteproc_number=$((cdsp_position - 1))
-
-# Construct the remoteproc path based on the cdsp position
-remoteproc_path="/sys/class/remoteproc/remoteproc${remoteproc_number}"
-
-# Execute command 1 and check if the output is "running"
-state1=$(cat ${remoteproc_path}/state)
-if [ "$state1" != "running" ]; then
-    log_fail "$TESTNAME : Test Failed"
-    echo "$TESTNAME FAIL" > $test_path/$TESTNAME.res
-    exit 1
+rproc_path=$(find_remoteproc_node_by_name cdsp)
+if [ -z "$rproc_path" ]; then
+    log_skip "Remoteproc for cdsp not found"
+    echo "$TESTNAME SKIP" > "$res_file"
+    exit 0
 fi
+log_info "Using remoteproc node: $rproc_path"
 
-# Execute command 2 (no output expected)
-echo stop > ${remoteproc_path}/state
-
-# Execute command 3 and check if the output is "offline"
-state3=$(cat ${remoteproc_path}/state)
-if [ "$state3" != "offline" ]; then
-    log_fail "cdsp stop failed"
-    echo "$TESTNAME FAIL" > $test_path/$TESTNAME.res
-    exit 1
-else
-    log_pass "cdsp stop successful"
-fi
-log_info "Restarting remoteproc"
-# Execute command 4 (no output expected)
-echo start > ${remoteproc_path}/state
-
-# Execute command 5 and check if the output is "running"
-state5=$(cat ${remoteproc_path}/state)
-if [ "$state5" != "running" ]; then
-    log_fail "cdsp start failed"
+if ! check_remoteproc_state "$rproc_path" "running"; then
+    log_fail "cdsp not in 'running' state initially"
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
 
-# If all checks pass, print "PASS"
-echo "cdsp PASS"
-log_pass "cdsp PASS"
-echo "$TESTNAME PASS" > "$res_file" 
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
+log_info "Stopping cdsp..."
+if ! stop_remoteproc "$rproc_path"; then
+    log_fail "Failed to stop cdsp"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 1
+else
+    log_pass "cdsp stopped successfully"
+fi
+
+log_info "Starting cdsp..."
+if ! start_remoteproc "$rproc_path"; then
+    log_fail "Failed to start cdsp"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 1
+else
+    log_pass "cdsp started successfully"
+    echo "$TESTNAME PASS" > "$res_file"
+fi
+
+log_info "------------------- Completed $TESTNAME -------------------"

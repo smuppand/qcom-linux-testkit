@@ -382,3 +382,82 @@ weston_start() {
     fi
 }
 
+# retry_command - Retry a given command a number of times with delay between attempts
+# Arguments:
+# $1 - Command to execute (as string)
+# $2 - Number of retries
+# $3 - Delay (in seconds) between retries
+# Returns:
+# 0 if command succeeds, 1 if all retries fail
+retry_command() {
+    cmd="$1"
+    retries="$2"
+    delay="$3"
+    attempt=0
+    while [ "$attempt" -lt "$retries" ]; do
+        if eval "$cmd"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        log_warn "Retry $attempt/$retries failed: $cmd"
+        sleep "$delay"
+    done
+    return 1
+}
+
+# find_remoteproc_node_by_name - Locate the remoteproc node for a given firmware name
+# Arguments:
+# $1 - Substring to match in /sys/class/remoteproc/remoteproc*/name
+# Output:
+# Prints the full path of the matching remoteproc node (first match)
+# Returns:
+# 0 if found, 1 if not found
+find_remoteproc_node_by_name() {
+    name="$1"
+    for node in /sys/class/remoteproc/remoteproc*; do
+        [ -f "$node/name" ] || continue
+        node_name=$(tr '[:upper:]' '[:lower:]' < "$node/name" 2>/dev/null)
+        if echo "$node_name" | grep -qi "$name"; then
+            echo "$node"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# check_remoteproc_state - Check if a remoteproc node is in the expected state
+# Arguments:
+# $1 - Full path to the remoteproc node
+# $2 - Expected state ("running", "offline", etc.)
+# Returns:
+# 0 if current state matches expected, 1 otherwise
+check_remoteproc_state() {
+    rproc_path="$1"
+    expected_state="$2"
+    current_state=$(cat "$rproc_path/state" 2>/dev/null)
+    [ "$current_state" = "$expected_state" ]
+}
+
+# stop_remoteproc - Attempt to stop a remoteproc and verify it reached offline state
+# Arguments:
+# $1 - Full path to the remoteproc node
+# Returns:
+# 0 if stopped successfully, 1 otherwise
+stop_remoteproc() {
+    rproc_path="$1"
+    echo stop > "$rproc_path/state" 2>/dev/null
+    sleep 1
+    check_remoteproc_state "$rproc_path" "offline"
+}
+
+# start_remoteproc - Attempt to start a remoteproc and verify it reached running state
+# Arguments:
+# $1 - Full path to the remoteproc node
+# Returns:
+# 0 if started successfully, 1 otherwise
+start_remoteproc() {
+    rproc_path="$1"
+    echo start > "$rproc_path/state" 2>/dev/null
+    sleep 1
+    check_remoteproc_state "$rproc_path" "running"
+}
