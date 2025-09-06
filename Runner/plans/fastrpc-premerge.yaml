@@ -15,5 +15,5 @@ run:
     steps:
         - cd Runner
         - $PWD/suites/Multimedia/CDSP/fastrpc_test/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/CDSP/fastrpc_test/fastrpc_test.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/CDSP/fastrpc_test/fastrpc_test.res || true
         - $PWD/utils/result_parse.sh

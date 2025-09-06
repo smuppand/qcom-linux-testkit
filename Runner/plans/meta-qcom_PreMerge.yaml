@@ -15,27 +15,27 @@ run:
     steps:
         - cd Runner
         - $PWD/suites/Connectivity/Ethernet/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
         - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
         - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
         - $PWD/suites/Kernel/Baseport/IPA/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/IPA/IPA.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Kernel/Baseport/IPA/IPA.res || true
         - $PWD/suites/Kernel/Baseport/pinctrl/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
         - $PWD/suites/Kernel/Baseport/remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
         - $PWD/suites/Kernel/Baseport/wpss_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
         - $PWD/suites/Multimedia/Graphics/KMSCube/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/KMSCube/KMSCube.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/Graphics/KMSCube/KMSCube.res || true
         - $PWD/suites/Multimedia/Graphics/weston-simple-egl/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/weston-simple-egl/weston-simple-egl.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/Graphics/weston-simple-egl/weston-simple-egl.res || true
         - $PWD/suites/Multimedia/Audio/AudioPlayback/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true
         - $PWD/suites/Multimedia/Audio/AudioRecord/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
         - $PWD/suites/Connectivity/Bluetooth/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/Bluetooth.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Connectivity/Bluetooth/Bluetooth.res || true
         - $PWD/utils/result_parse.sh

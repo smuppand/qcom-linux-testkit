@@ -15,8 +15,8 @@ run:
     steps:
         - cd Runner
         - $PWD/suites/Multimedia/Audio/AudioPlayback/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true  
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true  
         - $PWD/suites/Multimedia/Audio/AudioRecord/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
+        - $PWD/utils/send_to_lava.py -f $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
         - $PWD/utils/result_parse.sh
 
