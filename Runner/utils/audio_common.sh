@@ -316,7 +316,7 @@ setup_overlay_audio_environment() {
     
     # Restart PipeWire
     log_info "Restarting pipewire service..."
-    if ! audio_exec_with_timeout 15s systemctl restart pipewire 2>/dev/null; then
+    if ! audio_exec_with_timeout 30s systemctl restart pipewire 2>/dev/null; then
         log_fail "Failed to restart pipewire service"
         return 1
     fi
