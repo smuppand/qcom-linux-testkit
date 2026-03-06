@@ -111,7 +111,10 @@ for param in VIDEO_DURATION RUNTIMESEC VIDEO_FRAMERATE VIDEO_GST_DEBUG GST_DEBUG
 done
 
 cleanup() {
-  pkill -x gst-launch-1.0 >/dev/null 2>&1 || true
+  # Best-effort: try to kill only children first; fall back to name-based kill
+  if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
+    pkill -x gst-launch-1.0 >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup INT TERM EXIT
 

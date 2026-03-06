@@ -130,7 +130,10 @@ for param in AUDIO_DURATION AUDIO_GST_DEBUG GST_DEBUG_LEVEL; do
 done
 
 cleanup() {
-  pkill -x gst-launch-1.0 >/dev/null 2>&1 || true
+  # Best-effort: try to kill only children first; fall back to name-based kill
+  if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
+    pkill -x gst-launch-1.0 >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup INT TERM EXIT
 
@@ -358,6 +361,14 @@ run_playback_test() {
     return 1
   fi
 
+  # Check if file has minimum content (same threshold as recording: 1000 bytes)
+  file_size="$(gstreamer_file_size_bytes "$input_file")"
+  if [ "$file_size" -le 1000 ]; then
+    log_warn "$testname: SKIP - recorded file too small: $file_size bytes (recording likely failed)"
+    skip_count=$((skip_count + 1))
+    return 1
+  fi
+
   test_log="$OUTDIR/${testname}.log"
   : >"$test_log"
 
@@ -499,6 +510,14 @@ run_playback_pulsesrc_test() {
 
   if [ ! -f "$input_file" ]; then
     log_warn "$testname: SKIP - recorded file not found: $input_file (run pulsesrc record first)"
+    skip_count=$((skip_count + 1))
+    return 1
+  fi
+
+  # Check if file has minimum content (same threshold as recording: 1000 bytes)
+  file_size="$(gstreamer_file_size_bytes "$input_file")"
+  if [ "$file_size" -le 1000 ]; then
+    log_warn "$testname: SKIP - recorded file too small: $file_size bytes (pulsesrc recording likely failed)"
     skip_count=$((skip_count + 1))
     return 1
   fi
