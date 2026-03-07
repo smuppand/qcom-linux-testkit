@@ -2,7 +2,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 #
-# Audio Record/Playback Validation using GStreamer (8 tests total)
+# Audio Record/Playback Validation using GStreamer (10 tests total)
 #
 # Test Sequence:
 #   ENCODE PHASE (4 tests):
@@ -11,17 +11,20 @@
 #     3. record_pulsesrc_wav - pulsesrc HW → wavenc → file
 #     4. record_pulsesrc_flac- pulsesrc HW → flacenc → file
 #
-#   DECODE PHASE (4 tests):
+#   DECODE PHASE (6 tests):
 #     5. playback_wav             - file → wavparse → pulsesink
 #     6. playback_flac            - file → flacparse → flacdec → pulsesink
 #     7. playback_pulsesrc_wav    - file → wavparse → pulsesink
 #     8. playback_pulsesrc_flac   - file → flacparse → flacdec → pulsesink
+#     9. playback_sample_ogg      - file → oggdemux → vorbisdec → pulsesink
+#    10. playback_sample_mp3      - file → mpegaudioparse → mpg123audiodec → pulsesink
 #
 # Features:
 #   - audiotestsrc: Synthetic audio generation (uses num-buffers for duration control)
 #   - pulsesrc: Hardware audio capture (uses timeout for duration control)
 #   - pulsesink: Audio playback
-#   - Formats: WAV (wavenc/wavparse), FLAC (flacenc/flacparse/flacdec)
+#   - Formats: WAV (wavenc/wavparse), FLAC (flacenc/flacparse/flacdec), OGG (oggdemux/vorbisdec), MP3 (mpegaudioparse/mpg123audiodec)
+#   - Test file provisioning via URL download or local path
 #   - Duration control via AUDIO_DURATION env var (default: 10 seconds)
 #
 # Logs everything to console and local log files.
@@ -96,6 +99,8 @@ testMode="${AUDIO_TEST_MODE:-all}"
 formatList="${AUDIO_FORMATS:-wav,flac}"
 duration="${AUDIO_DURATION:-${RUNTIMESEC:-10}}"
 gstDebugLevel="${AUDIO_GST_DEBUG:-${GST_DEBUG_LEVEL:-2}}"
+clipUrl="${AUDIO_CLIP_URL:-https://github.com/qualcomm-linux/qcom-linux-testkit/releases/download/GST-Audio-Files-v1.0/audio_clips_gst.tar.gz}"
+clipPath="${AUDIO_CLIP_PATH:-}"
 
 # Calculate num_buffers based on duration
 # Formula: num_buffers = (sample_rate * duration) / samples_per_buffer
@@ -188,6 +193,26 @@ while [ $# -gt 0 ]; do
         exit 0
       fi
       [ -n "$2" ] && gstDebugLevel="$2"
+      shift 2
+      ;;
+
+    --clip-url)
+      if [ $# -lt 2 ] || [ "${2#--}" != "$2" ]; then
+        log_warn "Missing/invalid value for --clip-url"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+      fi
+      [ -n "$2" ] && clipUrl="$2"
+      shift 2
+      ;;
+
+    --clip-path)
+      if [ $# -lt 2 ] || [ "${2#--}" != "$2" ]; then
+        log_warn "Missing/invalid value for --clip-path"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+      fi
+      [ -n "$2" ] && clipPath="$2"
       shift 2
       ;;
 
@@ -563,10 +588,151 @@ run_playback_pulsesrc_test() {
   fi
 }
 
+# -------------------- Test file playback test function (OGG/MP3) --------------------
+run_playback_ogg_mp3_test() {
+  fmt="$1"
+  
+  testname="playback_sample_${fmt}"
+  log_info "=========================================="
+  log_info "Running: $testname"
+  log_info "=========================================="
+  
+  # Determine input file based on format
+  case "$fmt" in
+    ogg)
+      input_file="$OUTDIR/sample_audio.ogg"
+      ;;
+    mp3)
+      input_file="$OUTDIR/sample_audio.mp3"
+      ;;
+    *)
+      log_warn "$testname: SKIP - unsupported format: $fmt"
+      skip_count=$((skip_count + 1))
+      return 1
+      ;;
+  esac
+  
+  if [ ! -f "$input_file" ]; then
+    log_warn "$testname: SKIP - Test file not found: $input_file"
+    skip_count=$((skip_count + 1))
+    return 1
+  fi
+  
+  # Check if file has minimum content
+  file_size="$(gstreamer_file_size_bytes "$input_file")"
+  if [ "$file_size" -le 1000 ]; then
+    log_warn "$testname: SKIP - Test file too small: $file_size bytes"
+    skip_count=$((skip_count + 1))
+    return 1
+  fi
+  
+  test_log="$OUTDIR/${testname}.log"
+  : >"$test_log"
+  
+  pipeline="$(gstreamer_build_audio_playback_pipeline "$fmt" "$input_file")"
+  
+  if [ -z "$pipeline" ]; then
+    log_fail "$testname: FAIL (could not build playback pipeline - format not supported or elements missing)"
+    fail_count=$((fail_count + 1))
+    return 1
+  fi
+  
+  log_info "Pipeline: $pipeline"
+  
+  # Run playback
+  if gstreamer_run_gstlaunch_timeout "$((duration + 10))" "$pipeline" >>"$test_log" 2>&1; then
+    gstRc=0
+  else
+    gstRc=$?
+  fi
+  
+  log_info "Playback exit code: $gstRc"
+  
+  # Check for GStreamer errors in log
+  if ! gstreamer_validate_log "$test_log" "$testname"; then
+    log_fail "$testname: FAIL (GStreamer errors detected)"
+    fail_count=$((fail_count + 1))
+    return 1
+  fi
+  
+  # Check for successful completion
+  if [ "$gstRc" -eq 0 ] || [ "$gstRc" -eq 124 ] || [ "$gstRc" -eq 143 ]; then
+    log_pass "$testname: PASS"
+    pass_count=$((pass_count + 1))
+    return 0
+  else
+    log_fail "$testname: FAIL (rc=$gstRc)"
+    fail_count=$((fail_count + 1))
+    return 1
+  fi
+}
+
 # -------------------- GStreamer debug capture --------------------
 export GST_DEBUG_NO_COLOR=1
 export GST_DEBUG="$gstDebugLevel"
 export GST_DEBUG_FILE="$GST_LOG"
+
+# -------------------- Test file provisioning (OGG/MP3) --------------------
+provision_test_files() {
+  log_info "=========================================="
+  log_info "TEST FILE PROVISIONING"
+  log_info "=========================================="
+  
+  sample_ogg="$OUTDIR/sample_audio.ogg"
+  sample_mp3="$OUTDIR/sample_audio.mp3"
+  
+  # Check if Test files already exist
+  if [ -f "$sample_ogg" ] && [ -f "$sample_mp3" ]; then
+    log_info "Test files already exist"
+  else
+    # Try to get Test files from provided path or URL
+    if [ -n "$clipPath" ]; then
+      log_info "Attempting to get Test files from local path: $clipPath"
+      if [ -f "$clipPath/sample_audio.ogg" ]; then
+        cp "$clipPath/sample_audio.ogg" "$sample_ogg" 2>/dev/null || true
+        log_info "Sample OGG file copied from local path"
+      fi
+      if [ -f "$clipPath/sample_audio.mp3" ]; then
+        cp "$clipPath/sample_audio.mp3" "$sample_mp3" 2>/dev/null || true
+        log_info "Sample MP3 file copied from local path"
+      fi
+    fi
+    
+    # If not found locally, try URL download
+    if [ ! -f "$sample_ogg" ] || [ ! -f "$sample_mp3" ]; then
+      log_info "Test files not found locally; attempting download from URL..."
+      if extract_tar_from_url "$clipUrl" "$OUTDIR"; then
+        log_pass "Test files downloaded and extracted successfully"
+      else
+        log_warn "Test file download failed (offline or URL issue)"
+      fi
+    fi
+  fi
+  
+  # Check what we have
+  have_ogg=0
+  have_mp3=0
+  
+  if [ -f "$sample_ogg" ]; then
+    size=$(gstreamer_file_size_bytes "$sample_ogg")
+    if [ "$size" -gt 1000 ]; then
+      have_ogg=1
+      log_info "OGG Test file available (size: $size bytes)"
+    fi
+  fi
+  
+  if [ -f "$sample_mp3" ]; then
+    size=$(gstreamer_file_size_bytes "$sample_mp3")
+    if [ "$size" -gt 1000 ]; then
+      have_mp3=1
+      log_info "MP3 Test file available (size: $size bytes)"
+    fi
+  fi
+  
+  if [ "$have_ogg" -eq 0 ] && [ "$have_mp3" -eq 0 ]; then
+    log_warn "No Test files (OGG/MP3) available for playback tests"
+  fi
+}
 
 # -------------------- Main test execution --------------------
 log_info "Starting audio record/playback tests..."
@@ -578,6 +744,9 @@ if ! check_required_elements; then
   exit 0
 fi
 log_info "Required GStreamer elements verified"
+
+# Provision Test files for OGG/MP3 playback tests
+provision_test_files
 
 # Parse format list
 formats=$(printf '%s' "$formatList" | tr ',' ' ')
@@ -621,6 +790,13 @@ if [ "$testMode" = "all" ] || [ "$testMode" = "playback" ]; then
   for fmt in $formats; do
     total_tests=$((total_tests + 1))
     run_playback_pulsesrc_test "$fmt" || true
+  done
+  
+  # 5. Playback Test files (2 tests: ogg, mp3)
+  log_info "Playing back Test files (OGG/MP3)..."
+  for fmt in ogg mp3; do
+    total_tests=$((total_tests + 1))
+    run_playback_ogg_mp3_test "$fmt" || true
   done
 fi
 

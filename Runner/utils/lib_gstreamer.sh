@@ -527,25 +527,34 @@ gstreamer_build_audio_record_pipeline() {
 
 # gstreamer_build_audio_playback_pipeline <format> <input_file>
 # Builds audio playback pipeline using pulsesink
-# Supports: wav, flac formats
+# Supports: wav, flac, ogg, mp3 formats
 # Prints: pipeline string or empty if format not supported
 gstreamer_build_audio_playback_pipeline() {
-  fmt="$1"
-  input_file="$2"
+  _fmt="$1"
+  _input_file="$2"
 
-  case "$fmt" in
+  case "$_fmt" in
     wav)
-      printf '%s\n' "filesrc location=${input_file} ! wavparse ! audioconvert ! pulsesink volume=10"
+      printf '%s\n' "filesrc location=${_input_file} ! wavparse ! audioconvert ! pulsesink volume=10"
+      return 0
       ;;
     flac)
-      printf '%s\n' "filesrc location=${input_file} ! flacparse ! flacdec ! pulsesink volume=10"
+      printf '%s\n' "filesrc location=${_input_file} ! flacparse ! flacdec ! audioconvert ! pulsesink volume=10"
+      return 0
+      ;;
+    ogg)
+      printf '%s\n' "filesrc location=${_input_file} ! oggdemux ! vorbisdec ! audioconvert ! pulsesink volume=10"
+      return 0
+      ;;
+    mp3)
+      printf '%s\n' "filesrc location=${_input_file} ! mpegaudioparse ! mpg123audiodec ! audioconvert ! pulsesink volume=10"
+      return 0
       ;;
     *)
       printf '%s\n' ""
       return 1
       ;;
   esac
-  return 0
 }
 
 # -------------------- GStreamer error log checker --------------------
