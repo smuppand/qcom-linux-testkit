@@ -11,29 +11,44 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        shell: sh
+
     steps:
       - name: Checkout source
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install ShellCheck from apt
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck=0.9.0-1
+          shellcheck --version
 
       - name: Run ShellCheck on changed .sh files in PR
         if: github.event_name == 'pull_request'
         run: |
-          echo "Checking only changed shell files in PR..."
-          git fetch origin ${{ github.base_ref }}
-          FILES=$(git diff --diff-filter=d --name-only origin/${{ github.base_ref }} -- '*.sh')
+          set -eu
+
+          BASE_BRANCH="${{ github.base_ref }}"
+          git fetch origin "${BASE_BRANCH}" --depth=1
+
+          MERGE_BASE="$(git merge-base HEAD "origin/${BASE_BRANCH}")"
+          FILES="$(git diff --diff-filter=d --name-only "${MERGE_BASE}"...HEAD -- '*.sh')"
+
           if [ -n "$FILES" ]; then
-            echo "$FILES" | tr '\n' '\0' | xargs -0 -r shellcheck -S warning -e SC1091,SC2230,SC3043
+            echo "Checking changed shell files:"
+            printf '%s\n' "$FILES"
+            printf '%s\n' "$FILES" | tr '\n' '\0' | xargs -0 -r shellcheck -s sh -e SC1091,SC2230,SC3043
           else
             echo "No shell files to lint."
           fi
 
-      - name: Run ShellCheck on all .sh files (main or manual trigger)
+      - name: Run ShellCheck on all .sh files (push/manual)
         if: github.event_name != 'pull_request'
         run: |
+          set -eu
           echo "Linting all shell files in repository..."
-          find . -type f -name '*.sh' -print0 | xargs -0 -r shellcheck -S warning -e SC1091,SC2230,SC3043
+          find . -type f -name '*.sh' -print0 | xargs -0 -r shellcheck -s sh -e SC1091,SC2230,SC3043
