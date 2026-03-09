@@ -51,11 +51,6 @@ RECORDED_DIR="$OUTDIR/recorded"
 mkdir -p "$OUTDIR" "$DMESG_DIR" "$RECORDED_DIR" >/dev/null 2>&1 || true
 : >"$RES_FILE"
 : >"$GST_LOG"
-
-SCRIPT_DIR="$(
-  cd "$(dirname "$0")" || exit 1
-  pwd
-)"
  
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
@@ -66,8 +61,6 @@ while [ "$SEARCH" != "/" ]; do
   fi
   SEARCH=$(dirname "$SEARCH")
 done
-
-RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
 
 if [ -z "${INIT_ENV:-}" ]; then
   echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
@@ -217,7 +210,76 @@ while [ $# -gt 0 ]; do
       ;;
 
     -h|--help)
-      echo "$TESTNAME SKIP" >"$RES_FILE"
+      cat <<EOF
+Usage: $0 [OPTIONS]
+
+Audio Record/Playback Validation using GStreamer
+
+OPTIONS:
+  --mode <all|record|playback>
+                        Test mode (default: all)
+                        - all: Run both record and playback tests
+                        - record: Run only recording tests
+                        - playback: Run only playback tests
+
+  --formats <format1,format2,...>
+                        Comma-separated list of audio formats to test
+                        (default: wav,flac)
+                        Supported: wav, flac
+
+  --duration <seconds>  Duration for recording/playback in seconds
+                        (default: 10)
+
+  --gst-debug <level>   GStreamer debug level (1-9)
+                        (default: 2)
+
+  --clip-url <url>      URL to download test audio files (OGG/MP3)
+                        (default: GitHub release URL)
+
+  --clip-path <path>    Local path to test audio files
+                        (overrides --clip-url if files exist)
+
+  -h, --help            Display this help message
+
+ENVIRONMENT VARIABLES:
+  AUDIO_TEST_MODE       Same as --mode
+  AUDIO_FORMATS         Same as --formats
+  AUDIO_DURATION        Same as --duration
+  AUDIO_GST_DEBUG       Same as --gst-debug
+  AUDIO_CLIP_URL        Same as --clip-url
+  AUDIO_CLIP_PATH       Same as --clip-path
+  GST_DEBUG_LEVEL       Alternative to AUDIO_GST_DEBUG
+  RUNTIMESEC            Alternative to AUDIO_DURATION
+
+EXAMPLES:
+  # Run all tests with default settings
+  $0
+
+  # Run only recording tests for 5 seconds
+  $0 --mode record --duration 5
+
+  # Test only WAV format
+  $0 --formats wav
+
+  # Use local test files
+  $0 --clip-path /path/to/audio/files
+
+TEST SEQUENCE:
+  ENCODE PHASE (4 tests):
+    1. record_wav          - audiotestsrc → wavenc → file
+    2. record_flac         - audiotestsrc → flacenc → file
+    3. record_pulsesrc_wav - pulsesrc HW → wavenc → file
+    4. record_pulsesrc_flac- pulsesrc HW → flacenc → file
+
+  DECODE PHASE (6 tests):
+    5. playback_wav             - file → wavparse → pulsesink
+    6. playback_flac            - file → flacparse → flacdec → pulsesink
+    7. playback_pulsesrc_wav    - file → wavparse → pulsesink
+    8. playback_pulsesrc_flac   - file → flacparse → flacdec → pulsesink
+    9. playback_sample_ogg      - file → oggdemux → vorbisdec → pulsesink
+   10. playback_sample_mp3      - file → mpegaudioparse → mpg123audiodec → pulsesink
+
+EOF
       exit 0
       ;;
 
@@ -423,8 +485,8 @@ run_playback_test() {
     return 1
   fi
 
-  # Check for successful completion (rc=0 or timeout rc which means it played to end)
-  if [ "$gstRc" -eq 0 ] || [ "$gstRc" -eq 124 ] || [ "$gstRc" -eq 143 ]; then
+  # Check for successful completion
+  if [ "$gstRc" -eq 0 ]; then
     log_pass "$testname: PASS"
     pass_count=$((pass_count + 1))
     return 0
@@ -576,8 +638,8 @@ run_playback_pulsesrc_test() {
     return 1
   fi
 
-  # Check for successful completion (rc=0 or timeout rc which means it played to end)
-  if [ "$gstRc" -eq 0 ] || [ "$gstRc" -eq 124 ] || [ "$gstRc" -eq 143 ]; then
+  # Check for successful completion
+  if [ "$gstRc" -eq 0 ]; then
     log_pass "$testname: PASS"
     pass_count=$((pass_count + 1))
     return 0
@@ -824,8 +886,7 @@ fi
 log_info "=========================================="
 log_info "TEST SUMMARY"
 log_info "=========================================="
-actual_total=$((pass_count + fail_count + skip_count))
-log_info "Total testcases: $actual_total"
+log_info "Total testcases: $total_tests"
 log_info "Passed: $pass_count"
 log_info "Failed: $fail_count"
 log_info "Skipped: $skip_count"
@@ -834,16 +895,16 @@ log_info "Skipped: $skip_count"
 if [ "$fail_count" -eq 0 ] && [ "$pass_count" -gt 0 ]; then
   result="PASS"
   if [ "$skip_count" -gt 0 ]; then
-    reason="No failures (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $actual_total)"
+    reason="No failures (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $total_tests)"
   else
-    reason="All tests passed ($pass_count/$actual_total)"
+    reason="All tests passed ($pass_count/$total_tests)"
   fi
 elif [ "$fail_count" -gt 0 ]; then
   result="FAIL"
-  reason="Some tests failed (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $actual_total)"
+  reason="Some tests failed (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $total_tests)"
 else
   result="SKIP"
-  reason="No tests passed (skipped: $skip_count, total: $actual_total)"
+  reason="No tests passed (skipped: $skip_count, total: $total_tests)"
 fi
 
 case "$result" in

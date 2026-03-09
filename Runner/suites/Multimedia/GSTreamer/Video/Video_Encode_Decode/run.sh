@@ -23,11 +23,6 @@ ENCODED_DIR="$OUTDIR/encoded"
 mkdir -p "$OUTDIR" "$DMESG_DIR" "$ENCODED_DIR" >/dev/null 2>&1 || true
 : >"$RES_FILE"
 : >"$GST_LOG"
-
-SCRIPT_DIR="$(
-  cd "$(dirname "$0")" || exit 1
-  pwd
-)"
  
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
@@ -38,8 +33,6 @@ while [ "$SEARCH" != "/" ]; do
   fi
   SEARCH=$(dirname "$SEARCH")
 done
- 
-RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
  
 if [ -z "${INIT_ENV:-}" ]; then
   echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
@@ -245,7 +238,81 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -h|--help)
-      echo "$TESTNAME SKIP" >"$RES_FILE"
+      cat <<EOF
+Usage: $0 [OPTIONS]
+
+Video Encode/Decode Validation using GStreamer with V4L2 hardware accelerated codecs
+
+OPTIONS:
+  --mode <all|encode|decode>
+                        Test mode (default: all)
+                        - all: Run both encode and decode tests
+                        - encode: Run only encoding tests
+                        - decode: Run only decoding tests
+
+  --codecs <codec1,codec2,...>
+                        Comma-separated list of codecs to test
+                        (default: h264,h265,vp9)
+                        Supported: h264, h265, vp9
+
+  --resolutions <res1,res2,...>
+                        Comma-separated list of resolutions to test
+                        (default: 480p)
+                        Supported: 480p, 720p, 1080p, 4k
+
+  --duration <seconds>  Duration for encoding/decoding in seconds
+                        (default: 30)
+
+  --framerate <fps>     Framerate for video encoding
+                        (default: 30)
+
+  --stack <auto|upstream|downstream>
+                        Video stack to use
+                        (default: auto)
+
+  --gst-debug <level>   GStreamer debug level (1-9)
+                        (default: 2)
+
+  --clip-url <url>      URL to download test video files (VP9)
+                        (default: GitHub release URL)
+
+  --clip-path <path>    Local path to test video files
+                        (overrides --clip-url if files exist)
+
+  -h, --help            Display this help message
+
+ENVIRONMENT VARIABLES:
+  VIDEO_TEST_MODE       Same as --mode
+  VIDEO_CODECS          Same as --codecs
+  VIDEO_RESOLUTIONS     Same as --resolutions
+  VIDEO_DURATION        Same as --duration
+  VIDEO_FRAMERATE       Same as --framerate
+  VIDEO_STACK           Same as --stack
+  VIDEO_GST_DEBUG       Same as --gst-debug
+  VIDEO_CLIP_URL        Same as --clip-url
+  VIDEO_CLIP_PATH       Same as --clip-path
+  GST_DEBUG_LEVEL       Alternative to VIDEO_GST_DEBUG
+  RUNTIMESEC            Alternative to VIDEO_DURATION
+
+EXAMPLES:
+  # Run all tests with default settings
+  $0
+
+  # Run only encoding tests for H.264 at 720p
+  $0 --mode encode --codecs h264 --resolutions 720p
+
+  # Test multiple codecs and resolutions
+  $0 --codecs h264,h265 --resolutions 480p,720p
+
+  # Use upstream video stack
+  $0 --stack upstream
+
+SUPPORTED CODECS:
+  - h264: H.264/AVC encoding and decoding (v4l2h264enc, v4l2h264dec)
+  - h265: H.265/HEVC encoding and decoding (v4l2h265enc, v4l2h265dec)
+  - vp9:  VP9 decoding only (v4l2vp9dec) - uses pre-recorded WebM clip
+
+EOF
       exit 0
       ;;
     *)
@@ -630,9 +697,7 @@ fi
 log_info "=========================================="
 log_info "TEST SUMMARY"
 log_info "=========================================="
-# Calculate actual total for display (sum of pass/fail/skip)
-actual_total=$((pass_count + fail_count + skip_count))
-log_info "Total testcases: $actual_total"
+log_info "Total testcases: $total_tests"
 log_info "Passed: $pass_count"
 log_info "Failed: $fail_count"
 log_info "Skipped: $skip_count"
@@ -641,16 +706,16 @@ log_info "Skipped: $skip_count"
 if [ "$fail_count" -eq 0 ] && [ "$pass_count" -gt 0 ]; then
   result="PASS"
   if [ "$skip_count" -gt 0 ]; then
-    reason="No failures (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $actual_total)"
+    reason="No failures (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $total_tests)"
   else
-    reason="All tests passed ($pass_count/$actual_total)"
+    reason="All tests passed ($pass_count/$total_tests)"
   fi
 elif [ "$fail_count" -gt 0 ]; then
   result="FAIL"
-  reason="Some tests failed (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $actual_total)"
+  reason="Some tests failed (passed: $pass_count, failed: $fail_count, skipped: $skip_count, total: $total_tests)"
 else
   result="SKIP"
-  reason="No tests passed (skipped: $skip_count, total: $actual_total)"
+  reason="No tests passed (skipped: $skip_count, total: $total_tests)"
 fi
 
 case "$result" in

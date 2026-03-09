@@ -525,6 +525,35 @@ gstreamer_build_audio_record_pipeline() {
   return 0
 }
 
+
+# -------------------- Playback pipeline builder (backend-aware) --------------------
+# gstreamer_build_playback_pipeline <backend> <format> <file> <capsStrOrEmpty> <alsadev>
+gstreamer_build_playback_pipeline() {
+  backend="$1"
+  format="$2"
+  file="$3"
+  capsStr="$4"
+  alsadev="$5"
+
+  [ -n "$alsadev" ] || alsadev="default"
+
+  dec="$(gstreamer_pick_decode_chain "$format")"
+  sinkElem="$(gstreamer_pick_sink_element "$backend" "$alsadev")"
+  if [ -z "$sinkElem" ]; then
+    printf '%s\n' ""
+    return 0
+  fi
+
+  if [ -n "$capsStr" ]; then
+    printf '%s\n' "filesrc location=${file} ! ${dec} ! audioconvert ! audioresample ! ${capsStr} ! ${sinkElem}"
+    return 0
+  fi
+
+  printf '%s\n' "filesrc location=${file} ! ${dec} ! audioconvert ! audioresample ! ${sinkElem}"
+  return 0
+}
+
+
 # gstreamer_build_audio_playback_pipeline <format> <input_file>
 # Builds audio playback pipeline using pulsesink
 # Supports: wav, flac, ogg, mp3 formats

@@ -23,4 +23,4 @@ run:
     - cd Runner/suites/Multimedia/GSTreamer/Audio/Audio_Record_Playback/
     - export AUDIO_TEST_MODE AUDIO_FORMATS AUDIO_DURATION AUDIO_GST_DEBUG
     - ./run.sh --mode "${AUDIO_TEST_MODE}" --formats "${AUDIO_FORMATS}" --duration "${AUDIO_DURATION}" --gst-debug "${AUDIO_GST_DEBUG}" || true
-    - $REPO_PATH/Runner/utils/send-to-lava.sh Audio_Record_Playback.res || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Audio_Record_Playback.res

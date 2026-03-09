@@ -38,8 +38,6 @@ while [ "$SEARCH" != "/" ]; do
   SEARCH=$(dirname "$SEARCH")
 done
  
-RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
- 
 if [ -z "${INIT_ENV:-}" ]; then
   echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
   echo "$TESTNAME SKIP" >"$RES_FILE" 2>/dev/null || true

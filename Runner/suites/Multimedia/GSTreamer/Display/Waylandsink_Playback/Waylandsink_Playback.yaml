@@ -25,4 +25,4 @@ run:
     - cd Runner/suites/Multimedia/GSTreamer/Display/Waylandsink_Playback/
     - export VIDEO_DURATION VIDEO_PATTERN VIDEO_WIDTH VIDEO_HEIGHT VIDEO_FRAMERATE VIDEO_GST_DEBUG
     - ./run.sh --resolution "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" --pattern "${VIDEO_PATTERN}" --duration "${VIDEO_DURATION}" --framerate "${VIDEO_FRAMERATE}" --gst-debug "${VIDEO_GST_DEBUG}" || true
-    - $REPO_PATH/Runner/utils/send-to-lava.sh Waylandsink_Playback.res || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Waylandsink_Playback.res
