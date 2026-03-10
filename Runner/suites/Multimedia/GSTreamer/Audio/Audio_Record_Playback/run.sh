@@ -127,6 +127,7 @@ for param in AUDIO_DURATION AUDIO_GST_DEBUG GST_DEBUG_LEVEL; do
   fi
 done
 
+# shellcheck disable=SC2317
 cleanup() {
   # Best-effort: try to kill only children first; fall back to name-based kill
   if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
@@ -718,7 +719,7 @@ run_playback_ogg_mp3_test() {
   fi
   
   # Check for successful completion
-  if [ "$gstRc" -eq 0 ] || [ "$gstRc" -eq 124 ] || [ "$gstRc" -eq 143 ]; then
+  if [ "$gstRc" -eq 0 ]; then
     log_pass "$testname: PASS"
     pass_count=$((pass_count + 1))
     return 0
@@ -769,9 +770,10 @@ provision_test_files() {
         log_warn "Test file download failed (offline or URL issue)"
       fi
     fi
+    
   fi
   
-  # Check what we have
+  # Check what we have AFTER all provisioning attempts
   have_ogg=0
   have_mp3=0
   
@@ -791,6 +793,7 @@ provision_test_files() {
     fi
   fi
   
+  # Only warn if BOTH files are missing after all attempts
   if [ "$have_ogg" -eq 0 ] && [ "$have_mp3" -eq 0 ]; then
     log_warn "No Test files (OGG/MP3) available for playback tests"
   fi

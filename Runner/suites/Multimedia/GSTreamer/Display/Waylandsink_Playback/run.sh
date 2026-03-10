@@ -92,6 +92,7 @@ height="${VIDEO_HEIGHT:-1080}"
 framerate="${VIDEO_FRAMERATE:-30}"
 gstDebugLevel="${VIDEO_GST_DEBUG:-${GST_DEBUG_LEVEL:-2}}"
 
+# shellcheck disable=SC2317
 cleanup() {
   # Best-effort: try to kill only children first; fall back to name-based kill
   if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then

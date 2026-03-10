@@ -58,7 +58,7 @@ At a high level, the test:
 
 ## Test Cases
 
-By default, the test runs **8 test cases** with 10 second duration:
+By default, the test runs **10 test cases** with 10 second duration:
 
 ### ENCODE PHASE (4 tests)
 
@@ -70,7 +70,7 @@ By default, the test runs **8 test cases** with 10 second duration:
 3. **record_pulsesrc_wav** - Record WAV format using pulsesrc → audioconvert → wavenc
 4. **record_pulsesrc_flac** - Record FLAC format using pulsesrc → audioconvert → flacenc
 
-### DECODE PHASE (4 tests)
+### DECODE PHASE (6 tests)
 
 #### Playback Tests - audiotestsrc recordings
 5. **playback_wav** - Playback WAV file using filesrc → wavparse → audioconvert → pulsesink
@@ -80,7 +80,13 @@ By default, the test runs **8 test cases** with 10 second duration:
 7. **playback_pulsesrc_wav** - Playback WAV file using filesrc → wavparse → audioconvert → pulsesink
 8. **playback_pulsesrc_flac** - Playback FLAC file using filesrc → flacparse → flacdec → pulsesink
 
-**Total: 8 test cases** (4 encode + 4 decode)
+#### Playback Tests - External Test Files (OGG/MP3)
+9. **playback_sample_ogg** - Playback OGG file using filesrc → oggdemux → vorbisdec → pulsesink
+10. **playback_sample_mp3** - Playback MP3 file using filesrc → mpegaudioparse → mpg123audiodec → pulsesink
+
+**Total: 10 test cases** (4 encode + 6 decode)
+
+**Note:** OGG/MP3 playback tests require external test files (downloaded from URL or provided via `--clip-path`). If test files are not available, these tests will be skipped.
 
 ---
 
@@ -88,12 +94,14 @@ By default, the test runs **8 test cases** with 10 second duration:
 
 ### PASS
 - **Recording**: Output file is created and has size > 1000 bytes
-- **Playback**: Pipeline completes successfully (exit code 0, 124, or 143)
+- **Playback**: Pipeline completes successfully with exit code 0 (clean completion)
+  - **Note**: Timeout (exit code 124) or termination (exit code 143) are treated as **FAIL** for controlled-duration recordings
+  - This ensures playback completed successfully rather than being interrupted
 - **Overall**: At least one test passes and no tests fail
 
 ### FAIL
 - **Recording**: No output file created or file size too small
-- **Playback**: Pipeline fails or GStreamer errors detected
+- **Playback**: Pipeline exits with non-zero code (including timeout 124 or termination 143) or GStreamer errors detected
 - **Overall**: One or more tests fail
 
 ### SKIP
