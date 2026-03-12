@@ -3055,6 +3055,87 @@ check_systemd_services() {
     return 0
 }
 
+# Check whether a systemd service/unit exists on the target.
+systemd_service_exists() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl cat "$svc" >/dev/null 2>&1
+}
+
+# Check whether a systemd service/unit is currently active.
+systemd_service_is_active() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl is-active --quiet "$svc"
+}
+
+# Start a systemd service/unit quietly.
+systemd_service_start_safe() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl start "$svc" >/dev/null 2>&1
+}
+
+# Stop a systemd service/unit quietly.
+systemd_service_stop_safe() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl stop "$svc" >/dev/null 2>&1
+}
+
+# Log status-only output for a systemd service/unit to the given logfile.
+systemd_service_status_log() {
+    label="$1"
+    logfile="$2"
+    svc="$3"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    {
+        echo "===== $label ====="
+        systemctl --no-pager --full --lines=0 status "$svc" 2>&1
+        echo "=============================="
+    } | tee -a "$logfile"
+}
+
+# Log stdout journal entries for a systemd service/unit since a given timestamp.
+systemd_service_stdout_since() {
+    label="$1"
+    logfile="$2"
+    since_ts="$3"
+    svc="$4"
+
+    if ! command -v journalctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    {
+        echo "===== $label ====="
+        journalctl --no-pager -q \
+            _SYSTEMD_UNIT="$svc" \
+            _TRANSPORT=stdout \
+            --since "$since_ts" 2>&1
+        echo "=============================="
+    } | tee -a "$logfile"
+}
 # Ensure udhcpc default.script exists, create if missing
 ensure_udhcpc_script() {
     udhcpc_dir="/usr/share/udhcpc"
@@ -4557,4 +4638,52 @@ get_pid() {
 
     log_info "Process '$process_name' not found."
     return 1
+}
+
+# Returns the size of the given file in bytes using stat, with fallbacks for portability across systems.
+# Prints 0 and returns failure if the file does not exist or the size cannot be determined reliably.
+file_size_bytes() {
+  file_path="$1"
+  size=""
+
+  [ -f "$file_path" ] || {
+    printf '%s\n' "0"
+    return 1
+  }
+
+  # Prefer GNU stat first.
+  size="$(stat -c %s "$file_path" 2>/dev/null || true)"
+  case "$size" in
+    ''|*[!0-9]*)
+      size=""
+      ;;
+  esac
+
+  # Fall back to BSD stat only if GNU form did not work.
+  if [ -z "$size" ]; then
+    size="$(stat -f %z "$file_path" 2>/dev/null || true)"
+    case "$size" in
+      ''|*[!0-9]*)
+        size=""
+        ;;
+    esac
+  fi
+
+  # Final portable fallback.
+  if [ -z "$size" ]; then
+    size="$(wc -c <"$file_path" 2>/dev/null | awk '{print $1}')"
+    case "$size" in
+      ''|*[!0-9]*)
+        size=""
+        ;;
+    esac
+  fi
+
+  if [ -z "$size" ]; then
+    printf '%s\n' "0"
+    return 1
+  fi
+
+  printf '%s\n' "$size"
+  return 0
 }
