@@ -49,9 +49,10 @@ At a high level, the test:
    - Duration control:
      - audiotestsrc: Buffer count calculated dynamically: `(44100 * duration) / 1024`
      - pulsesrc: Uses timeout command to stop recording after specified duration
-5. **Playback phase (DECODE - 4 tests)**:
+5. **Playback phase (DECODE - 6 tests)**:
    - Reads the previously recorded files (both audiotestsrc and pulsesrc recordings)
    - Decodes and plays back using pulsesink
+   - Plays back external test files (OGG/MP3 formats)
 6. Collects test results and emits PASS/FAIL/SKIP
 
 ---
@@ -219,7 +220,7 @@ Help:
 
 ## Examples
 
-### 1) Run all tests (default - 8 tests: 4 encode + 4 decode for WAV and FLAC with 10 second duration)
+### 1) Run all tests (default - 10 tests: 4 encode + 6 decode for WAV, FLAC, OGG, and MP3 with 10 second duration)
 
 ```bash
 ./run.sh
@@ -231,19 +232,19 @@ Help:
 ./run.sh --mode record
 ```
 
-### 3) Run only playback tests (4 decode tests - requires recorded files from previous run)
+### 3) Run only playback tests (6 decode tests - requires recorded files from previous run, plus OGG/MP3 test files)
 
 ```bash
 ./run.sh --mode playback
 ```
 
-### 4) Test only WAV format (4 tests: 2 encode + 2 decode)
+### 4) Test only WAV format (6 tests total: 2 encode + 2 decode + 2 OGG/MP3 playback)
 
 ```bash
 ./run.sh --formats wav
 ```
 
-### 5) Test only FLAC format (4 tests: 2 encode + 2 decode)
+### 5) Test only FLAC format (6 tests total: 2 encode + 2 decode + 2 OGG/MP3 playback)
 
 ```bash
 ./run.sh --formats flac
@@ -255,7 +256,7 @@ Help:
 ./run.sh --duration 30
 ```
 
-### 7) Quick test - WAV only with 3 second duration (4 tests)
+### 7) Quick test - WAV only with 3 second duration (6 tests total)
 
 ```bash
 ./run.sh --formats wav --duration 3
@@ -546,11 +547,12 @@ The test supports these environment variables (can be set in LAVA job definition
 
 ### Test Counting
 
-- **Total tests**: 8 (when running with default wav,flac formats in all mode)
+- **Total tests**: 10 (when running with default wav,flac formats in all mode)
   - 4 encode tests (2 audiotestsrc + 2 pulsesrc)
-  - 4 decode tests (2 audiotestsrc playback + 2 pulsesrc playback)
+  - 6 decode tests (2 audiotestsrc playback + 2 pulsesrc playback + 2 OGG/MP3 playback)
 - **Pass/Fail/Skip are mutually exclusive**: Each test increments exactly one counter
 - **Plugin unavailability**: pulsesrc tests will skip if pulsesrc plugin is not available, but audiotestsrc tests will still run
+- **Test file availability**: OGG/MP3 playback tests will skip if test files are not available
 
 ---
 

@@ -3,8 +3,8 @@ metadata:
   format: "Lava-Test Test Definition 1.0"
   description: >
     Audio record/playback validation using GStreamer (gst-launch-1.0).
-    Tests 8 scenarios: 4 encode (2 audiotestsrc + 2 pulsesrc) + 4 decode (playback).
-    Supports WAV and FLAC formats with both synthetic audio (audiotestsrc) and hardware capture (pulsesrc).
+    Tests 10 scenarios: 4 encode (2 audiotestsrc + 2 pulsesrc) + 6 decode (4 playback + 2 OGG/MP3).
+    Supports WAV, FLAC, OGG, and MP3 formats with both synthetic audio (audiotestsrc) and hardware capture (pulsesrc).
     Duration controlled via AUDIO_DURATION (default 10s): audiotestsrc uses num-buffers, pulsesrc uses timeout.
   os:
     - linux
