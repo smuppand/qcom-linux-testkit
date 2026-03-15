@@ -1,0 +1,26 @@
+metadata:
+  name: gstreamer-audio-record-playback
+  format: "Lava-Test Test Definition 1.0"
+  description: >
+    Audio record/playback validation using GStreamer (gst-launch-1.0).
+    Tests 10 scenarios: 4 encode (2 audiotestsrc + 2 pulsesrc) + 6 decode (4 playback + 2 OGG/MP3).
+    Supports WAV, FLAC, OGG, and MP3 formats with both synthetic audio (audiotestsrc) and hardware capture (pulsesrc).
+    Duration controlled via AUDIO_DURATION (default 10s): audiotestsrc uses num-buffers, pulsesrc uses timeout.
+  os:
+    - linux
+  scope:
+    - functional
+ 
+params:
+  AUDIO_TEST_MODE: "all"
+  AUDIO_FORMATS: "wav,flac"
+  AUDIO_DURATION: "10"
+  AUDIO_GST_DEBUG: "2"
+
+run:
+  steps:
+    - REPO_PATH="$PWD"
+    - cd Runner/suites/Multimedia/GSTreamer/Audio/Audio_Record_Playback/
+    - export AUDIO_TEST_MODE AUDIO_FORMATS AUDIO_DURATION AUDIO_GST_DEBUG
+    - ./run.sh --mode "${AUDIO_TEST_MODE}" --formats "${AUDIO_FORMATS}" --duration "${AUDIO_DURATION}" --gst-debug "${AUDIO_GST_DEBUG}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Audio_Record_Playback.res

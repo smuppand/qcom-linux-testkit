@@ -38,8 +38,6 @@ while [ "$SEARCH" != "/" ]; do
   SEARCH=$(dirname "$SEARCH")
 done
  
-RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
- 
 if [ -z "${INIT_ENV:-}" ]; then
   echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
   echo "$TESTNAME SKIP" >"$RES_FILE" 2>/dev/null || true
@@ -94,6 +92,7 @@ height="${VIDEO_HEIGHT:-1080}"
 framerate="${VIDEO_FRAMERATE:-30}"
 gstDebugLevel="${VIDEO_GST_DEBUG:-${GST_DEBUG_LEVEL:-2}}"
 
+# shellcheck disable=SC2317
 cleanup() {
   # Best-effort: try to kill only children first; fall back to name-based kill
   if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
