@@ -442,36 +442,93 @@ camx_read_soc_id() {
 # Find ICP camera firmware ELF (CAMERA_ICP_*.elf)
 # Prints first match path on stdout.
 camx_find_icp_firmware() {
-  soc="$(camx_read_soc_id 2>/dev/null || true)"
-
-  # First try soc-specific canonical path
-  for root in /usr/lib/firmware /lib/firmware; do
-    if [ -n "$soc" ] && [ -d "$root/qcom/$soc" ]; then
-      p="$(find "$root/qcom/$soc" -maxdepth 1 -type f -name 'CAMERA_ICP_*.elf' 2>/dev/null | head -n 1)"
-      [ -n "$p" ] && echo "$p" && return 0
+  token_list=""
+  token=""
+  cand=""
+ 
+  if [ -r /proc/device-tree/compatible ]; then
+    token_list="$(
+      tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -n 's#.*\(qcm[0-9][0-9]*\|qcs[0-9][0-9]*\|sa[0-9][0-9]*p\).*#\1#p' \
+        | sort -u
+    )"
+  fi
+ 
+  for token in $token_list; do
+    if [ -d "/lib/firmware/qcom/$token" ]; then
+      for cand in \
+        "/lib/firmware/qcom/$token/CAMERA_ICP.mbn" \
+        "/lib/firmware/qcom/$token/CAMERA_ICP.elf"
+      do
+        if [ -f "$cand" ]; then
+          printf '%s\n' "$cand"
+          return 0
+        fi
+      done
+ 
+      cand="$(
+        find "/lib/firmware/qcom/$token" -maxdepth 1 -type f \
+          \( -name 'CAMERA_ICP*.mbn' -o -name 'CAMERA_ICP*.elf' \) \
+          2>/dev/null | sort | head -n 1
+      )"
+      if [ -n "$cand" ] && [ -f "$cand" ]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
     fi
   done
-
-  # Fallback bounded search
-  for root in /usr/lib/firmware /lib/firmware; do
-    if [ -d "$root/qcom" ]; then
-      p="$(find "$root/qcom" -maxdepth 2 -type f -name 'CAMERA_ICP_*.elf' 2>/dev/null | head -n 1)"
-      [ -n "$p" ] && echo "$p" && return 0
-    fi
-  done
-
+ 
+  cand="$(
+    find /lib/firmware/qcom -type f \
+      \( -name 'CAMERA_ICP.mbn' -o -name 'CAMERA_ICP.elf' -o -name 'CAMERA_ICP*.mbn' -o -name 'CAMERA_ICP*.elf' \) \
+      2>/dev/null | sort | head -n 1
+  )"
+  if [ -n "$cand" ] && [ -f "$cand" ]; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+ 
+  cand="$(
+    find /lib/firmware -type f \
+      \( -name 'CAMERA_ICP.mbn' -o -name 'CAMERA_ICP.elf' -o -name 'CAMERA_ICP*.mbn' -o -name 'CAMERA_ICP*.elf' \) \
+      2>/dev/null | sort | head -n 1
+  )"
+  if [ -n "$cand" ] && [ -f "$cand" ]; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+ 
   return 1
 }
-
 # -----------------------------------------------------------------------------
 # Package helpers (Yocto/QLI proprietary builds)
 # -----------------------------------------------------------------------------
 camx_opkg_list_camx() {
-  command -v opkg >/dev/null 2>&1 || return 1
-  out="$(opkg list-installed 2>/dev/null | grep -i '^camx' || true)"
-  [ -n "$out" ] || return 1
-  printf '%s\n' "$out"
-  return 0
+  out=""
+ 
+  if command -v opkg >/dev/null 2>&1; then
+    out="$(opkg list-installed 2>/dev/null | grep -i '^camx' || true)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+ 
+  if command -v dnf >/dev/null 2>&1; then
+    out="$(dnf list installed 2>/dev/null | grep -i '^camx' || true)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+ 
+  if command -v rpm >/dev/null 2>&1; then
+    out="$(rpm -qa 2>/dev/null | grep -i '^camx' || true)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+ 
+  return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -634,4 +691,54 @@ run_cmd_live_to_log() {
   rm -f "$fifo"
   wait "$teepid" 2>/dev/null || true
   return "$rc"
+}
+
+# -----------------------------------------------------------------------------
+# Pick board-specific camera module from DT compatible/model
+# -----------------------------------------------------------------------------
+camx_pick_camera_module() {
+  compat_list=""
+  model_str=""
+ 
+  if [ -r /proc/device-tree/compatible ]; then
+    compat_list="$(tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  fi
+ 
+  if [ -r /proc/device-tree/model ]; then
+    model_str="$(tr '[:upper:]' '[:lower:]' </proc/device-tree/model 2>/dev/null)"
+  fi
+ 
+  case "$compat_list
+$model_str" in
+    *rb3gen2*|*qcm6490*|*qcs6490*)
+      printf '%s\n' "camera_qcm6490"
+      return 0
+      ;;
+    *qcs9100-ride-sx*|*iq-9075-evk*|*qcs8300-ride-sx*|*iq-8275-evk*|*qcs9100*|*qcs8300*)
+      printf '%s\n' "camera_qcs9100"
+      return 0
+      ;;
+    *qcs615-ride*|*iq-615-evk*|*qcs615*)
+      printf '%s\n' "camera_qcs615"
+      return 0
+      ;;
+  esac
+ 
+  return 1
+}
+
+# Get the size of the yuv file dump
+nhx_dump_size_bytes() {
+  file_path="$1"
+  size="$(file_size_bytes "$file_path" 2>/dev/null || printf '%s\n' "0")"
+
+  case "$size" in
+    ''|*[!0-9]*)
+      printf '%s\n' "0"
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "$size"
+  return 0
 }
