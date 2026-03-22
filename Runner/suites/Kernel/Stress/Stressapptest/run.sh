@@ -182,10 +182,9 @@ detect_online_cpus() {
     fi
     ONLINE_CPUS=$(expand_list "$ONLINE_STR")
     [ -n "$ONLINE_CPUS" ] || ONLINE_CPUS="0"
-    CPU_COUNT=$(printf "%s\n" $ONLINE_CPUS | wc -l | tr -d ' ')
+    CPU_COUNT=$(printf '%s\n' "$ONLINE_CPUS" | awk '{c += NF} END {print c + 0}')
 }
 detect_online_cpus
-
 # Return online NUMA nodes as CSV (e.g. "0,1")
 nodes_online() {
     if [ -r /sys/devices/system/node/online ]; then
@@ -407,7 +406,7 @@ if [ "$AUTO_DISK" -eq 1 ] && [ -z "$USER_f" ]; then
         log_warn "Auto-disk requested but 'df' not available; skipping"
     fi
 fi
-
+# shellcheck disable=SC2317  # cleanup is invoked via trap
 cleanup_auto_bits() {
     [ -n "$LISTENER_PID" ] && kill "$LISTENER_PID" 2>/dev/null
     [ -n "$TMPF" ] && rm -f "$TMPF" 2>/dev/null
