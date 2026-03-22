@@ -58,7 +58,7 @@ MOUNT_DIR=""
 FS_PATH=""
 key_id=""
 KEY_FILE=""
-
+# shellcheck disable=SC2317  # cleanup is invoked via trap
 cleanup() {
 
     if [ -n "${MOUNT_DIR:-}" ] && [ "${MOUNT_DIR:-}" != "/" ] && [ -d "${MOUNT_DIR:-}" ]; then
