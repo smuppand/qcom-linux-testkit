@@ -6,15 +6,16 @@
 set -x
 chmod 777 -R /var/common/*
 __RUNNER_UTILS_BIN_DIR="/var/common"
+
 # Find test case path by name
 find_test_case_bin_by_name() {
-    local test_name="$1"
-    find $__RUNNER_UTILS_BIN_DIR -type f -iname "$test_name" 2>/dev/null
+    test_name="$1"
+    find "$__RUNNER_UTILS_BIN_DIR" -type f -iname "$test_name" 2>/dev/null
 }
 
 # Define variables
 APP_PATH=$(find_test_case_bin_by_name "reboot_health_check")
-APP_DIR=$(readlink -f $APP_PATH)
+APP_DIR=$(readlink -f "$APP_PATH")
 SERVICE_FILE="/etc/systemd/system/reboot-health.service"
 
 # Colors for console output
@@ -47,7 +48,7 @@ chmod +x "$APP_PATH"
 log_info "Made app binary executable: $APP_PATH"
 
 # Create systemd service file
-cat << EOF > "$SERVICE_FILE"
+if cat <<EOF > "$SERVICE_FILE"
 [Unit]
 Description=Reboot Health Check Service
 After=default.target
@@ -63,8 +64,7 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
-
-if [ $? -eq 0 ]; then
+then
     log_info "Created systemd service file: $SERVICE_FILE"
 else
     log_error "Failed to create systemd service file!"
@@ -76,16 +76,14 @@ systemctl daemon-reload
 log_info "Systemd daemon reloaded."
 
 # Enable and start service
-systemctl enable reboot-health.service
-if [ $? -eq 0 ]; then
+if systemctl enable reboot-health.service; then
     log_info "Service enabled at boot."
 else
     log_error "Failed to enable service!"
     exit 1
 fi
 
-systemctl start reboot-health.service
-if [ $? -eq 0 ]; then
+if systemctl start reboot-health.service; then
     log_success "Service started successfully!"
 else
     log_error "Failed to start service!"
