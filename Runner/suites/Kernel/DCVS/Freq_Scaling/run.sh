@@ -64,12 +64,12 @@ if [ "$miss" -eq 1 ]; then
 fi
 
 log_info "Reading scaling governor..."
-GOVERNOR=$(cat $CPUFREQ_PATH/scaling_governor)
+GOVERNOR=$(cat "$CPUFREQ_PATH"/scaling_governor)
 log_info "Current governor: $GOVERNOR"
 
 log_info "Reading min/max frequencies"
-MIN_FREQ=$(cat $CPUFREQ_PATH/cpuinfo_min_freq)
-MAX_FREQ=$(cat $CPUFREQ_PATH/cpuinfo_max_freq)
+MIN_FREQ=$(cat "$CPUFREQ_PATH"/cpuinfo_min_freq)
+MAX_FREQ=$(cat "$CPUFREQ_PATH"/cpuinfo_max_freq)
 log_info "CPU frequency range: $MIN_FREQ - $MAX_FREQ"
 
 log_info "Triggering frequency update via governor"
@@ -77,7 +77,7 @@ dd if=/dev/urandom of=/dev/null bs=1M count=1000 &
 LOAD_PID=$!
 sleep 2
 
-CURRENT_FREQ=$(cat $CPUFREQ_PATH/scaling_cur_freq)
+CURRENT_FREQ=$(cat "$CPUFREQ_PATH"/scaling_cur_freq)
 log_info "Observed frequency under load: $CURRENT_FREQ"
 
 kill $LOAD_PID
@@ -91,5 +91,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-
-log_info "----------- Completed $TESTNAME Test ------------"
