@@ -33,6 +33,9 @@ cd "$test_path" || exit 1
 # shellcheck disable=SC2034
 res_file="./$TESTNAME.res"
 
+TASK_PID=""
+trap '[ -n "${TASK_PID:-}" ] && kill "$TASK_PID" 2>/dev/null || true' EXIT INT TERM
+
 log_info "----------------------------------------------------"
 log_info "-------- Starting $TESTNAME Functional Test --------"
 
@@ -59,14 +62,14 @@ TASK_PID=$!
 sleep 2
 
 log_info "Checking CPU affinity of task $TASK_PID..."
-CPU_AFFINITY=$(taskset -p $TASK_PID | awk -F: '{print $2}' | xargs)
+CPU_AFFINITY=$(taskset -p "$TASK_PID" | awk -F: '{print $2}' | xargs)
 log_info "CPU affinity: $CPU_AFFINITY"
 
 log_info "Setting affinity to CPU 0"
-taskset -pc 0 $TASK_PID > /dev/null
+taskset -pc 0 "$TASK_PID" > /dev/null
 sleep 1
 
-NEW_AFFINITY=$(taskset -p $TASK_PID | awk -F: '{print $2}' | xargs)
+NEW_AFFINITY=$(taskset -p "$TASK_PID" | awk -F: '{print $2}' | xargs)
 if [ "$NEW_AFFINITY" = "1" ]; then
     log_pass "Successfully set CPU affinity"
     echo "$TESTNAME PASS" > "$res_file"
@@ -76,7 +79,7 @@ else
 fi
 
 log_info "Checking scheduling policy of task..."
-SCHED_POLICY=$(chrt -p $TASK_PID | grep "scheduling policy" | awk -F: '{print $2}' | xargs)
+SCHED_POLICY=$(chrt -p "$TASK_PID" | grep "scheduling policy" | awk -F: '{print $2}' | xargs)
 log_info "Scheduling Policy: $SCHED_POLICY"
 
 if echo "$SCHED_POLICY" | grep -q "SCHED_OTHER"; then
@@ -88,7 +91,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-
-kill $TASK_PID
-echo "$TESTNAME PASS" > $test_path/$TESTNAME.res
-log_info "-------- Completed $TESTNAME Functional Test --------"
