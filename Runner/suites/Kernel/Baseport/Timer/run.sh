@@ -79,16 +79,14 @@ else
 fi
 
 # --- Check if binary exists in PATH or at custom path ---
-check_dependencies "$BINARY"
-if [ $? -ne 0 ]; then
+if ! check_dependencies "$BINARY"; then
     log_skip "$TESTNAME : Binary '$BINARY' not found"
     echo "$TESTNAME SKIP" > "$res_file"
     exit 0
 fi
-
 # Run the binary and capture the output
 OUTPUT=$($BINARY)
-echo $OUTPUT
+echo "$OUTPUT"
 
 # Check if "pass:7" is in the output
 if echo "${OUTPUT}" | grep "pass:7"; then
@@ -100,4 +98,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

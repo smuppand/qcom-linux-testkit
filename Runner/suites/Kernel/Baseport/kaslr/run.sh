@@ -38,11 +38,11 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
 
-output=$(cat /proc/kallsyms | grep stext)
+output=$(grep stext /proc/kallsyms)
 
-value=$(echo $output | awk '{print $1}')
+value=$(printf '%s\n' "$output" | awk '{print $1}')
 
-if [ $value != "0000000000000000" ]; then
+if [ "$value" != "0000000000000000" ]; then
     log_pass "$TESTNAME : Test Passed"
     log_info "Writing to file $res_file"
     echo "$TESTNAME PASS" > "$res_file"
@@ -53,4 +53,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

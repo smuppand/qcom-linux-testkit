@@ -69,7 +69,7 @@ for cpu in /sys/devices/system/cpu/cpu[0-7]*; do
     offline_cpu "$cpu_id"
     sleep 1
 
-    online_status=$(cat /sys/devices/system/cpu/$cpu_id/online)
+    online_status=$(cat /sys/devices/system/cpu/"$cpu_id"/online)
     if [ "$online_status" -ne 0 ]; then
         log_fail "Failed to offline $cpu_id"
         test_passed=false
@@ -79,7 +79,7 @@ for cpu in /sys/devices/system/cpu/cpu[0-7]*; do
     online_cpu "$cpu_id"
     sleep 1
 
-    online_status=$(cat /sys/devices/system/cpu/$cpu_id/online)
+    online_status=$(cat /sys/devices/system/cpu/"$cpu_id"/online)
     if [ "$online_status" -ne 1 ]; then
         log_fail "Failed to online $cpu_id"
         test_passed=false
@@ -99,4 +99,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

@@ -40,7 +40,7 @@ log_info "=== Test Initialization ==="
 
 # Function to get the timer count
 get_timer_count() {
-    cat /proc/interrupts | grep arch_timer
+    grep arch_timer /proc/interrupts
 }
 
 # Get the initial timer count
@@ -58,37 +58,40 @@ log_info "$final_count"
 
 # Compare the initial and final counts
 log_info "Comparing timer counts:"
-echo "$initial_count" | while read -r line; do
-    cpu=$(echo "$line" | awk '{print $1}')
-    initial_values=$(echo "$line" | awk '{for(i=2;i<=9;i++) print $i}')
-    final_values=$(echo "$final_count" | grep "$cpu" | awk '{for(i=2;i<=9;i++) print $i}')
-    
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+
+    cpu=$(printf '%s\n' "$line" | awk '{print $1}')
+    initial_values=$(printf '%s\n' "$line" | awk '{for(i=2;i<=9;i++) print $i}')
+    final_values=$(printf '%s\n' "$final_count" | awk -v cpu="$cpu" '$1 == cpu {for(i=2;i<=9;i++) print $i}')
+
     fail_test=false
-    initial_values_list=$(echo "$initial_values" | tr ' ' '
-')
-    final_values_list=$(echo "$final_values" | tr ' ' '
-')
-    
     i=0
-    echo "$initial_values_list" | while read -r initial_value; do
-        final_value=$(echo "$final_values_list" | sed -n "$((i+1))p")
+
+    while IFS= read -r initial_value; do
+        [ -n "$initial_value" ] || continue
+
+        final_value=$(printf '%s\n' "$final_values" | sed -n "$((i + 1))p")
         if [ "$initial_value" -lt "$final_value" ]; then
             log_pass "CPU $i: Timer count has incremented. Test PASSED"
         else
             log_fail "CPU $i: Timer count has not incremented. Test FAILED"
             fail_test=true
         fi
-        i=$((i+1))
-    done
+        i=$((i + 1))
+    done <<EOF
+$initial_values
+EOF
 
     if [ "$fail_test" = false ]; then
         log_pass "$TESTNAME : Test Passed"
-	echo "$TESTNAME PASS" > "$res_file"
-    exit 0
+        echo "$TESTNAME PASS" > "$res_file"
+        exit 0
     else
         log_fail "$TESTNAME : Test Failed"
-	echo "$TESTNAME FAIL" > "$res_file"
-    exit 1
+        echo "$TESTNAME FAIL" > "$res_file"
+        exit 1
     fi
-done
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
+done <<EOF
+$initial_count
+EOF

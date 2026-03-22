@@ -45,12 +45,11 @@ detect_platform
 available_rprocs=$(cat /sys/class/remoteproc/remoteproc*/firmware)
 
 # Check if any line contains "modem"
-echo "$available_rprocs" | grep -q "modem"
-if [ $? -eq 0 ] && [ ${PLATFORM_TARGET} = "Kodiak" ]; then
-    subsystem_count=$(echo "$available_rprocs" | grep -v "modem" | wc -l)
+if printf '%s\n' "$available_rprocs" | grep -q "modem" && [ "${PLATFORM_TARGET}" = "Kodiak" ]; then
+    subsystem_count=$(printf '%s\n' "$available_rprocs" | grep -vc "modem")
 else
     # "modem" not found, count all lines
-    subsystem_count=$(echo "$available_rprocs" | wc -l)
+    subsystem_count=$(printf '%s\n' "$available_rprocs" | wc -l)
 fi
 
 # Execute the command and get the output
@@ -62,7 +61,7 @@ count=$(echo "$output" | grep -c "running")
 log_info "rproc subsystems in running state : $count, expected subsystems : $subsystem_count"
 
 # Print overall test result
-if [ $count -eq $subsystem_count ]; then
+if [ "$count" -eq "$subsystem_count" ]; then
     log_pass "$TESTNAME : Test Passed"
     echo "$TESTNAME PASS" > "$res_file"
     exit 0
@@ -71,4 +70,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

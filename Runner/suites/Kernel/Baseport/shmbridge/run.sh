@@ -38,7 +38,7 @@ log_info "Checking if required tools are available"
 
 if ! check_dependencies zcat grep dmesg; then
     log_skip "$TESTNAME SKIP - missing one or more of zcat grep dmesg utils"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
+    echo "$TESTNAME SKIP" >"$res_file"
     exit 0
 fi
 
