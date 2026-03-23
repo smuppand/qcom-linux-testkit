@@ -20,6 +20,31 @@ GSTLAUNCHFLAGS="${GSTLAUNCHFLAGS:--e -v -m}"
 # GST_ALSA_PLAYBACK_DEVICE=hw:0,0
 # GST_ALSA_CAPTURE_DEVICE=hw:0,1
 
+# -------------------- Shared encoded-artifact directory --------------------
+# gstreamer_shared_encoded_dir <script_dir> <outdir>
+# Prints a directory path to use for encoded video artifacts.
+# Priority:
+# 1. VIDEO_SHARED_ENCODE_DIR if explicitly provided
+# 2. A job-shared path derived from the common LAVA prefix before /tests/
+# 3. Fallback to <outdir>/encoded for local/manual runs
+gstreamer_shared_encoded_dir() {
+    script_dir="$1"
+    outdir="$2"
+
+    if [ -n "${VIDEO_SHARED_ENCODE_DIR:-}" ]; then
+        printf '%s\n' "$VIDEO_SHARED_ENCODE_DIR"
+        return 0
+    fi
+
+    case "$script_dir" in
+        */tests/*)
+            printf '%s/shared/video-encode-decode\n' "${script_dir%%/tests/*}"
+            ;;
+        *)
+            printf '%s/encoded\n' "$outdir"
+            ;;
+    esac
+}
 # -------------------- Element check --------------------
 has_element() {
   elem="$1"
