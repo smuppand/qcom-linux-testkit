@@ -18,11 +18,6 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 OUTDIR="$LOG_DIR/$TESTNAME"
 GST_LOG="$OUTDIR/gst.log"
 DMESG_DIR="$OUTDIR/dmesg"
-ENCODED_DIR="$OUTDIR/encoded"
-
-mkdir -p "$OUTDIR" "$DMESG_DIR" "$ENCODED_DIR" >/dev/null 2>&1 || true
-: >"$RES_FILE"
-: >"$GST_LOG"
  
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
@@ -54,6 +49,25 @@ fi
 
 # shellcheck disable=SC1091
 [ -f "$TOOLS/lib_video.sh" ] && . "$TOOLS/lib_video.sh"
+
+# Use the shared encoded directory if supported; otherwise default to $OUTDIR/encoded.
+if command -v gstreamer_shared_encoded_dir >/dev/null 2>&1; then
+    ENCODED_DIR="$(gstreamer_shared_encoded_dir "$SCRIPT_DIR" "$OUTDIR")"
+else
+    ENCODED_DIR="$OUTDIR/encoded"
+fi
+
+if ! mkdir -p "$OUTDIR" "$DMESG_DIR" "$ENCODED_DIR"; then
+  log_error "Failed to create required directories:"
+  log_error "  OUTDIR=$OUTDIR"
+  log_error "  DMESG_DIR=$DMESG_DIR"
+  log_error "  ENCODED_DIR=$ENCODED_DIR"
+  echo "$TESTNAME FAIL" >"$RES_FILE" 2>/dev/null || true
+  exit 0
+fi
+
+: >"$RES_FILE"
+: >"$GST_LOG"
 
 result="FAIL"
 reason="unknown"
@@ -384,6 +398,7 @@ log_info "Resolutions: $resolutionList"
 log_info "Duration: ${duration}s, Framerate: ${framerate}fps"
 log_info "GST debug: GST_DEBUG=$gstDebugLevel"
 log_info "Logs: $OUTDIR"
+log_info "Encoded artifact dir: $ENCODED_DIR"
 log_info "VP9 clip URL: $clipUrl"
 if [ -n "$clipPath" ]; then
   log_info "VP9 clip local path: $clipPath"
