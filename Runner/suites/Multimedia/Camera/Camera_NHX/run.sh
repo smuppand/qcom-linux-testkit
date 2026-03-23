@@ -289,34 +289,39 @@ log_info "CKSUM_TOOL=${CKSUM_TOOL:-none}"
 # -----------------------------------------------------------------------------
 if systemd_service_exists "cam-server"; then
   CAM_SERVER_PRESENT=1
-
-  CAM_SERVER_TS_BEFORE_STOP='5 minutes ago'
-
-  log_info "cam-server status before stop"
-  systemd_service_status_log "cam-server BEFORE stop (status only)" "$RUN_LOG" "cam-server" || true
-
-  log_info "cam-server stdout before stop"
-  systemd_service_stdout_since "cam-server BEFORE stop (stdout recent)" \
-    "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "cam-server.service" || true
-
-  log_info "Stopping cam-server before nhx.sh"
-  if systemd_service_stop_safe "cam-server"; then
-    CAM_SERVER_STOPPED_FOR_TEST=1
-    CAM_SERVER_TS_AFTER_STOP="$(date '+%Y-%m-%d %H:%M:%S')"
-
-    log_info "cam-server status after stop"
-    systemd_service_status_log "cam-server AFTER stop (status only)" "$RUN_LOG" "cam-server" || true
-
-    log_info "cam-server stdout after stop"
-    systemd_service_stdout_since "cam-server AFTER stop (stdout since stop marker)" \
-      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "cam-server.service" || true
+ 
+  log_info "cam-server status before NHX handling"
+  systemd_service_status_log "cam-server BEFORE NHX handling (status only)" \
+    "$RUN_LOG" "cam-server" || true
+ 
+  if systemd_service_is_active "cam-server"; then
+    CAM_SERVER_TS_BEFORE_STOP='5 minutes ago'
+ 
+    log_info "cam-server stdout before stop"
+    systemd_service_stdout_since "cam-server BEFORE stop (stdout recent)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "cam-server.service" || true
+ 
+    log_info "Stopping active cam-server before nhx.sh"
+    if systemd_service_stop_safe "cam-server"; then
+      CAM_SERVER_STOPPED_FOR_TEST=1
+      CAM_SERVER_TS_AFTER_STOP="$(date '+%Y-%m-%d %H:%M:%S')"
+ 
+      log_info "cam-server status after stop"
+      systemd_service_status_log "cam-server AFTER stop (status only)" \
+        "$RUN_LOG" "cam-server" || true
+ 
+      log_info "cam-server stdout after stop"
+      systemd_service_stdout_since "cam-server AFTER stop (stdout since stop marker)" \
+        "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "cam-server.service" || true
+    else
+      log_warn "Failed to stop active cam-server before nhx.sh"
+    fi
   else
-    log_warn "Failed to stop cam-server before nhx.sh"
+    log_info "cam-server service exists but is not active, skipping stop before nhx.sh"
   fi
 else
   log_info "cam-server service not present, continuing"
 fi
-
 # -----------------------------------------------------------------------------
 # Run NHX
 # -----------------------------------------------------------------------------
@@ -350,31 +355,46 @@ fi
 # cam-server start after NHX
 # -----------------------------------------------------------------------------
 if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ]; then
-  log_info "Starting cam-server after nhx.sh"
+  CAM_SERVER_TS_AFTER_START="$(date '+%Y-%m-%d %H:%M:%S')"
+ 
+  log_info "Attempting to restart cam-server after nhx.sh"
   if systemd_service_start_safe "cam-server"; then
-    CAM_SERVER_STOPPED_FOR_TEST=0
-    CAM_SERVER_TS_AFTER_START="$(date '+%Y-%m-%d %H:%M:%S')"
- 
-    log_info "cam-server status after start"
-    systemd_service_status_log "cam-server AFTER start (status only)" "$RUN_LOG" "cam-server" || true
- 
-    log_info "cam-server stdout after start"
-    systemd_service_stdout_since "cam-server AFTER start (stdout since start marker)" \
-      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "cam-server.service" || true
+    if systemd_service_is_active "cam-server"; then
+      CAM_SERVER_STOPPED_FOR_TEST=0
+      log_info "cam-server restart succeeded and service is active"
+    else
+      log_warn "cam-server start command returned, but service is not active"
+    fi
   else
-    log_warn "Failed to start cam-server after nhx.sh"
+    log_warn "Failed to invoke cam-server start after nhx.sh"
   fi
+ 
+  log_info "cam-server status after start attempt"
+  systemd_service_status_log "cam-server AFTER start attempt (status only)" \
+    "$RUN_LOG" "cam-server" || true
+ 
+  log_info "cam-server stdout after start attempt"
+  systemd_service_stdout_since "cam-server AFTER start attempt (stdout since start marker)" \
+    "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "cam-server.service" || true
 else
-  log_info "cam-server was not stopped for test, skipping restart"
+  log_info "cam-server was not active before nhx.sh; restart after test is skipped"
 fi
 # -----------------------------------------------------------------------------
 # Dump validation
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Dump validation
+# -----------------------------------------------------------------------------
 DUMP_VALIDATION_FAIL=0
-
+DUMP_VALIDATION_SKIPPED=0
+ 
 mkdir -p "$NHX_OUTDIR" 2>/dev/null || true
-
-if command -v nhx_validate_dumps_and_checksums >/dev/null 2>&1; then
+: >"$DUMPS_LIST" 2>/dev/null || true
+ 
+if [ "$NHX_RC" -ne 0 ]; then
+  DUMP_VALIDATION_SKIPPED=1
+  log_info "Skipping dump validation because nhx.sh exited with code $NHX_RC"
+elif command -v nhx_validate_dumps_and_checksums >/dev/null 2>&1; then
   if ! nhx_validate_dumps_and_checksums "$DUMP_DIR" "$MARKER" "$NHX_OUTDIR" "$CHECKSUMS_TXT" "$CHECKSUMS_PREV"; then
     DUMP_VALIDATION_FAIL=1
   fi
@@ -431,6 +451,7 @@ TOTAL_BYTES=0
   echo "Checksums: $CHECKSUMS_TXT"
   echo "Prev checksums: $CHECKSUMS_PREV"
   echo "Dump validation helper fail: $DUMP_VALIDATION_FAIL"
+  echo "Dump validation skipped: $DUMP_VALIDATION_SKIPPED"
   echo "========================================"
   echo
 } >"$SUMMARY_TXT"
@@ -509,7 +530,21 @@ fi
 # -----------------------------------------------------------------------------
 RESULT="FAIL"
 REASON=""
-
+DUMP_EXPECTED=1
+ 
+if [ "$NHX_RC" -ne 0 ]; then
+  DUMP_EXPECTED=0
+fi
+ 
+case "${FAILED:-}" in
+  ''|*[!0-9]*) : ;;
+  *)
+    if [ "$FAILED" -gt 0 ]; then
+      DUMP_EXPECTED=0
+    fi
+    ;;
+esac
+ 
 if [ -z "$FINAL_LINE" ] || [ -z "$FAILED" ] || [ -z "$PASSED" ]; then
   RESULT="FAIL"
   REASON="Final Report not found or could not parse"
@@ -517,37 +552,44 @@ else
   if [ "$FAILED" -gt 0 ]; then
     RESULT="FAIL"
     REASON="NHX reported FAILED=$FAILED"
+  elif [ "$NHX_RC" -ne 0 ]; then
+    RESULT="FAIL"
+    REASON="nhx.sh exited with code $NHX_RC"
   else
     RESULT="PASS"
     REASON="NHX reported FAILED=0"
   fi
 fi
-
-if [ "$ZERO_OR_MISSING" -gt 0 ]; then
-  RESULT="FAIL"
-  if [ -n "$REASON" ]; then
-    REASON="$REASON dump issues=$ZERO_OR_MISSING"
-  else
-    REASON="dump issues=$ZERO_OR_MISSING"
+ 
+if [ "$DUMP_EXPECTED" -eq 1 ]; then
+  if [ "$ZERO_OR_MISSING" -gt 0 ]; then
+    RESULT="FAIL"
+    if [ -n "$REASON" ]; then
+      REASON="$REASON dump issues=$ZERO_OR_MISSING"
+    else
+      REASON="dump issues=$ZERO_OR_MISSING"
+    fi
   fi
-fi
-
-if [ "$DUMP_COUNT" -eq 0 ]; then
-  RESULT="FAIL"
-  if [ -n "$REASON" ]; then
-    REASON="$REASON no dumps detected"
-  else
-    REASON="no dumps detected"
+ 
+  if [ "$DUMP_COUNT" -eq 0 ]; then
+    RESULT="FAIL"
+    if [ -n "$REASON" ]; then
+      REASON="$REASON no dumps detected"
+    else
+      REASON="no dumps detected"
+    fi
   fi
-fi
-
-if [ "$DUMP_VALIDATION_FAIL" -ne 0 ]; then
-  RESULT="FAIL"
-  if [ -n "$REASON" ]; then
-    REASON="$REASON dump checksum validation failed"
-  else
-    REASON="dump checksum validation failed"
+ 
+  if [ "$DUMP_VALIDATION_FAIL" -ne 0 ]; then
+    RESULT="FAIL"
+    if [ -n "$REASON" ]; then
+      REASON="$REASON dump checksum validation failed"
+    else
+      REASON="dump checksum validation failed"
+    fi
   fi
+else
+  log_info "Dump-related failure reasons suppressed because NHX failed before dump validation was expected"
 fi
 
 log_info "========================================"
