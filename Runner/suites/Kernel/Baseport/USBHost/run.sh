@@ -48,7 +48,7 @@ usb_output=$(lsusb)
 device_count=$(echo "$usb_output" | wc -l)
 
 # Filter out USB hubs
-non_hub_count=$(echo "$usb_output" | grep -vi "hub" | wc -l)
+non_hub_count=$(printf '%s\n' "$usb_output" | grep -ivc "hub")
 
 echo "Enumerated USB devices..."
 echo "$usb_output"
@@ -68,5 +68,3 @@ else
     echo "$TESTNAME PASS" > "$res_file"
     exit 0
 fi
-
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

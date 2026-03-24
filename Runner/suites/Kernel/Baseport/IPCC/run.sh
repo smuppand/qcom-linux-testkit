@@ -42,7 +42,7 @@ output=$(cat /sys/class/remoteproc/remoteproc*/state)
 
 count=$(echo "$output" | grep -c "running")
 
-if [ $count -eq 4 ]; then
+if [ "$count" -eq 4 ]; then
     log_pass "$TESTNAME : Test Passed"
     log_info "Writing to file $res_file"
     echo "$TESTNAME PASS" > "$res_file"
@@ -53,4 +53,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

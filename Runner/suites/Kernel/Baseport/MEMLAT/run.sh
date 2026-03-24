@@ -43,7 +43,7 @@ log_info "Checking if dependency binary is available"
 check_dependencies lat_mem_rd
 
 extract_votes() {
-  cat /sys/kernel/debug/interconnect/interconnect_summary | grep -i cpu | awk '{print $NF}'
+  grep -i cpu /sys/kernel/debug/interconnect/interconnect_summary | awk '{print $NF}'
 }
 
 log_info "Initial vote check:"
@@ -90,4 +90,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"

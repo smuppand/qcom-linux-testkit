@@ -228,6 +228,7 @@ while IFS= read -r test || [ -n "$test" ]; do
 
 done < "$whitelist"
 
+log_info "Per-test results written to $per_test_file"
 if [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]; then
     echo "$TESTNAME PASS" > "$res_file"
     log_pass "$TESTNAME: all tests passed"
@@ -237,6 +238,3 @@ else
     log_fail "$TESTNAME: one or more tests failed"
     exit 1
 fi
-
-log_info "Per-test results written to $per_test_file"
-log_info "------------------- Completed $TESTNAME Testcase -----------"

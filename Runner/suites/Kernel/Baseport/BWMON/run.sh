@@ -43,7 +43,7 @@ check_dependencies bw_mem
 
 log_info "Fetching te interconnect summary"
 extract_votes() {
-  cat /sys/kernel/debug/interconnect/interconnect_summary | grep -i pmu | awk '{print $NF}'
+  grep -i pmu /sys/kernel/debug/interconnect/interconnect_summary | awk '{print $NF}'
 }
 log_info "Initial vote check:"
 sleep 5
@@ -88,4 +88,3 @@ else
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
