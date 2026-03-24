@@ -131,14 +131,38 @@ By default, logs are written relative to the script working directory:
   playback_flac.log
   playback_pulsesrc_wav.log
   playback_pulsesrc_flac.log
-  recorded/                       # Recorded audio files
-    record_wav.wav
-    record_flac.flac
-    record_pulsesrc_wav.wav
-    record_pulsesrc_flac.flac
   dmesg/                          # dmesg scan outputs (if available)
     dmesg_errors.log
 ```
+
+### Recorded Audio Artifacts
+
+Recorded audio files are stored in a shared directory to enable artifact reuse across test runs:
+
+**Local/Manual Runs** (fallback):
+```
+./logs/Audio_Record_Playback/recorded/
+  record_wav.wav
+  record_flac.flac
+  record_pulsesrc_wav.wav
+  record_pulsesrc_flac.flac
+```
+
+**CI/LAVA Runs** (shared path):
+```
+<repo_root>/shared/audio-record-playback/
+  record_wav.wav
+  record_flac.flac
+  record_pulsesrc_wav.wav
+  record_pulsesrc_flac.flac
+```
+
+The recorded artifact directory is determined by:
+1. **Explicit override**: `AUDIO_SHARED_RECORDED_DIR` environment variable (if set)
+2. **LAVA/tests detection**: Shared path derived from repository structure (if script path contains `/tests/`)
+3. **Local fallback**: `./logs/Audio_Record_Playback/recorded/` (for manual runs)
+
+This ensures that in CI/LAVA environments, recorded artifacts are placed in a shared location accessible across multiple test runs, while local/manual runs use a simple local directory.
 
 ---
 
@@ -537,13 +561,18 @@ fi
 The test supports these environment variables (can be set in LAVA job definition):
 
 - `AUDIO_TEST_MODE` - Test mode (all/record/playback) (default: all)
+- `AUDIO_TEST_NAME` - Individual test name for single test execution (optional)
 - `AUDIO_FORMATS` - Comma-separated format list (default: `wav,flac`)
 - `AUDIO_DURATION` - Recording duration in seconds (default: 10)
 - `RUNTIMESEC` - Alternative to AUDIO_DURATION (for backward compatibility)
 - `AUDIO_GST_DEBUG` - GStreamer debug level (default: 2)
 - `GST_DEBUG_LEVEL` - Alternative to AUDIO_GST_DEBUG
+- `AUDIO_SHARED_RECORDED_DIR` - Shared directory for recorded audio artifacts (optional)
+- `REPO_PATH` - Repository root path (set by YAML, used for path resolution)
 
 **Priority order for duration**: `AUDIO_DURATION` > `RUNTIMESEC` > default (10)
+
+**Shared Artifact Directory**: The test uses `AUDIO_SHARED_RECORDED_DIR` to store recorded audio files in a shared location across multiple test runs. If not set, the test will automatically determine the appropriate directory based on the environment (LAVA vs local).
 
 ### Test Counting
 
