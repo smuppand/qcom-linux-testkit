@@ -45,7 +45,9 @@ At a high level, the test:
 4. **Recording phase (ENCODE - 4 tests)**:
    - **audiotestsrc tests**: Generates sine wave at 440Hz, encodes to WAV/FLAC
    - **pulsesrc tests**: Captures from hardware audio input, encodes to WAV/FLAC
-   - Saves recorded files to `logs/Audio_Record_Playback/recorded/`
+   - Saves recorded files to shared directory (via `AUDIO_SHARED_RECORDED_DIR` / `gstreamer_shared_recorded_dir()`)
+     - CI/LAVA runs: `<repo_root>/shared/audio-record-playback/`
+     - Local/manual runs: `logs/Audio_Record_Playback/recorded/` (fallback)
    - Duration control:
      - audiotestsrc: Buffer count calculated dynamically: `(44100 * duration) / 1024`
      - pulsesrc: Uses timeout command to stop recording after specified duration
@@ -94,15 +96,14 @@ By default, the test runs **10 test cases** with 10 second duration:
 ## PASS / FAIL / SKIP criteria
 
 ### PASS
-- **Recording**: Output file is created and has size > 1000 bytes
-- **Playback**: Pipeline completes successfully with exit code 0 (clean completion)
-  - **Note**: Timeout (exit code 124) or termination (exit code 143) are treated as **FAIL** for controlled-duration recordings
-  - This ensures playback completed successfully rather than being interrupted
+- **Recording**: Output file is created and has size > 1000 bytes, and no GStreamer errors detected in log
+  - Exit code is not directly checked - timeout/termination is acceptable if file is valid
+- **Playback**: Pipeline completes successfully with exit code 0 and no GStreamer errors detected in log
 - **Overall**: At least one test passes and no tests fail
 
 ### FAIL
-- **Recording**: No output file created or file size too small
-- **Playback**: Pipeline exits with non-zero code (including timeout 124 or termination 143) or GStreamer errors detected
+- **Recording**: No output file created, file size too small (≤ 1000 bytes), or GStreamer errors detected in log
+- **Playback**: Pipeline exits with non-zero code or GStreamer errors detected in log
 - **Overall**: One or more tests fail
 
 ### SKIP
@@ -554,7 +555,9 @@ fi
   - `SKIP` - No tests executed or all skipped
 - Test summary is logged showing pass/fail/skip counts
 - Individual test logs are available in `logs/Audio_Record_Playback/`
-- Recorded files are preserved in `logs/Audio_Record_Playback/recorded/` for debugging
+- Recorded files are preserved in the shared recorded directory for debugging:
+  - CI/LAVA runs: `<repo_root>/shared/audio-record-playback/`
+  - Local/manual runs: `logs/Audio_Record_Playback/recorded/` (fallback)
 
 ### LAVA Environment Variables
 
@@ -567,6 +570,8 @@ The test supports these environment variables (can be set in LAVA job definition
 - `RUNTIMESEC` - Alternative to AUDIO_DURATION (for backward compatibility)
 - `AUDIO_GST_DEBUG` - GStreamer debug level (default: 2)
 - `GST_DEBUG_LEVEL` - Alternative to AUDIO_GST_DEBUG
+- `AUDIO_CLIP_URL` - URL to download test audio files (OGG/MP3) (default: GitHub release URL)
+- `AUDIO_CLIP_PATH` - Local path to test audio files (overrides AUDIO_CLIP_URL if files exist)
 - `AUDIO_SHARED_RECORDED_DIR` - Shared directory for recorded audio artifacts (optional)
 - `REPO_PATH` - Repository root path (set by YAML, used for path resolution)
 
