@@ -4687,3 +4687,40 @@ file_size_bytes() {
   printf '%s\n' "$size"
   return 0
 }
+
+# Return the first /proc/interrupts line matching the given pattern.
+# Prints the full line and returns 0 on success, 1 if no match is found.
+get_interrupt_line_by_name() {
+    pattern="$1"
+    [ -n "$pattern" ] || return 1
+    grep "$pattern" /proc/interrupts 2>/dev/null | head -n 1
+}
+
+# Extract only numeric per-CPU interrupt counters from a /proc/interrupts line.
+# Prints one counter per line, stopping at the first non-numeric token after the IRQ field.
+extract_interrupt_cpu_counts() {
+    printf '%s\n' "$1" | awk '
+        {
+            seen_irq = 0
+            for (i = 1; i <= NF; i++) {
+                if (seen_irq == 0) {
+                    if ($i ~ /:$/) {
+                        seen_irq = 1
+                    }
+                    continue
+                }
+                if ($i ~ /^[0-9]+$/) {
+                    print $i
+                } else {
+                    break
+                }
+            }
+        }
+    '
+}
+
+# Count extracted per-CPU interrupt counters.
+# Prints the count as a decimal integer.
+count_interrupt_cpu_counts() {
+    printf '%s\n' "$1" | awk 'NF { c++ } END { print c + 0 }'
+}
