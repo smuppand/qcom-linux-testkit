@@ -1617,3 +1617,225 @@ display_screenshot_delta_end() {
   log_info "Screenshot delta check changed visual validation OK"
   return 0
 }
+
+# Resolve FPS expectation policy for display tests.
+# Sets DISPLAY_FPS_* globals from FPS_EXPECT_MODE / EXPECT_FPS / detected refresh.
+display_resolve_fps_policy() {
+    DISPLAY_FPS_MODE=""
+    DISPLAY_FPS_EXPECTED=""
+    DISPLAY_FPS_DETECTED_HZ=""
+    DISPLAY_FPS_MIN_OK=""
+    DISPLAY_FPS_MAX_OK=""
+
+    fps_mode="${FPS_EXPECT_MODE:-auto}"
+    fps_expect="${EXPECT_FPS:-}"
+    fps_default="${EXPECT_FPS_DEFAULT:-60}"
+    fps_tol="${FPS_TOL_PCT:-10}"
+    fps_min_pct="${MIN_FPS_PCT:-85}"
+
+    case "$fps_mode" in
+        auto)
+            if [ -n "$fps_expect" ]; then
+                DISPLAY_FPS_MODE="fixed"
+            else
+                DISPLAY_FPS_MODE="detected"
+            fi
+            ;;
+        fixed|detected)
+            DISPLAY_FPS_MODE="$fps_mode"
+            ;;
+        *)
+            log_warn "display_resolve_fps_policy: unknown FPS_EXPECT_MODE='$fps_mode', defaulting to auto"
+            if [ -n "$fps_expect" ]; then
+                DISPLAY_FPS_MODE="fixed"
+            else
+                DISPLAY_FPS_MODE="detected"
+            fi
+            ;;
+    esac
+
+    if [ "$DISPLAY_FPS_MODE" = "detected" ]; then
+        if command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
+            DISPLAY_FPS_DETECTED_HZ="$(weston_get_primary_refresh_hz 2>/dev/null || true)"
+        fi
+
+        case "$DISPLAY_FPS_DETECTED_HZ" in
+            ''|*[!0-9.]*)
+                DISPLAY_FPS_MODE="fixed"
+                if [ -n "$fps_expect" ]; then
+                    DISPLAY_FPS_EXPECTED="$fps_expect"
+                    log_warn "display_resolve_fps_policy: refresh detect failed, falling back to fixed EXPECT_FPS=$DISPLAY_FPS_EXPECTED"
+                else
+                    DISPLAY_FPS_EXPECTED="$fps_default"
+                    log_warn "display_resolve_fps_policy: refresh detect failed, falling back to fixed EXPECT_FPS_DEFAULT=$DISPLAY_FPS_EXPECTED"
+                fi
+                ;;
+            *)
+                DISPLAY_FPS_EXPECTED="$(printf '%s\n' "$DISPLAY_FPS_DETECTED_HZ" | awk '{printf "%.0f\n", $1 + 0.0}')"
+                DISPLAY_FPS_MIN_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v p="$fps_min_pct" 'BEGIN { printf "%.0f\n", f * p / 100.0 }')"
+                log_info "FPS policy: mode=detected refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK}"
+                return 0
+                ;;
+        esac
+    fi
+
+    if [ -z "$DISPLAY_FPS_EXPECTED" ]; then
+        if [ -n "$fps_expect" ]; then
+            DISPLAY_FPS_EXPECTED="$fps_expect"
+        else
+            DISPLAY_FPS_EXPECTED="$fps_default"
+        fi
+    fi
+
+    DISPLAY_FPS_MIN_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v t="$fps_tol" 'BEGIN { printf "%.0f\n", f * (100.0 - t) / 100.0 }')"
+    DISPLAY_FPS_MAX_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v t="$fps_tol" 'BEGIN { printf "%.0f\n", f * (100.0 + t) / 100.0 }')"
+
+    log_info "FPS policy: mode=fixed expected=${DISPLAY_FPS_EXPECTED} range=[${DISPLAY_FPS_MIN_OK}, ${DISPLAY_FPS_MAX_OK}]"
+    return 0
+}
+
+# Apply refresh policy for display tests.
+# Fixed ~60 FPS target gets best-effort 60Hz normalization; detected mode keeps native refresh.
+display_apply_fps_refresh_policy() {
+    if [ -z "${DISPLAY_FPS_MODE:-}" ] || [ -z "${DISPLAY_FPS_EXPECTED:-}" ]; then
+        log_warn "display_apply_fps_refresh_policy: FPS policy not resolved"
+        return 1
+    fi
+
+    if [ "$DISPLAY_FPS_MODE" = "detected" ]; then
+        log_info "Detected FPS mode selected; keeping native refresh"
+        return 0
+    fi
+
+    if hz_is_about_60 "${DISPLAY_FPS_EXPECTED}"; then
+        if command -v weston_force_primary_1080p60_if_not_60 >/dev/null 2>&1; then
+            log_info "Fixed ~60 FPS policy selected; ensuring primary output is ~60Hz (best-effort)"
+            if weston_force_primary_1080p60_if_not_60; then
+                log_info "Primary output is ~60Hz (or was already ~60Hz)"
+            else
+                log_warn "Unable to force ~60Hz (continuing; not a hard failure)"
+            fi
+        else
+            log_warn "weston_force_primary_1080p60_if_not_60 helper not found; skipping ~60Hz enforcement"
+        fi
+    else
+        log_info "Fixed FPS policy selected with expected=${DISPLAY_FPS_EXPECTED}; no refresh normalization applied"
+    fi
+
+    return 0
+}
+
+# Gate measured FPS against the resolved display FPS policy.
+# Returns 0 for pass, 1 for fail. Logs the reason internally.
+display_fps_gate_avg() {
+    fps_avg="$1"
+    fps_count="$2"
+    require_fps="${REQUIRE_FPS:-1}"
+
+    if [ "$require_fps" -eq 0 ]; then
+        if [ "$fps_count" -eq 0 ]; then
+            log_warn "REQUIRE_FPS=0 and no FPS samples found; skipping FPS gating"
+        else
+            log_info "REQUIRE_FPS=0; FPS stats recorded but not used for gating"
+        fi
+        return 0
+    fi
+
+    if [ "$fps_count" -eq 0 ]; then
+        log_fail "FPS gating enabled but no FPS samples were found"
+        return 1
+    fi
+
+    fps_int="$(printf '%s\n' "$fps_avg" | awk 'BEGIN {v=0} {v=$1+0.0} END {printf "%.0f\n", v}')"
+
+    if [ "${DISPLAY_FPS_MODE:-}" = "detected" ]; then
+        if [ -z "${DISPLAY_FPS_MIN_OK:-}" ]; then
+            log_fail "Detected FPS policy missing minimum threshold"
+            return 1
+        fi
+
+        if [ "$fps_int" -lt "$DISPLAY_FPS_MIN_OK" ]; then
+            log_fail "Average FPS below detected-refresh threshold: avg=${fps_avg} (~${fps_int}) < ${DISPLAY_FPS_MIN_OK} (refresh=${DISPLAY_FPS_DETECTED_HZ}Hz)"
+            return 1
+        fi
+
+        log_info "Detected-refresh FPS gate passed: avg=${fps_avg} (~${fps_int}) >= ${DISPLAY_FPS_MIN_OK} (refresh=${DISPLAY_FPS_DETECTED_HZ}Hz)"
+        return 0
+    fi
+
+    if [ -z "${DISPLAY_FPS_MIN_OK:-}" ] || [ -z "${DISPLAY_FPS_MAX_OK:-}" ]; then
+        log_fail "Fixed FPS policy missing valid range"
+        return 1
+    fi
+
+    if [ "$fps_int" -lt "$DISPLAY_FPS_MIN_OK" ] || [ "$fps_int" -gt "$DISPLAY_FPS_MAX_OK" ]; then
+        log_fail "Average FPS out of range: avg=${fps_avg} (~${fps_int}) not in [${DISPLAY_FPS_MIN_OK}, ${DISPLAY_FPS_MAX_OK}] (expected=${DISPLAY_FPS_EXPECTED})"
+        return 1
+    fi
+
+    log_info "Fixed FPS gate passed: avg=${fps_avg} (~${fps_int}) in [${DISPLAY_FPS_MIN_OK}, ${DISPLAY_FPS_MAX_OK}]"
+    return 0
+}
+
+# Parse FPS samples from a weston-simple-egl style log.
+# Sets DISPLAY_FPS_COUNT / DISPLAY_FPS_AVG / DISPLAY_FPS_MIN / DISPLAY_FPS_MAX.
+display_parse_fps_log() {
+    logf="$1"
+
+    DISPLAY_FPS_COUNT=0
+    DISPLAY_FPS_AVG="-"
+    DISPLAY_FPS_MIN="-"
+    DISPLAY_FPS_MAX="-"
+
+    [ -n "$logf" ] || return 1
+    [ -r "$logf" ] || return 1
+
+    fps_stats=$(
+        awk '
+            /[0-9]+[[:space:]]+frames in[[:space:]]+[0-9]+[[:space:]]+seconds/ {
+                val = $(NF-1) + 0.0
+                all_n++
+                all_vals[all_n] = val
+            }
+            END {
+                if (all_n == 0) exit
+
+                if (all_n == 1) {
+                    n = 1
+                    sum = all_vals[1]
+                    min = all_vals[1]
+                    max = all_vals[1]
+                } else {
+                    n = 0
+                    sum = 0.0
+                    for (i = 2; i <= all_n; i++) {
+                        v = all_vals[i]
+                        n++
+                        sum += v
+                        if (n == 1 || v < min) min = v
+                        if (n == 1 || v > max) max = v
+                    }
+                }
+
+                if (n > 0) {
+                    avg = sum / n
+                    printf "n=%d avg=%f min=%f max=%f\n", n, avg, min, max
+                }
+            }
+        ' "$logf" 2>/dev/null || true
+    )
+
+    [ -n "$fps_stats" ] || return 1
+
+    DISPLAY_FPS_COUNT=$(printf '%s\n' "$fps_stats" | awk '{print $1}' | sed 's/^n=//')
+    DISPLAY_FPS_AVG=$(printf '%s\n' "$fps_stats" | awk '{print $2}' | sed 's/^avg=//')
+    DISPLAY_FPS_MIN=$(printf '%s\n' "$fps_stats" | awk '{print $3}' | sed 's/^min=//')
+    DISPLAY_FPS_MAX=$(printf '%s\n' "$fps_stats" | awk '{print $4}' | sed 's/^max=//')
+
+    case "$DISPLAY_FPS_COUNT" in ''|*[!0-9]*) DISPLAY_FPS_COUNT=0 ;; esac
+    [ -n "$DISPLAY_FPS_AVG" ] || DISPLAY_FPS_AVG="-"
+    [ -n "$DISPLAY_FPS_MIN" ] || DISPLAY_FPS_MIN="-"
+    [ -n "$DISPLAY_FPS_MAX" ] || DISPLAY_FPS_MAX="-"
+
+    return 0
+}
