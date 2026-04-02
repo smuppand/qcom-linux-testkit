@@ -241,6 +241,13 @@ Help:
     - `9` MEMDUMP
   - Default: `2`
 
+- `--lava-testcase-id <name>`
+  - Override the test case name reported to LAVA in the `.res` file
+  - Default: `Audio_Record_Playback`
+  - Used by LAVA to match expected test case names
+  - Example: `--lava-testcase-id "GStreamer_Audio_Record_wav"`
+  - **Note:** This is typically set automatically by LAVA job definitions and should not be used for local testing
+
 ---
 
 ## Examples
@@ -574,10 +581,26 @@ The test supports these environment variables (can be set in LAVA job definition
 - `AUDIO_CLIP_PATH` - Local path to test audio files (overrides AUDIO_CLIP_URL if files exist)
 - `AUDIO_SHARED_RECORDED_DIR` - Shared directory for recorded audio artifacts (optional)
 - `REPO_PATH` - Repository root path (set by YAML, used for path resolution)
+- `LAVA_TESTCASE_ID` - Override test case name for LAVA reporting (default: Audio_Record_Playback)
 
 **Priority order for duration**: `AUDIO_DURATION` > `RUNTIMESEC` > default (10)
 
 **Shared Artifact Directory**: The test uses `AUDIO_SHARED_RECORDED_DIR` to store recorded audio files in a shared location across multiple test runs. If not set, the test will automatically determine the appropriate directory based on the environment (LAVA vs local).
+
+### LAVA Test Case Naming
+
+The test supports flexible test case naming for LAVA integration:
+
+- **Default behavior**: Reports results as `Audio_Record_Playback` in the `.res` file
+- **LAVA override**: Set `LAVA_TESTCASE_ID` parameter in the YAML definition to match LAVA's expected test case name
+- **Example YAML configuration**:
+  ```yaml
+  params:
+    AUDIO_TEST_MODE: record
+    AUDIO_FORMATS: wav
+    LAVA_TESTCASE_ID: "GStreamer_Audio_Record_wav"  # Matches LAVA expected name
+  ```
+- This ensures LAVA correctly matches test results with expected test case names, avoiding "Unexpected test result" errors
 
 ### Test Counting
 
