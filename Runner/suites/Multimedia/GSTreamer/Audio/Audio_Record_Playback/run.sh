@@ -148,7 +148,7 @@ for param in AUDIO_DURATION AUDIO_GST_DEBUG GST_DEBUG_LEVEL; do
   fi
 done
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   # Best-effort: try to kill only children first; fall back to name-based kill
   if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
