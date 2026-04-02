@@ -39,17 +39,20 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
 fi
 
 TESTNAME="AudioRecord"
+RESULT_TESTNAME="$TESTNAME"
 RES_SUFFIX="" # Optional suffix for unique result files (e.g., "Config1")
 # RES_FILE will be set after parsing command-line arguments
 
-# Pre-parse --res-suffix for early failure handling
-# This ensures unique result files even if setup fails in parallel CI runs
+# Pre-parse --res-suffix and --lava-testcase-id for early failure handling
+# This ensures unique result files and unique testcase IDs even if setup fails in parallel CI runs
 prev_arg=""
 for arg in "$@"; do
   case "$prev_arg" in
     --res-suffix)
       RES_SUFFIX="$arg"
-      break
+      ;;
+    --lava-testcase-id)
+      RESULT_TESTNAME="$arg"
       ;;
   esac
   prev_arg="$arg"
@@ -143,6 +146,10 @@ while [ $# -gt 0 ]; do
       ;;
     --res-suffix)
       RES_SUFFIX="$2"
+      shift 2
+      ;;
+    --lava-testcase-id)
+      RESULT_TESTNAME="$2"
       shift 2
       ;;
     --durations)
@@ -254,7 +261,7 @@ trap 'audio_cleanup_started_daemons' EXIT HUP INT TERM
 test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
 if ! cd "$test_path"; then
   log_error "cd failed: $test_path"
-  echo "$TESTNAME FAIL" > "$RES_FILE"
+  echo "$RESULT_TESTNAME FAIL" > "$RES_FILE"
   exit 1
 fi
 
@@ -273,7 +280,7 @@ fi
 if { [ -n "$CONFIG_NAMES" ] || [ -n "$CONFIG_FILTER" ]; } && [ -n "$DURATIONS" ]; then
   log_error "Cannot mix config discovery parameters (--config-name, --config-filter) with legacy matrix parameters (--durations)"
   log_error "Please use either config discovery mode OR legacy matrix mode, not both"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
@@ -335,7 +342,7 @@ if [ -z "$AUDIO_BACKEND" ]; then
       log_warn "$TESTNAME: no managed audio backend running - using direct ALSA capture path"
     else
       log_skip "$TESTNAME SKIP - no audio backend running and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
   fi
@@ -403,7 +410,7 @@ if [ "$backend_ok" -ne 1 ]; then
   else
     log_skip "$TESTNAME SKIP - backend not available: $AUDIO_BACKEND"
   fi
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
@@ -412,27 +419,27 @@ case "$AUDIO_BACKEND" in
   pipewire)
     if ! check_dependencies wpctl pw-record; then
       log_skip "$TESTNAME SKIP - missing PipeWire utils"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
     ;;
   pulseaudio)
     if ! check_dependencies pactl parecord; then
       log_skip "$TESTNAME SKIP - missing PulseAudio utils"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
     ;;
   alsa)
     if ! check_dependencies arecord; then
       log_skip "$TESTNAME SKIP - missing arecord"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
     ;;
   *)
     log_skip "$TESTNAME SKIP - unsupported backend: $AUDIO_BACKEND"
-    echo "$TESTNAME SKIP" > "$RES_FILE"
+    echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
     exit 0
     ;;
 esac
@@ -452,7 +459,7 @@ if [ "$AUDIO_BACKEND" = "pipewire" ]; then
     fi
     if ! audio_pw_ctl_ok 2>/dev/null; then
       log_skip "$TESTNAME SKIP - PipeWire control-plane not responsive"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
   fi
@@ -470,7 +477,7 @@ elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
     fi
     if ! audio_pa_ctl_ok 2>/dev/null; then
       log_skip "$TESTNAME SKIP - PulseAudio control-plane not responsive"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
   fi
@@ -543,7 +550,7 @@ fi
 # Only skip if no source AND not on PipeWire.
 if [ -z "$SRC_ID" ] && [ "$AUDIO_BACKEND" != "pipewire" ]; then
   log_skip "$TESTNAME SKIP - requested source '$SRC_CHOICE' not available on any backend (${BACKENDS_TO_TRY:-unknown})"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
@@ -574,7 +581,7 @@ if [ "$AUDIO_BACKEND" = "alsa" ]; then
         log_info "ALSA auto-pick: using $SRC_ID"
       else
         log_skip "$TESTNAME SKIP - no valid ALSA capture device found"
-        echo "$TESTNAME SKIP" > "$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
         exit 0
       fi
       ;;
@@ -606,21 +613,21 @@ case "$AUDIO_BACKEND" in
   pipewire)
     if ! check_dependencies wpctl pw-record; then
       log_skip "$TESTNAME SKIP - missing PipeWire utils"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
     ;;
   pulseaudio)
     if ! check_dependencies pactl parecord; then
       log_skip "$TESTNAME SKIP - missing PulseAudio utils"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
     ;;
   alsa)
     if ! check_dependencies arecord; then
       log_skip "$TESTNAME SKIP - missing arecord"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
     ;;
@@ -696,20 +703,20 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
   if [ -n "$CONFIG_NAMES" ] || [ -n "$CONFIG_FILTER" ]; then
     CONFIGS_TO_TEST="$(discover_and_filter_record_configs "$CONFIG_NAMES" "$CONFIG_FILTER")" || {
       log_skip "$TESTNAME SKIP - Invalid config name(s) provided"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     }
   else
     CONFIGS_TO_TEST="$(discover_record_configs)" || {
       log_skip "$TESTNAME SKIP - No record configs found"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     }
   fi
 
   if [ -z "$CONFIGS_TO_TEST" ]; then
     log_skip "$TESTNAME SKIP - No valid record configs found"
-    echo "$TESTNAME SKIP" > "$RES_FILE"
+    echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
     exit 0
   fi
 
@@ -1334,22 +1341,22 @@ log_info "Summary: total=$total pass=$pass fail=$fail skip=$skip"
 # --- Proper exit codes: PASS=0, FAIL=1, SKIP-only=0 ---
 if [ "$total" -eq 0 ] && [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ]; then
   log_skip "$TESTNAME SKIP - no runnable record testcases"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
 if [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ] && [ "$skip" -gt 0 ]; then
   log_skip "$TESTNAME SKIP"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
 if [ "$suite_rc" -eq 0 ]; then
   log_pass "$TESTNAME PASS"
-  echo "$TESTNAME PASS" > "$RES_FILE"
+  echo "$RESULT_TESTNAME PASS" > "$RES_FILE"
   exit 0
 fi
 
 log_fail "$TESTNAME FAIL"
-echo "$TESTNAME FAIL" > "$RES_FILE"
+echo "$RESULT_TESTNAME FAIL" > "$RES_FILE"
 exit 1
