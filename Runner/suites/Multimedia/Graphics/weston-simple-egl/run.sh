@@ -161,6 +161,25 @@ if [ -n "$sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; t
   fi
 fi
 
+# On base, do not start Weston here, but allow a short wait for an already
+# expected Weston runtime to come back after a previous DRM-exclusive test.
+if [ -z "$sock" ] && [ "$BUILD_FLAVOUR" = "base" ]; then
+  if command -v weston_wait_ready >/dev/null 2>&1; then
+    log_info "No usable Wayland socket yet on base build; waiting briefly for Weston runtime..."
+    if weston_wait_ready 10; then
+      if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        sock=$(discover_wayland_socket_anywhere | head -n 1 || true)
+      fi
+      if [ -n "$sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        log_info "Base Weston runtime became ready: $sock"
+        if ! adopt_wayland_env_from_socket "$sock"; then
+          log_warn "Failed to adopt env from $sock after wait"
+        fi
+      fi
+    fi
+  fi
+fi
+
 # If no usable socket yet:
 # - base: SKIP (do not try to start/stop Weston)
 # - overlay: try starting private Weston (helper) then re-discover/adopt
@@ -217,9 +236,23 @@ fi
 
 if command -v wayland_connection_ok >/dev/null 2>&1; then
   if ! wayland_connection_ok; then
-    log_fail "Wayland connection test failed; cannot run ${TESTNAME}."
-    echo "${TESTNAME} SKIP" >"$RES_FILE"
-    exit 0
+    if [ "$BUILD_FLAVOUR" = "base" ] && command -v weston_wait_ready >/dev/null 2>&1; then
+      log_warn "Initial Wayland connection test failed; waiting briefly and retrying..."
+      if weston_wait_ready 5; then
+        if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+          sock=$(discover_wayland_socket_anywhere | head -n 1 || true)
+        fi
+        if [ -n "$sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+          adopt_wayland_env_from_socket "$sock" || true
+        fi
+      fi
+    fi
+
+    if ! wayland_connection_ok; then
+      log_fail "Wayland connection test failed; cannot run ${TESTNAME}."
+      echo "${TESTNAME} SKIP" >"$RES_FILE"
+      exit 0
+    fi
   fi
   log_info "Wayland connection test: OK"
 else
