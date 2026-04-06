@@ -595,12 +595,14 @@ wayland_debug_snapshot() {
     log_info "----- End snapshot: $tag -----"
 }
 
+# Discover an available Wayland socket from common runtime locations.
+# Prefers user-session sockets first, then system-wide sockets such as /run/wayland-*.
 discover_wayland_socket_anywhere() {
     candidates=""
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
         candidates="$candidates $XDG_RUNTIME_DIR"
     fi
-    candidates="$candidates /dev/socket/weston /run/user/0 /run/user/1000"
+    candidates="$candidates /run/user/1000 /run/user/0 /run /dev/socket/weston"
 
     for dir in $candidates; do
         [ -d "$dir" ] || continue
@@ -665,6 +667,113 @@ wayland_connection_ok() {
     return 0
 }
 
+# Return success if any real Weston/Wayland socket currently exists.
+# Checks discovered sockets first, then common fallback socket paths.
+weston_runtime_socket_exists() {
+    weston_sock=""
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        weston_sock=$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1 || true)
+        if [ -n "$weston_sock" ]; then
+            return 0
+        fi
+    fi
+
+    for weston_sock in /run/wayland-* /run/user/0/wayland-* /run/user/1000/wayland-*; do
+        [ -S "$weston_sock" ] || continue
+        return 0
+    done
+
+    return 1
+}
+
+# Wait until Weston is usable by requiring both process presence and socket availability.
+# Returns 0 when ready, 1 after timeout seconds if Weston does not become ready.
+weston_wait_ready() {
+    timeout="${1:-15}"
+    i=0
+
+    while [ "$i" -lt "$timeout" ]; do
+        weston_proc_ready=1
+        weston_sock_ready=1
+
+        if command -v weston_is_running >/dev/null 2>&1; then
+            if weston_is_running >/dev/null 2>&1; then
+                weston_proc_ready=0
+            fi
+        else
+            if command -v pgrep >/dev/null 2>&1; then
+                if pgrep -x weston >/dev/null 2>&1; then
+                    weston_proc_ready=0
+                fi
+            fi
+        fi
+
+        if weston_runtime_socket_exists; then
+            weston_sock_ready=0
+        fi
+
+        if [ "$weston_proc_ready" -eq 0 ] && [ "$weston_sock_ready" -eq 0 ]; then
+            return 0
+        fi
+
+        i=$((i + 1))
+        sleep 1
+    done
+
+    log_warn "weston_wait_ready: Weston did not become ready within ${timeout}s"
+    return 1
+}
+
+# Restore Weston runtime after a DRM-exclusive test stopped it.
+# Starts socket/service first, then falls back to weston_start, and waits until ready.
+weston_restore_runtime() {
+    timeout="${1:-15}"
+ 
+    if command -v weston_is_running >/dev/null 2>&1; then
+        if weston_is_running >/dev/null 2>&1 && weston_runtime_socket_exists; then
+            return 0
+        fi
+    fi
+ 
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start weston.socket >/dev/null 2>&1 || true
+        systemctl start weston.service >/dev/null 2>&1 || \
+        systemctl start weston@root.service >/dev/null 2>&1 || true
+    fi
+ 
+    if weston_wait_ready 3; then
+        return 0
+    fi
+ 
+    if command -v weston_start >/dev/null 2>&1; then
+        weston_start >/dev/null 2>&1 || true
+    fi
+ 
+    weston_wait_ready "$timeout"
+}
+
+# Remove stale Wayland socket files only when Weston is not running.
+# Best-effort cleanup for common Weston runtime paths; ignores missing files
+# and permission errors. Intentionally does not touch /run/wayland-* because
+# that may be owned by systemd weston.socket on base builds.
+weston_cleanup_stale_sockets() {
+    if weston_is_running; then
+        return 0
+    fi
+
+    for s in \
+        /dev/socket/weston/wayland-* \
+        /run/user/0/wayland-* \
+        /run/user/1000/wayland-* \
+        /tmp/wayland-* \
+        "${XDG_RUNTIME_DIR:-/nonexistent}"/wayland-*; do
+        [ -S "$s" ] || continue
+        rm -f "$s" 2>/dev/null || true
+    done
+
+    return 0
+}
 ###############################################################################
 # Hz helpers
 ###############################################################################
