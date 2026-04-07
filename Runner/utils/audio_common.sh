@@ -345,7 +345,7 @@ audio_timeout_run() {
       wait "$pid" 2>/dev/null
       return 143
     fi
-    sleep 1; t=$(expr $t + 1)
+    sleep 1; t=$((t + 1))
   done
   wait "$pid"; return $?
 }
@@ -567,12 +567,6 @@ setup_overlay_audio_environment() {
 }
 
 # ---------- PipeWire control helpers (bounded; never hang) ----------
-pwctl_status_safe() {
-  # Prints wpctl status on stdout; returns nonzero on timeout/failure.
-  command -v wpctl >/dev/null 2>&1 || return 1
-  audio_exec_with_timeout 2s wpctl status 2>/dev/null
-}
-
 pwctl_inspect_safe() {
   # Prints wpctl inspect <id> on stdout; returns nonzero on timeout/failure.
   id="$1"
@@ -581,9 +575,6 @@ pwctl_inspect_safe() {
   audio_exec_with_timeout 2s wpctl inspect "$id" 2>/dev/null
 }
 
-audio_pw_ctl_ok() {
-  pwctl_status_safe >/dev/null 2>&1
-}
 # ---------- PipeWire: sinks (playback) ----------
 pw_default_speakers() {
   st="$(pwctl_status_safe 2>/dev/null)" || { printf '%s\n' ""; return 0; }
@@ -652,11 +643,6 @@ pw_default_null_source() {
   blk="$(printf '%s\n' "$st" | sed -n '/Sources:/,/^$/p')"
   id="$(printf '%s\n' "$blk" | grep -i 'null\|dummy' | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n1)"
   printf '%s\n' "$id"
-}
-
-pw_set_default_source() {
-  [ -n "$1" ] || return 1
-  audio_exec_with_timeout 2s wpctl set-default "$1" >/dev/null 2>&1
 }
 
 pw_source_label_safe() {
@@ -945,7 +931,7 @@ audio_parse_secs() {
   in="$*"
   norm=$(printf '%s' "$in" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
   [ -n "$norm" ] || return 1
- 
+
   case "$norm" in
     *:*)
       IFS=':' set -- "$norm"
@@ -956,7 +942,8 @@ audio_parse_secs() {
         *) return 1 ;;
       esac
       h_val=${h:-0}; m_val=${m:-0}; s_val=${s:-0}
-      result=$(expr $h_val \* 3600 + $m_val \* 60 + $s_val)
+
+      result=$((h_val * 3600 + m_val * 60 + s_val))
       printf '%s\n' "$result"
       return 0
       ;;
@@ -965,9 +952,9 @@ audio_parse_secs() {
         [0-9]*s|[0-9]*sec|[0-9]*secs|[0-9]*second|[0-9]*seconds)
           n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$n"; return 0 ;;
         [0-9]*m|[0-9]*min|[0-9]*mins|[0-9]*minute|[0-9]*minutes)
-          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$(expr $n \* 60)"; return 0 ;;
+          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$((n * 60))"; return 0 ;;
         [0-9]*h|[0-9]*hr|[0-9]*hrs|[0-9]*hour|[0-9]*hours)
-          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$(expr $n \* 3600)"; return 0 ;;
+          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$((n * 3600))"; return 0 ;;
         *)
           tokens=$(printf '%s' "$norm" | sed 's/\([0-9][0-9]*[a-z][a-z]*\)/\1 /g')
           total=0; ok=0
@@ -976,11 +963,11 @@ audio_parse_secs() {
             u=$(printf '%s' "$t" | sed -n 's/^[0-9][0-9]*\([a-z][a-z]*\)$/\1/p')
             case "$u" in
               s|sec|secs|second|seconds) add=$n ;;
-              m|min|mins|minute|minutes) add=$(expr $n \* 60) ;;
-              h|hr|hrs|hour|hours)       add=$(expr $n \* 3600) ;;
+              m|min|mins|minute|minutes) add=$((n * 60)) ;;
+              h|hr|hrs|hour|hours) add=$((n * 3600)) ;;
               *) return 1 ;;
             esac
-            total=$(expr $total + $add); ok=1
+            total=$((total + add)); ok=1
           done
           [ "$ok" -eq 1 ] 2>/dev/null || return 1
           printf '%s\n' "$total"
@@ -993,7 +980,6 @@ audio_parse_secs() {
       return 0
       ;;
   esac
-  return 1
 }
 
 # --- Local watchdog that always honors the first argument (e.g. "15" or "15s") ---
@@ -1019,7 +1005,7 @@ audio_exec_with_timeout() {
   pid=$!
  
   start="$(date +%s 2>/dev/null || echo 0)"
-  deadline="$(expr "$start" + "$dur_norm" 2>/dev/null || echo 0)"
+  deadline=$((start + dur_norm))
  
   # Wait until exit or deadline
   while kill -0 "$pid" 2>/dev/null; do
@@ -1040,7 +1026,7 @@ audio_exec_with_timeout() {
     grace=0
     while kill -0 "$pid" 2>/dev/null && [ "$grace" -lt 3 ]; do
       sleep 1
-      grace="$(expr "$grace" + 1)"
+      grace=$((grace + 1))
     done
  
     # Still alive -> likely D-state. Do NOT wait forever.
@@ -1364,6 +1350,7 @@ parse_clip_metadata() {
   fi
   
   # Split extracted fields (rate bits channels)
+  # shellcheck disable=SC2086 # Intentional field splitting of generated key=value triplet.
   set -- $metadata
   rate="$1"; bits="$2"; channels="$3"
   
@@ -1388,6 +1375,7 @@ generate_clip_testcase_name() {
   metadata="$(parse_clip_metadata "$filename")" || return 1
   
   # Extract values using positional parameters and prefix stripping
+  # shellcheck disable=SC2086 # Intentional field splitting of generated key=value triplet.
   set -- $metadata
   rate="${1#rate=}"
   bits="${2#bits=}"
@@ -1457,6 +1445,7 @@ validate_clip_name() {
   if [ -n "$config_num" ]; then
     # Generic config name - map to clip by index (1-based)
     # Count total clips first using POSIX-compliant approach
+    # shellcheck disable=SC2086 # Intentional field splitting of generated key=value triplet.
     set -- $available_clips
     idx=$#
     
@@ -1469,7 +1458,7 @@ validate_clip_name() {
     # Get clip by index (1-based) using POSIX-compliant approach
     current_idx=0
     for clip in $available_clips; do
-      current_idx=$(expr $current_idx + 1)
+      current_idx=$((current_idx + 1))
       if [ "$current_idx" -eq "$config_num" ]; then
         printf '%s\n' "$clip"
         return 0
@@ -1491,6 +1480,7 @@ validate_clip_name() {
   done
   
   # No match found - count available clips for helpful message using POSIX-compliant approach
+  # shellcheck disable=SC2086 # Intentional field splitting of space-separated clip list.
   set -- $available_clips
   idx=$#
   
