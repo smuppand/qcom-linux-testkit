@@ -46,17 +46,20 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
 fi
 
 TESTNAME="AudioPlayback"
+RESULT_TESTNAME="$TESTNAME"
 RES_SUFFIX="" # Optional suffix for unique result files (e.g., "Config1")
 # RES_FILE will be set after parsing command-line arguments
 
-# Pre-parse --res-suffix for early failure handling
-# This ensures unique result files even if setup fails in parallel CI runs
+# Pre-parse --res-suffix and --lava-testcase-id for early failure handling
+# This ensures unique result files and unique testcase IDs even if setup fails in parallel CI runs
 prev_arg=""
 for arg in "$@"; do
   case "$prev_arg" in
     --res-suffix)
       RES_SUFFIX="$arg"
-      break
+      ;;
+    --lava-testcase-id)
+      RESULT_TESTNAME="$arg"
       ;;
   esac
   prev_arg="$arg"
@@ -183,6 +186,10 @@ while [ $# -gt 0 ]; do
       RES_SUFFIX="$2"
       shift 2
       ;;
+    --lava-testcase-id)
+      RESULT_TESTNAME="$2"
+      shift 2
+      ;;
     --loops)
       LOOPS="$2"
       shift 2
@@ -306,7 +313,7 @@ trap 'audio_cleanup_started_daemons' EXIT HUP INT TERM
 if { [ -n "$CLIP_NAMES" ] || [ -n "$CLIP_FILTER" ]; } && { [ -n "$FORMATS" ] || [ -n "$DURATIONS" ]; }; then
   log_error "Cannot mix clip discovery parameters (--clip-name, --clip-filter) with legacy matrix parameters (--formats, --durations)"
   log_error "Please use either clip discovery mode OR legacy matrix mode, not both"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
@@ -368,7 +375,7 @@ fi
 test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
 if ! cd "$test_path"; then
   log_error "cd failed: $test_path"
-  echo "$TESTNAME FAIL" >"$RES_FILE"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
   exit 1
 fi
 
@@ -443,14 +450,14 @@ if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
         else
           log_error "Failed to download or extract audio clips from: $AUDIO_TAR_URL"
           log_skip "$TESTNAME SKIP - Audio clips download failed"
-          echo "$TESTNAME SKIP" >"$RES_FILE"
+          echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
           exit 0
         fi
       else
         log_skip "$TESTNAME SKIP - Required audio clips not found locally and network download disabled"
         log_info "To download audio clips, run with: --enable-network-download"
         log_info "Or manually download from: $AUDIO_TAR_URL"
-        echo "$TESTNAME SKIP" >"$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
         exit 0
       fi
     fi
@@ -488,13 +495,13 @@ if [ -z "$AUDIO_BACKEND" ]; then
         log_info "Using backend: alsa (direct minimal-build fallback)"
       else
         log_skip "$TESTNAME SKIP - no audio backend running"
-        echo "$TESTNAME SKIP" >"$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
         exit 0
       fi
     fi
   else
     log_skip "$TESTNAME SKIP - no audio backend running"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
+    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
     exit 0
   fi
 fi
@@ -558,7 +565,7 @@ fi
 
 if [ "$backend_ok" -ne 1 ]; then
   log_skip "$TESTNAME SKIP - backend not available: $AUDIO_BACKEND"
-  echo "$TESTNAME SKIP" >"$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
   exit 0
 fi
 
@@ -573,7 +580,7 @@ case "$AUDIO_BACKEND" in
         export AUDIO_SYSTEMD_MANAGED
       else
         log_skip "$TESTNAME SKIP - missing PipeWire playback utility"
-        echo "$TESTNAME SKIP" >"$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
         exit 0
       fi
     fi
@@ -587,7 +594,7 @@ case "$AUDIO_BACKEND" in
         export AUDIO_SYSTEMD_MANAGED
       else
         log_skip "$TESTNAME SKIP - missing PulseAudio playback utility"
-        echo "$TESTNAME SKIP" >"$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
         exit 0
       fi
     fi
@@ -595,13 +602,13 @@ case "$AUDIO_BACKEND" in
   alsa)
     if ! check_dependencies aplay; then
       log_skip "$TESTNAME SKIP - missing ALSA playback utility"
-      echo "$TESTNAME SKIP" >"$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
       exit 0
     fi
     ;;
   *)
     log_skip "$TESTNAME SKIP - unsupported backend: $AUDIO_BACKEND"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
+    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
     exit 0
     ;;
 esac
@@ -624,7 +631,7 @@ if [ "$AUDIO_BACKEND" = "pipewire" ]; then
         export AUDIO_SYSTEMD_MANAGED
       else
         log_skip "$TESTNAME SKIP - PipeWire control-plane not responsive"
-        echo "$TESTNAME SKIP" > "$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
         exit 0
       fi
     fi
@@ -647,7 +654,7 @@ elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
         export AUDIO_SYSTEMD_MANAGED
       else
         log_skip "$TESTNAME SKIP - PulseAudio control-plane not responsive"
-        echo "$TESTNAME SKIP" > "$RES_FILE"
+        echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
         exit 0
       fi
     fi
@@ -684,7 +691,7 @@ esac
 
 if [ -z "$SINK_ID" ]; then
   log_skip "$TESTNAME SKIP - requested sink '$SINK_CHOICE' not found for $AUDIO_BACKEND"
-  echo "$TESTNAME SKIP" >"$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
   exit 0
 fi
 
@@ -742,13 +749,13 @@ if [ "$USE_CLIP_DISCOVERY" = "true" ]; then
   if [ -n "$CLIP_NAMES" ] || [ -n "$CLIP_FILTER" ]; then
     CLIPS_TO_TEST="$(discover_and_filter_clips "$CLIP_NAMES" "$CLIP_FILTER")" || {
       log_skip "$TESTNAME SKIP - Invalid clip/config name(s) provided"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     }
   else
     CLIPS_TO_TEST="$(discover_audio_clips)" || {
       log_skip "$TESTNAME SKIP - No audio clips found in $clips_dir"
-      echo "$TESTNAME SKIP" > "$RES_FILE"
+      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     }
   fi
@@ -1059,23 +1066,23 @@ log_info "Summary: total=$total pass=$pass fail=$fail skip=$skip"
 
 if [ "$total" -eq 0 ] && [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ]; then
   log_skip "$TESTNAME SKIP - no runnable playback testcases"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
 # --- Proper exit codes: PASS=0, FAIL=1, SKIP-only=0 ---
 if [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ] && [ "$skip" -gt 0 ]; then
   log_skip "$TESTNAME SKIP"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
+  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
 if [ "$suite_rc" -eq 0 ]; then
   log_pass "$TESTNAME PASS"
-  echo "$TESTNAME PASS" > "$RES_FILE"
+  echo "$RESULT_TESTNAME PASS" > "$RES_FILE"
   exit 0
 fi
 
 log_fail "$TESTNAME FAIL"
-echo "$TESTNAME FAIL" > "$RES_FILE"
+echo "$RESULT_TESTNAME FAIL" > "$RES_FILE"
 exit 1
