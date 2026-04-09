@@ -664,44 +664,51 @@ gstreamer_build_audio_playback_pipeline() {
 # Uses severity-based matching to avoid false positives on benign logs
 gstreamer_check_errors() {
   logfile="$1"
-  
+
   [ -f "$logfile" ] || return 0
-  
-  # Check for explicit ERROR: prefixed messages (most reliable)
-  if grep -q -E "^ERROR:|^0:[0-9]+:[0-9]+\.[0-9]+ [0-9]+ [^ ]+ ERROR" "$logfile" 2>/dev/null; then
+
+  filtered_log="${logfile}.filtered.$$"
+  check_log="$logfile"
+
+  # Ignore known benign warnings seen on successful downstream V4L2 decode paths.
+  if sed \
+    -e '/gst_video_info_dma_drm_to_caps: assertion .*drm_fourcc != DRM_FORMAT_INVALID/d' \
+    -e "/gst_structure_remove_field: assertion 'IS_MUTABLE (structure)' failed/d" \
+    "$logfile" >"$filtered_log" 2>/dev/null; then
+    check_log="$filtered_log"
+  fi
+
+  # Explicit gst-launch / GStreamer ERROR/FATAL lines.
+  if grep -q -E '^ERROR:|^FATAL:|^0:[0-9]+:[0-9]+\.[0-9]+ [0-9]+ [^ ]+ (ERROR|FATAL)' "$check_log" 2>/dev/null; then
+    rm -f "$filtered_log" 2>/dev/null || true
     return 1
   fi
-  
-  # Check for ERROR messages from GStreamer elements
-  if grep -q -E "ERROR: from element|gst.*ERROR" "$logfile" 2>/dev/null; then
+
+  # Element-reported hard failures.
+  if grep -q -E 'ERROR: from element|gst.*ERROR|gst.*FATAL' "$check_log" 2>/dev/null; then
+    rm -f "$filtered_log" 2>/dev/null || true
     return 1
   fi
-  
-  # Check for critical streaming errors
-  if grep -q -E "Internal data stream error|streaming stopped, reason not-negotiated" "$logfile" 2>/dev/null; then
+
+  # Known fatal streaming / negotiation failures.
+  if grep -q -E 'Internal data stream error|streaming stopped, reason not-negotiated|not-negotiated' "$check_log" 2>/dev/null; then
+    rm -f "$filtered_log" 2>/dev/null || true
     return 1
   fi
-  
-  # Check for pipeline failures (more specific patterns)
-  if grep -q -E "pipeline doesn't want to preroll|pipeline doesn't want to play|ERROR.*pipeline" "$logfile" 2>/dev/null; then
+
+  # Pipeline / state transition failures.
+  if grep -q -E "pipeline doesn't want to preroll|pipeline doesn't want to play|ERROR.*pipeline|ERROR.*failed to change state|ERROR.*state change failed|failed to change state|state change failed" "$check_log" 2>/dev/null; then
+    rm -f "$filtered_log" 2>/dev/null || true
     return 1
   fi
-  
-  # Check for state change failures (require ERROR context)
-  if grep -q -E "ERROR.*failed to change state|ERROR.*state change failed" "$logfile" 2>/dev/null; then
+
+  # Resource / file failures.
+  if grep -q -E 'Could not open resource|No such file or directory|Failed to open|failed to open' "$check_log" 2>/dev/null; then
+    rm -f "$filtered_log" 2>/dev/null || true
     return 1
   fi
-  
-  # Check for specific error patterns with proper grouping
-  if grep -q -E '(^ERROR:|ERROR: from element|Internal data stream error|streaming stopped, reason not-negotiated|pipeline.*failed|state change failed|Could not open resource|No such file or directory)' "$logfile" 2>/dev/null; then
-    return 1
-  fi
-  
-  # Check for CRITICAL or FATAL level messages (keep these as they are actual severity indicators)
-  if grep -q -E '(^CRITICAL:|^FATAL:|gst.*(CRITICAL|FATAL))' "$logfile" 2>/dev/null; then
-    return 1
-  fi
-  
+
+  rm -f "$filtered_log" 2>/dev/null || true
   return 0
 }
 
@@ -712,42 +719,94 @@ gstreamer_check_errors() {
 gstreamer_validate_log() {
   logfile="$1"
   testname="${2:-test}"
-  
+
   [ -f "$logfile" ] || {
     log_warn "$testname: Log file not found: $logfile"
     return 1
   }
-  
+
   if ! gstreamer_check_errors "$logfile"; then
-    log_fail "$testname: GStreamer errors detected in log"
-    
-    # Extract and log specific error messages
-    if grep -q "ERROR:" "$logfile" 2>/dev/null; then
-      log_fail "Error messages found:"
-      grep "ERROR:" "$logfile" 2>/dev/null | head -n 5 | while IFS= read -r line; do
-        log_fail "  $line"
-      done
+    log_fail "$testname: GStreamer fatal errors detected in log"
+
+    grep -E '^ERROR:|^FATAL:|ERROR: from element|gst.*ERROR|gst.*FATAL|Internal data stream error|streaming stopped, reason not-negotiated|not-negotiated|pipeline doesn'\''t want to preroll|pipeline doesn'\''t want to play|failed to change state|state change failed|Could not open resource|No such file or directory|Failed to open|failed to open' \
+      "$logfile" 2>/dev/null | head -n 5 | while IFS= read -r line; do
+      [ -n "$line" ] && log_fail " $line"
+    done
+
+    if grep -q 'not-negotiated' "$logfile" 2>/dev/null; then
+      log_fail " Reason: Format negotiation failed (caps mismatch)"
     fi
-    
-    # Check for specific failure reasons
-    if grep -q "not-negotiated" "$logfile" 2>/dev/null; then
-      log_fail "  Reason: Format negotiation failed (caps mismatch)"
+
+    if grep -q -E 'Could not open resource|Failed to open|failed to open' "$logfile" 2>/dev/null; then
+      log_fail " Reason: File or device access failed"
     fi
-    
-    if grep -q "Could not open" "$logfile" 2>/dev/null; then
-      log_fail "  Reason: File or device access failed"
+
+    if grep -q 'No such file or directory' "$logfile" 2>/dev/null; then
+      log_fail " Reason: File not found"
     fi
-    
-    if grep -q "No such file" "$logfile" 2>/dev/null; then
-      log_fail "  Reason: File not found"
-    fi
-    
+
     return 1
   fi
-  
+
+  filtered_log="${logfile}.filtered.$$"
+  check_log="$logfile"
+
+  # Ignore known benign warnings seen on successful downstream V4L2 decode paths.
+  if sed \
+    -e '/gst_video_info_dma_drm_to_caps: assertion .*drm_fourcc != DRM_FORMAT_INVALID/d' \
+    -e "/gst_structure_remove_field: assertion 'IS_MUTABLE (structure)' failed/d" \
+    "$logfile" >"$filtered_log" 2>/dev/null; then
+    check_log="$filtered_log"
+  fi
+
+  # If any CRITICAL lines remain after filtering, decide using success evidence
+  # instead of failing blindly on severity alone.
+  if grep -q -E '(^CRITICAL:|^FATAL:|gst.*(CRITICAL|FATAL))' "$check_log" 2>/dev/null; then
+    playing_seen=0
+    eos_seen=0
+    complete_seen=0
+    caps_seen=0
+
+    if grep -q -E 'Setting pipeline to PLAYING|new-state=\(GstState\)playing' "$logfile" 2>/dev/null; then
+      playing_seen=1
+    fi
+
+    if grep -q -E 'Got EOS from element|EOS received - stopping pipeline' "$logfile" 2>/dev/null; then
+      eos_seen=1
+    fi
+
+    if grep -q -E 'Execution ended after|Freeing pipeline' "$logfile" 2>/dev/null; then
+      complete_seen=1
+    fi
+
+    if grep -q -E 'caps = (video|audio)/x-|caps = image/' "$logfile" 2>/dev/null; then
+      caps_seen=1
+    fi
+
+    if [ "$eos_seen" -eq 1 ]; then
+      complete_seen=1
+    fi
+
+    if [ "$playing_seen" -eq 1 ] && [ "$complete_seen" -eq 1 ] && [ "$caps_seen" -eq 1 ]; then
+      log_warn "$testname: Non-fatal GStreamer criticals detected, but pipeline completed successfully"
+      grep -E '(^CRITICAL:|^FATAL:|gst.*(CRITICAL|FATAL))' "$check_log" 2>/dev/null | head -n 5 | while IFS= read -r line; do
+        [ -n "$line" ] && log_warn " $line"
+      done
+      rm -f "$filtered_log" 2>/dev/null || true
+      return 0
+    fi
+
+    log_fail "$testname: GStreamer critical/fatal messages detected without clear success evidence"
+    grep -E '(^CRITICAL:|^FATAL:|gst.*(CRITICAL|FATAL))' "$check_log" 2>/dev/null | head -n 5 | while IFS= read -r line; do
+      [ -n "$line" ] && log_fail " $line"
+    done
+    rm -f "$filtered_log" 2>/dev/null || true
+    return 1
+  fi
+
+  rm -f "$filtered_log" 2>/dev/null || true
   return 0
 }
-
 # -------------------- Video codec helpers (V4L2) --------------------
 # gstreamer_resolution_to_wh <resolution>
 # Converts resolution name to width and height
