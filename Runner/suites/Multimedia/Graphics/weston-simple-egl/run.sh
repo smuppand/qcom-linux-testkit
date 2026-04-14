@@ -207,8 +207,8 @@ if [ -z "$sock" ]; then
       log_warn "overlay_start_weston_drm returned non-zero; private Weston may have failed to start."
     fi
   else
-    log_warn "No Wayland socket found and not starting Weston on base build; skipping ${TESTNAME}."
-    echo "${TESTNAME} SKIP" >"$RES_FILE"
+    log_fail "No Wayland socket found and not starting Weston on base build, failing ${TESTNAME}."
+    echo "${TESTNAME} FAIL" >"$RES_FILE"
     exit 0
   fi
 fi
@@ -219,10 +219,10 @@ if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
   [ -n "$new_sock" ] && sock="$new_sock"
 fi
 
-# Final decision: run or SKIP
+# Final decision: run or FAIL
 if [ -z "$sock" ]; then
-  log_warn "No Wayland socket found after autodetection; skipping ${TESTNAME}."
-  echo "${TESTNAME} SKIP" >"$RES_FILE"
+  log_fail "No Wayland socket found after autodetection, failing ${TESTNAME}."
+  echo "${TESTNAME} FAIL" >"$RES_FILE"
   exit 0
 fi
 
@@ -237,7 +237,7 @@ fi
 if command -v wayland_connection_ok >/dev/null 2>&1; then
   if ! wayland_connection_ok; then
     if [ "$BUILD_FLAVOUR" = "base" ] && command -v weston_wait_ready >/dev/null 2>&1; then
-      log_warn "Initial Wayland connection test failed; waiting briefly and retrying..."
+      log_warn "Initial Wayland connection test failed, waiting briefly and retrying..."
       if weston_wait_ready 5; then
         if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
           sock=$(discover_wayland_socket_anywhere | head -n 1 || true)
@@ -249,8 +249,8 @@ if command -v wayland_connection_ok >/dev/null 2>&1; then
     fi
 
     if ! wayland_connection_ok; then
-      log_fail "Wayland connection test failed; cannot run ${TESTNAME}."
-      echo "${TESTNAME} SKIP" >"$RES_FILE"
+      log_fail "Wayland connection test failed, cannot run ${TESTNAME}."
+      echo "${TESTNAME} FAIL" >"$RES_FILE"
       exit 0
     fi
   fi
