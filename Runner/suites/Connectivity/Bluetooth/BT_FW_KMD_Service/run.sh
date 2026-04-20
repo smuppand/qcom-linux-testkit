@@ -89,6 +89,7 @@ fi
 # ---------- DT node / compatible ----------
 # ---------- DT node / compatible ----------
 if dt_confirm_node_or_compatible_all \
+    "qcom,wcn3950-bt" \
     "qcom,wcn7850-bt" \
     "qcom,wcn6855-bt" \
     "qcom,wcn6750-bt" \
@@ -104,7 +105,7 @@ fi
 if fw_dir="$(btfwpresent 2>/dev/null)"; then
     log_pass "Firmware present in: $fw_dir"
 else
-    log_warn "No BT firmware matching msbtfw*/msnv* found under standard firmware paths."
+    log_warn "No BT firmware matching msbtfw*/msnv* or cmbtfw*/cmnv* found under standard firmware paths."
     inc_warn
 fi
 

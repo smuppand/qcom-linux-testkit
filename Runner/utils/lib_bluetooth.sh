@@ -1880,15 +1880,30 @@ btpower() {
 
 btfwpresent() {
     dir=""
+    pattern=""
+    file=""
+ 
     for d in /lib/firmware/qca /usr/lib/firmware/qca /lib/firmware /usr/lib/firmware; do
         [ -d "$d" ] || continue
-        if ls "$d"/msbtfw*.mbn "$d"/msbtfw*.tlv "$d"/msnv*.bin >/dev/null 2>&1; then
-            dir="$d"; break
-        fi
+ 
+        for pattern in \
+            "msbtfw*.mbn" \
+            "msbtfw*.tlv" \
+            "msnv*.bin" \
+            "cmbtfw*.tlv" \
+            "cmnv*.bin"
+        do
+            for file in "$d"/$pattern; do
+                if [ -e "$file" ]; then
+                    dir="$d"
+                    printf '%s\n' "$dir"
+                    return 0
+                fi
+            done
+        done
     done
-    [ -n "$dir" ] || return 1
-    printf '%s\n' "$dir"
-    return 0
+ 
+    return 1
 }
 
 btfwloaded() {
