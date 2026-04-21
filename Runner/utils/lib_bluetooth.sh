@@ -1891,7 +1891,13 @@ btfwpresent() {
             "msbtfw*.tlv" \
             "msnv*.bin" \
             "cmbtfw*.tlv" \
-            "cmnv*.bin"
+            "cmnv*.bin" \
+            "hpbtfw*.tlv" \
+            "wcnhpbtfw*.tlv" \
+            "hmtbtfw*.tlv" \
+            "hmtnv*.bin" \
+            "hpnv*.bin" \
+            "wcnhpnv*.bin"
         do
             for file in "$d"/$pattern; do
                 if [ -e "$file" ]; then
@@ -1903,6 +1909,61 @@ btfwpresent() {
         done
     done
  
+    return 1
+}
+
+bt_wait_ready() {
+    max_wait="${1:-60}"
+    sleep_step="${2:-2}"
+    waited=0
+    started_service=0
+ 
+    if [ -z "$max_wait" ]; then
+        max_wait=60
+    fi
+    if [ -z "$sleep_step" ]; then
+        sleep_step=2
+    fi
+ 
+    case "$max_wait" in
+        ''|*[!0-9]*)
+            max_wait=60
+            ;;
+    esac
+    case "$sleep_step" in
+        ''|*[!0-9]*)
+            sleep_step=2
+            ;;
+    esac
+ 
+    if [ "$max_wait" -le 0 ] 2>/dev/null; then
+        max_wait=60
+    fi
+    if [ "$sleep_step" -le 0 ] 2>/dev/null; then
+        sleep_step=2
+    fi
+ 
+    while [ "$waited" -lt "$max_wait" ]; do
+        if btsvcactive && bthcipresent; then
+            log_info "Bluetooth runtime became ready after ${waited}s."
+            return 0
+        fi
+ 
+        if [ "$started_service" -eq 0 ]; then
+            if command -v systemctl >/dev/null 2>&1; then
+                if ! btsvcactive; then
+                    log_info "Bluetooth service not active yet, attempting start."
+                    systemctl start bluetooth.service >/dev/null 2>&1 || true
+                fi
+            fi
+            started_service=1
+        fi
+ 
+        sleep "$sleep_step"
+        waited=$((waited + sleep_step))
+    done
+ 
+    log_warn "Bluetooth runtime did not become ready within ${max_wait}s."
     return 1
 }
 
