@@ -592,7 +592,7 @@ gstreamer_build_audio_record_pipeline() {
   esac
 
   # Construct complete pipeline
-  printf '%s\n' "${source_elem} ! audioconvert ! ${encoder_elem} ! filesink location=${output_file}"
+  printf '%s\n' "${source_elem} ! audioconvert ! audioresample ! ${encoder_elem} ! filesink location=${output_file}"
   return 0
 }
 
