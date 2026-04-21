@@ -77,6 +77,11 @@ if ! check_dependencies bluetoothctl hciconfig lsmod; then
     echo "$TESTNAME SKIP" > "$RES_FILE"
     exit 0
 fi
+
+# ---------- Bluetooth runtime check/ readiness ----------
+log_info "Waiting for Bluetooth runtime readiness..."
+bt_wait_ready 60 2 || true
+
 # ---------- Bluetooth service / daemon ----------
 log_info "Checking if bluetoothd (or bluetooth.service) is running..."
 if btsvcactive; then
@@ -196,11 +201,15 @@ else
 fi
 
 if [ -z "$ADAPTER" ]; then
-    log_warn "No HCI adapter found; skipping BT FW/KMD test."
-    echo "$TESTNAME SKIP" > "./$TESTNAME.res"
+    log_warn "No HCI adapter found."
+ 
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        echo "$TESTNAME FAIL" > "$RES_FILE"
+    else
+        echo "$TESTNAME SKIP" > "$RES_FILE"
+    fi
     exit 0
 fi
-
 # ---------- BD address sanity check ----------
 if [ -n "$ADAPTER" ]; then
     if btbdok "$ADAPTER"; then
