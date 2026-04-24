@@ -3281,34 +3281,78 @@ wifi_write_wpa_conf() {
 
 # Find the first available WiFi interface (wl* or wlan0), using 'ip' or 'ifconfig'.
 # Prints the interface name, or returns non-zero if not found.
+# Discover the most likely WiFi netdev using override, iw, sysfs markers,
+# nmcli, and legacy name-based fallbacks while preserving existing behavior.
 get_wifi_interface() {
     WIFI_IF=""
 
-    # Prefer 'ip' if available.
-    if command -v ip >/dev/null 2>&1; then
-        WIFI_IF=$(ip link | awk -F: '/ wl/ {print $2}' | tr -d ' ' | head -n1)
-        if [ -z "$WIFI_IF" ]; then
-            WIFI_IF=$(ip link | awk -F: '/^[0-9]+: wl/ {print $2}' | tr -d ' ' | head -n1)
-        fi
-        if [ -z "$WIFI_IF" ] && ip link show wlan0 >/dev/null 2>&1; then
-            WIFI_IF="wlan0"
-        fi
-    else
-        # Fallback to 'ifconfig' if 'ip' is missing.
-        if command -v ifconfig >/dev/null 2>&1; then
-            WIFI_IF=$(ifconfig -a 2>/dev/null | grep -o '^wl[^:]*' | head -n1)
-            if [ -z "$WIFI_IF" ] && ifconfig wlan0 >/dev/null 2>&1; then
-                WIFI_IF="wlan0"
+    if [ -n "${WIFI_IFACE:-}" ]; then
+        if command -v ip >/dev/null 2>&1; then
+            if ip link show "$WIFI_IFACE" >/dev/null 2>&1; then
+                printf '%s\n' "$WIFI_IFACE"
+                return 0
             fi
         fi
     fi
 
-    if [ -n "$WIFI_IF" ]; then
-        echo "$WIFI_IF"
-        return 0
-    else
-        return 1
+    if command -v iw >/dev/null 2>&1; then
+        WIFI_IF="$(iw dev 2>/dev/null | awk '
+            $1 == "Interface" && $2 !~ /^p2p-dev-/ {
+                print $2
+                exit
+            }
+        ')"
+        if [ -n "$WIFI_IF" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
     fi
+
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+        WIFI_IF="$(basename "$n")"
+
+        if [ "$WIFI_IF" = "lo" ]; then
+            continue
+        fi
+
+        if [ -d "$n/wireless" ] || [ -e "$n/phy80211" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
+    done
+
+    if command -v nmcli >/dev/null 2>&1; then
+        WIFI_IF="$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '
+            $2 == "wifi" {
+                print $1
+                exit
+            }
+        ')"
+        if [ -n "$WIFI_IF" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        WIFI_IF="$(ip -o link show 2>/dev/null | awk -F': ' '
+            $2 ~ /^wlan[0-9]+$/ { print $2; exit }
+            $2 ~ /^wl[[:alnum:]_.-]*$/ { print $2; exit }
+            $2 ~ /^ath[[:alnum:]_.-]*$/ { print $2; exit }
+        ')"
+        if [ -n "$WIFI_IF" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
+
+        if ip link show wlan0 >/dev/null 2>&1; then
+            printf '%s\n' "wlan0"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 # Auto-detect eMMC block device (non-removable, not UFS)
