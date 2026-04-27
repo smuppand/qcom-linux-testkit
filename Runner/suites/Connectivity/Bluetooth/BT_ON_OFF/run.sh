@@ -97,20 +97,24 @@ fi
 if [ -n "$BT_ADAPTER" ]; then
     ADAPTER="$BT_ADAPTER"
     log_info "Using adapter from BT_ADAPTER/CLI: $ADAPTER"
-elif findhcisysfs >/dev/null 2>&1; then
-    ADAPTER="$(findhcisysfs 2>/dev/null || true)"
+ 
+    if command -v bt_adapter_is_usable >/dev/null 2>&1; then
+        if ! bt_adapter_is_usable "$ADAPTER"; then
+            log_warn "Requested adapter '$ADAPTER' is not currently UP/RUNNING with a valid BD address."
+            bt_log_hci_candidates || true
+        fi
+    fi
 else
-    ADAPTER=""
+    bt_log_hci_candidates || true
+ 
+    if command -v bt_select_usable_adapter >/dev/null 2>&1; then
+        ADAPTER="$(bt_select_usable_adapter 2>/dev/null || true)"
+    elif findhcisysfs >/dev/null 2>&1; then
+        ADAPTER="$(findhcisysfs 2>/dev/null || true)"
+    else
+        ADAPTER=""
+    fi
 fi
-
-if [ -n "$ADAPTER" ]; then
-    log_info "Using adapter: $ADAPTER"
-else
-    log_warn "No HCI adapter found; skipping test."
-    echo "$TESTNAME SKIP" > "./$TESTNAME.res"
-    exit 0
-fi
-
 # --- NEW: warn/diag if non-interactive "bluetoothctl list" is empty (non-fatal) ---
 btwarniflistempty "$ADAPTER" || true
 
