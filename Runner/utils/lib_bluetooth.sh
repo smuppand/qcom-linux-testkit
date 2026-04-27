@@ -2235,3 +2235,137 @@ bt_scan_poll_off() {
     log_warn "Discovering did not settle to 'no' within scan OFF polling window."
     return 1
 }
+
+# Return BD address for a given HCI adapter using hciconfig.
+# Prints empty output if the adapter is missing or address cannot be parsed.
+bt_hci_bdaddr() {
+    adapter="$1"
+
+    [ -n "$adapter" ] || return 1
+
+    if ! command -v hciconfig >/dev/null 2>&1; then
+        return 1
+    fi
+
+    hciconfig "$adapter" 2>/dev/null | awk '
+        /BD Address:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "Address:") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
+# Check whether an HCI adapter is usable for BT_ON_OFF.
+# Requires UP RUNNING state and a non-zero BD address.
+bt_adapter_is_usable() {
+    adapter="$1"
+    out=""
+    addr=""
+
+    [ -n "$adapter" ] || return 1
+
+    if ! command -v hciconfig >/dev/null 2>&1; then
+        return 1
+    fi
+
+    out="$(hciconfig "$adapter" 2>/dev/null || true)"
+    [ -n "$out" ] || return 1
+
+    addr="$(bt_hci_bdaddr "$adapter" 2>/dev/null || true)"
+    case "$addr" in
+        ""|"00:00:00:00:00:00")
+            return 1
+            ;;
+    esac
+
+    if printf '%s\n' "$out" | grep -q 'UP RUNNING'; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Select the best available Bluetooth adapter.
+# Prefer UP/RUNNING + non-zero BD address, then fallback to non-zero BD only.
+bt_select_usable_adapter() {
+    adapters=""
+    adapter=""
+    addr=""
+
+    if command -v hciconfig >/dev/null 2>&1; then
+        adapters="$(hciconfig 2>/dev/null | awk -F: '/^hci[0-9]+:/ { print $1 }')"
+
+        for adapter in $adapters; do
+            if bt_adapter_is_usable "$adapter"; then
+                printf '%s\n' "$adapter"
+                return 0
+            fi
+        done
+
+        for adapter in $adapters; do
+            addr="$(bt_hci_bdaddr "$adapter" 2>/dev/null || true)"
+            case "$addr" in
+                ""|"00:00:00:00:00:00")
+                    continue
+                    ;;
+                *)
+                    printf '%s\n' "$adapter"
+                    return 0
+                    ;;
+            esac
+        done
+    fi
+
+    if command -v findhcisysfs >/dev/null 2>&1; then
+        findhcisysfs 2>/dev/null || true
+        return 0
+    fi
+
+    return 1
+}
+
+# Log all HCI candidates with address/state details for CI/LAVA debug.
+# This helps explain why one adapter was selected or ignored.
+bt_log_hci_candidates() {
+    adapters=""
+    adapter=""
+    out=""
+    addr=""
+    state=""
+    usable="no"
+
+    if ! command -v hciconfig >/dev/null 2>&1; then
+        log_warn "hciconfig not available; cannot log HCI adapter candidates."
+        return 0
+    fi
+
+    adapters="$(hciconfig 2>/dev/null | awk -F: '/^hci[0-9]+:/ { print $1 }')"
+    if [ -z "$adapters" ]; then
+        log_warn "No HCI adapters reported by hciconfig."
+        return 0
+    fi
+
+    for adapter in $adapters; do
+        out="$(hciconfig "$adapter" 2>/dev/null || true)"
+        addr="$(bt_hci_bdaddr "$adapter" 2>/dev/null || true)"
+        state="$(printf '%s\n' "$out" | awk '/UP|DOWN|RUNNING/ {
+            gsub(/^[ \t]+|[ \t]+$/, "")
+            print
+            exit
+        }')"
+
+        [ -n "$addr" ] || addr="unknown"
+        [ -n "$state" ] || state="unknown"
+
+        usable="no"
+        if bt_adapter_is_usable "$adapter"; then
+            usable="yes"
+        fi
+
+        log_info "[bt-adapter] $adapter addr=$addr state='$state' usable=$usable"
+    done
+}
