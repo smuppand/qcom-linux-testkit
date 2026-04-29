@@ -381,6 +381,46 @@ display_select_primary_connector() {
     return 0
 }
 
+# Select the DRM card device that owns the preferred connected display.
+# Prints /dev/dri/cardN when a real connected connector is available.
+display_select_primary_drm_device() {
+    connector=""
+    card_idx=""
+    card_dev=""
+
+    if connector="$(display_select_primary_connector)"; then
+        if [ -z "$connector" ]; then
+            log_warn "display_select_primary_drm_device: display_select_primary_connector returned empty output" >&2
+            return 1
+        fi
+    else
+        log_warn "display_select_primary_drm_device: display_select_primary_connector failed" >&2
+        return 1
+    fi
+
+    if card_idx="$(display__drm_idx_from_sysfs_connector "$connector")"; then
+        :
+    else
+        log_warn "display_select_primary_drm_device: failed to extract DRM card index from connector '$connector'" >&2
+        return 1
+    fi
+
+    case "$card_idx" in
+        ""|*[!0-9]*)
+            log_warn "display_select_primary_drm_device: invalid DRM card index '$card_idx' from connector '$connector'" >&2
+            return 1
+            ;;
+    esac
+
+    card_dev="/dev/dri/card$card_idx"
+    if [ ! -e "$card_dev" ]; then
+        log_warn "display_select_primary_drm_device: selected DRM device '$card_dev' does not exist for connector '$connector'" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$card_dev"
+    return 0
+}
 ###############################################################################
 # Weston weston.ini helpers
 ###############################################################################

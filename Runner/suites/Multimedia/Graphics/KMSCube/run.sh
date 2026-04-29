@@ -43,6 +43,8 @@ cd "$test_path" || exit 1
 
 RES_FILE="./$TESTNAME.res"
 LOG_FILE="./${TESTNAME}_run.log"
+KMSCUBE_DRM_CONNECTOR=""
+KMSCUBE_DRM_DEV=""
 rm -f "$RES_FILE" "$LOG_FILE"
 
 log_info "-------------------------------------------------------------------"
@@ -81,6 +83,40 @@ if [ "$have_connector" -eq 0 ]; then
     exit 0
 fi
 
+# Select the DRM card that owns the connected display.
+# This avoids kmscube auto-selecting the wrong card on multi-DRM-card systems.
+if command -v display_select_primary_connector >/dev/null 2>&1; then
+    if KMSCUBE_DRM_CONNECTOR="$(display_select_primary_connector)"; then
+        if [ -z "$KMSCUBE_DRM_CONNECTOR" ]; then
+            log_warn "display_select_primary_connector returned empty output."
+        fi
+    else
+        KMSCUBE_DRM_CONNECTOR=""
+        log_warn "display_select_primary_connector failed; connected display mapping may be unavailable."
+    fi
+else
+    log_warn "display_select_primary_connector helper not found; connected display mapping may be unavailable."
+fi
+
+if command -v display_select_primary_drm_device >/dev/null 2>&1; then
+    if KMSCUBE_DRM_DEV="$(display_select_primary_drm_device)"; then
+        if [ -z "$KMSCUBE_DRM_DEV" ]; then
+            log_warn "display_select_primary_drm_device returned empty output; kmscube will use default DRM device selection."
+        fi
+    else
+        KMSCUBE_DRM_DEV=""
+        log_warn "display_select_primary_drm_device failed; kmscube will use default DRM device selection."
+    fi
+else
+    log_warn "display_select_primary_drm_device helper not found; kmscube will use default DRM device selection."
+fi
+
+if [ -n "$KMSCUBE_DRM_DEV" ]; then
+    log_info "Selected KMS connector: ${KMSCUBE_DRM_CONNECTOR:-<unknown>}"
+    log_info "Selected KMS DRM device: $KMSCUBE_DRM_DEV"
+else
+    log_warn "Could not map connected display to a DRM card; kmscube will use default device selection."
+fi
 # --- Basic DRM availability guard -------------------------------------------
 set -- /dev/dri/card* 2>/dev/null
 if [ ! -e "$1" ]; then
@@ -88,6 +124,7 @@ if [ ! -e "$1" ]; then
     echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
 fi
+
 # --- Dependencies ------------------------------------------------------------
 # With patched check_dependencies(): ask for return code instead of exit
 if ! CHECK_DEPS_NO_EXIT=1 check_dependencies kmscube; then
@@ -101,6 +138,7 @@ log_info "Using kmscube: ${KMSCUBE_BIN:-<not found>}"
 
 # --- Track whether this test stopped Weston ----------------------------------
 weston_stopped_by_test=0
+
 # --- GPU acceleration gating (avoid auto/Wayland for kmscube) ----------------
 # KMSCube is a DRM/KMS test. Using "auto" can start/adopt Weston and steal DRM master.
 if command -v display_is_cpu_renderer >/dev/null 2>&1; then
@@ -147,9 +185,19 @@ unset WAYLAND_DISPLAY
 EGL_PLATFORM_SAVED="${EGL_PLATFORM:-}"
 export EGL_PLATFORM=gbm
 
-log_info "Running kmscube with --count=${FRAME_COUNT} ..."
-if kmscube --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1; then :; else
+rc=0
+
+if [ -n "$KMSCUBE_DRM_DEV" ]; then
+    log_info "Running kmscube on $KMSCUBE_DRM_DEV with --count=${FRAME_COUNT} ..."
+    kmscube -D "$KMSCUBE_DRM_DEV" --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1
     rc=$?
+else
+    log_info "Running kmscube with default DRM device selection and --count=${FRAME_COUNT} ..."
+    kmscube --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1
+    rc=$?
+fi
+
+if [ "$rc" -ne 0 ]; then
     log_fail "$TESTNAME : Execution failed (rc=$rc) — see $LOG_FILE"
     cat "$LOG_FILE"
     echo "$TESTNAME FAIL" >"$RES_FILE"
