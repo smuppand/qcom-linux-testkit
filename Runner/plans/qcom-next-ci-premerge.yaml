@@ -16,6 +16,10 @@ run:
         - cd Runner
         - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/gpdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/gpdsp_remoteproc/gpdsp_remoteproc.res || true
         - $PWD/suites/Kernel/Baseport/CPUFreq_Validation/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/CPUFreq_Validation/CPUFreq_Validation.res || true
         - $PWD/suites/Kernel/Baseport/GIC/run.sh || true
@@ -76,4 +80,6 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/watchdog/watchdog.res || true
         - $PWD/suites/Multimedia/DSP_AudioPD/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/DSP_AudioPD/DSP_AudioPD.res || true
+        - $PWD/suites/Multimedia/OpenCV/run.sh ./run.sh --build-dir . --cwd . --suite all --list 0 --shuffle 0 || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/OpenCV/OpenCV.res || true
         - $PWD/utils/result_parse.sh
