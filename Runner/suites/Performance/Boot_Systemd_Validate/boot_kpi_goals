@@ -1,0 +1,48 @@
+# Boot KPI platform reference goals.
+#
+# Format:
+# <platform_aliases> <metric> <goal_sec> [tolerance_percent]
+#
+# - platform_aliases can be comma-separated.
+# - metric must match a KPI field from boot_kpi_this_run.txt.
+# - goal_sec is the reference target in seconds.
+# - tolerance_percent is optional. If omitted, BOOT_GOAL_TOLERANCE_PERCENT is used.
+#
+# Failure rule:
+# current_sec > goal_sec + tolerance_percent => FAIL
+#
+# Reference goals for QLI platforms.
+# Values below are platform-specific boot KPI goals in seconds.
+#
+# Note:
+# - Use --goal-metric boot_total_sec when gating against boot_total_sec.
+# - Default script metric may be boot_total_effective_sec, so pass --goal-metric
+#   explicitly if using one of the raw metrics below.
+ 
+# Kodiak
+kodiak,qcs6490,qcm6490,rb3gen2,rb3gen2-core-kit firmware_time_sec 5.67 2
+kodiak,qcs6490,qcm6490,rb3gen2,rb3gen2-core-kit bootloader_time_sec 0.222 2
+kodiak,qcs6490,qcm6490,rb3gen2,rb3gen2-core-kit kernel_time_sec 7.8 2
+kodiak,qcs6490,qcm6490,rb3gen2,rb3gen2-core-kit userspace_time_sec 15.94 2
+kodiak,qcs6490,qcm6490,rb3gen2,rb3gen2-core-kit boot_total_sec 24.6 2
+ 
+# Lemans
+lemans,qcs9100-ride-sx,iq-9075-evk firmware_time_sec 3.182 2
+lemans,qcs9100-ride-sx,iq-9075-evk bootloader_time_sec 0.182 2
+lemans,qcs9100-ride-sx,iq-9075-evk kernel_time_sec 2.126 2
+lemans,qcs9100-ride-sx,iq-9075-evk userspace_time_sec 15.54 2
+lemans,qcs9100-ride-sx,iq-9075-evk boot_total_sec 21.03 2
+ 
+# Monaco
+monaco,qcs8300-ride-sx,iq-8275-evk firmware_time_sec 3.51 2
+monaco,qcs8300-ride-sx,iq-8275-evk bootloader_time_sec 0.36 2
+monaco,qcs8300-ride-sx,iq-8275-evk kernel_time_sec 2.59 2
+monaco,qcs8300-ride-sx,iq-8275-evk userspace_time_sec 16.6 2
+monaco,qcs8300-ride-sx,iq-8275-evk boot_total_sec 23.07 2
+ 
+# Talos
+talos,qcs615-ride,iq-615-evk firmware_time_sec 1.56 2
+talos,qcs615-ride,iq-615-evk bootloader_time_sec 0.26 2
+talos,qcs615-ride,iq-615-evk kernel_time_sec 1.69 2
+talos,qcs615-ride,iq-615-evk userspace_time_sec 14.57 2
+talos,qcs615-ride,iq-615-evk boot_total_sec 18.1 2

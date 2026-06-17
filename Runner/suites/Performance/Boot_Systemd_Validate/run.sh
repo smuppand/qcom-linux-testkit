@@ -1,6 +1,7 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause# Systemd boot KPI + validation (single run).
+# SPDX-License-Identifier: BSD-3-Clause
+# Systemd boot KPI + validation (single run).
 
 SCRIPT_DIR="$(
   cd "$(dirname "$0")" || exit 1
@@ -17,6 +18,11 @@ REQUIRED_UNITS="${REQUIRED_UNITS:-}"
 TIMEOUT_PER_UNIT="${TIMEOUT_PER_UNIT:-30}"
 SVG="${SVG:-yes}"
 BOOT_TYPE="${BOOT_TYPE:-unknown}"
+BOOT_GOAL="${BOOT_GOAL:-}"
+BOOT_GOAL_FILE="${BOOT_GOAL_FILE:-}"
+BOOT_GOAL_METRIC="${BOOT_GOAL_METRIC:-boot_total_effective_sec}"
+BOOT_GOAL_TOLERANCE_PERCENT="${BOOT_GOAL_TOLERANCE_PERCENT:-2}"
+BOOT_GOAL_PLATFORM="${BOOT_GOAL_PLATFORM:-}"
 DISABLE_GETTY="${DISABLE_GETTY:-0}"
 DISABLE_SSHD="${DISABLE_SSHD:-0}"
 EXCLUDE_NETWORKD_WAIT_ONLINE="${EXCLUDE_NETWORKD_WAIT_ONLINE:-0}"
@@ -40,8 +46,12 @@ Options:
   --boot-type TYPE Tag boot type (e.g. cold, warm, unknown)
   --disable-getty Disable serial-getty@ttyS0.service for this KPI run
   --disable-sshd Disable sshd.service for this KPI run
-  --exclude-networkd-wait-online
-                                Exclude systemd-networkd-wait-online.service time from userspace/total
+  --goal SEC Gate selected boot KPI metric against max allowed seconds
+  --goal-file FILE Platform-aware file containing boot KPI goals
+  --goal-metric METRIC KPI metric to gate, default: boot_total_effective_sec
+  --goal-tolerance-percent PCT Allowed percentage deviation above goal before FAIL, default: 2
+  --goal-platform NAME Platform alias used to select a matching goal-file row
+  --exclude-networkd-wait-online Exclude systemd-networkd-wait-online.service time from userspace/total
   --exclude-services "A B" Exclude one or more services (from systemd-analyze blame) from userspace/total
   --iterations N Hint for KPI iterations (wrapper/LAVA metadata; this script still runs once)
   --verbose Dump key .txt artifacts from OUT_DIR to console for LAVA debugging
@@ -58,6 +68,7 @@ Artifacts in OUT:
   - boot_analysis.svg (unless --no-svg)
   - boot.dot
   - boot_kpi_this_run.txt
+  - boot_kpi_goal_check.txt (only when --goal or --goal-file is used)
 EOF
 }
 
@@ -166,6 +177,76 @@ while [ "$#" -gt 0 ]; do
       fi
       BOOT_TYPE="$1"
       ;;
+    --goal)
+      if [ "$#" -lt 2 ]; then
+        log_error "--goal requires a numeric seconds argument"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      shift
+      if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+        log_error "--goal requires a numeric seconds argument"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      BOOT_GOAL="$1"
+      ;;
+    --goal-file)
+      if [ "$#" -lt 2 ]; then
+        log_error "--goal-file requires a FILE argument"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      shift
+      if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+        log_error "--goal-file requires a FILE argument"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      BOOT_GOAL_FILE="$1"
+      ;;
+    --goal-metric)
+      if [ "$#" -lt 2 ]; then
+        log_error "--goal-metric requires a metric name"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      shift
+      if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+        log_error "--goal-metric requires a metric name"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      BOOT_GOAL_METRIC="$1"
+      ;;
+    --goal-tolerance-percent)
+      if [ "$#" -lt 2 ]; then
+        log_error "--goal-tolerance-percent requires a numeric percentage"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      shift
+      if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+        log_error "--goal-tolerance-percent requires a numeric percentage"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      BOOT_GOAL_TOLERANCE_PERCENT="$1"
+      ;;
+    --goal-platform)
+      if [ "$#" -lt 2 ]; then
+        log_error "--goal-platform requires a platform alias"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      shift
+      if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+        log_error "--goal-platform requires a platform alias"
+        usage >&2
+        write_skip_and_exit0
+      fi
+      BOOT_GOAL_PLATFORM="$1"
+      ;;
     --disable-getty)
       DISABLE_GETTY=1
       ;;
@@ -227,9 +308,17 @@ case "$TIMEOUT_PER_UNIT" in
     TIMEOUT_PER_UNIT=30
     ;;
 esac
+
 case "$BOOT_KPI_ITERATIONS" in
   ''|*[!0-9]*)
     BOOT_KPI_ITERATIONS=1
+    ;;
+esac
+
+case "$BOOT_GOAL_TOLERANCE_PERCENT" in
+  ''|*[!0-9.]*)
+    log_warn "Non-numeric --goal-tolerance-percent; defaulting to 2"
+    BOOT_GOAL_TOLERANCE_PERCENT=2
     ;;
 esac
 
@@ -257,7 +346,7 @@ check_dependencies systemctl systemd-analyze uname sed awk grep find sort || {
 
 # --- ensure CPU governors restored on exit (only if we changed it) ---
 GOV_CHANGED=0
-# shellcheck disable=SC2317  # cleanup is invoked via trap
+# shellcheck disable=SC2317 # cleanup is invoked via trap
 cleanup() {
   if [ "$GOV_CHANGED" -eq 1 ] 2>/dev/null; then
     restore_governor
@@ -630,6 +719,93 @@ kpi_file="$OUT_DIR/boot_kpi_this_run.txt"
 } | tee "$kpi_file"
 
 log_info "Boot KPI breakdown (this run) → $kpi_file"
+
+# ---------- Optional KPI goal gating ----------
+if [ -n "$BOOT_GOAL" ] || [ -n "$BOOT_GOAL_FILE" ]; then
+  goal_report="$OUT_DIR/boot_kpi_goal_check.txt"
+
+  case "$BOOT_GOAL_METRIC" in
+    uefi_time_sec)
+      goal_current="$UEFI_TOTAL"
+      ;;
+    firmware_time_sec)
+      goal_current="${FIRMWARE_SEC:-}"
+      ;;
+    bootloader_time_sec)
+      goal_current="${LOADER_SEC:-}"
+      ;;
+    kernel_time_sec)
+      goal_current="${KERNEL_SEC:-}"
+      ;;
+    userspace_time_sec)
+      goal_current="${USERSPACE_SEC:-}"
+      ;;
+    userspace_effective_time_sec)
+      goal_current="${USERSPACE_EFF:-}"
+      ;;
+    boot_total_sec)
+      goal_current="${TOTAL_SEC:-}"
+      ;;
+    boot_total_effective_sec)
+      goal_current="${TOTAL_EFF:-}"
+      ;;
+    *)
+      log_fail "Unknown boot KPI goal metric: $BOOT_GOAL_METRIC"
+      suite_rc=1
+      goal_current=""
+      ;;
+  esac
+
+  goal_value=""
+  goal_tolerance="$BOOT_GOAL_TOLERANCE_PERCENT"
+  goal_source="<none>"
+
+  if [ -n "$BOOT_GOAL" ]; then
+    goal_value="$BOOT_GOAL"
+    goal_source="inline"
+  elif [ -n "$BOOT_GOAL_FILE" ]; then
+    goal_record="$(perf_goal_file_get_for_platform "$BOOT_GOAL_FILE" "$BOOT_GOAL_METRIC" "$BOOT_GOAL_PLATFORM" || true)"
+
+    if [ -n "$goal_record" ]; then
+      goal_value="$(printf '%s\n' "$goal_record" | awk -F: '{print $1}')"
+      file_tolerance="$(printf '%s\n' "$goal_record" | awk -F: '{print $2}')"
+      matched_aliases="$(printf '%s\n' "$goal_record" | awk -F: '{print $3}')"
+
+      if [ -n "$file_tolerance" ]; then
+        goal_tolerance="$file_tolerance"
+      fi
+
+      goal_source="file:$BOOT_GOAL_FILE aliases:$matched_aliases"
+    fi
+  fi
+
+  log_info "Boot KPI goal gating enabled: metric=$BOOT_GOAL_METRIC current=${goal_current:-unknown}s goal=${goal_value:-unknown}s tolerance=${goal_tolerance}% source=$goal_source platform=${BOOT_GOAL_PLATFORM:-auto}"
+
+  if ! perf_goal_check_max_sec_with_tolerance "$BOOT_GOAL_METRIC" "$goal_current" "$goal_value" "$goal_tolerance" "$goal_report"; then
+    suite_rc=1
+  fi
+
+  log_info "Boot KPI goal report → $goal_report"
+else
+  log_info "Boot KPI goal gating not requested"
+fi
+
+# ---------- Console debug summary ----------
+# Keep this small and bounded. Full artifact dumping remains available through --verbose.
+log_info "Boot KPI debug summary artifacts"
+
+dump_debug_file "systemd-analyze time" "$an_time" 40
+dump_debug_file "systemd critical-chain" "$an_chain" 120
+dump_debug_file "systemd blame top20" "$an_blame_top" 40
+dump_debug_file "systemctl failed units" "$OUT_DIR/failed_units.txt" 80
+
+if [ -f "$OUT_DIR/boot_kpi_goal_check.txt" ]; then
+  dump_debug_file "boot KPI goal check" "$OUT_DIR/boot_kpi_goal_check.txt" 40
+fi
+
+if [ "$BOOT_NOT_FINISHED" -eq 1 ] && [ -f "$jobs_unfinished" ]; then
+  dump_debug_file "unfinished boot jobs" "$jobs_unfinished" 80
+fi
 
 # ---------- VERBOSE: dump key .txt artifacts to console ----------
 if [ "$VERBOSE" -eq 1 ]; then

@@ -40,6 +40,9 @@ Runs **once per boot** and collects detailed systemd boot KPIs:
 - `systemctl` unit dependency trees and per-unit state CSV
 - Journals: full boot, warnings, errors (when `journalctl` is available)
 - Optional **gating on required units** (e.g. “all critical services must be active”)
+- Optional **KPI goal gating** using `--goal` or `--goal-file`
+- Optional **platform-aware KPI goal lookup** using `--goal-platform`
+- Optional **configurable goal deviation tolerance** using `--goal-tolerance-percent`
 - **UEFI loader timings** from efivars (Init/Exec/Total) when EFI vars exist
 - **Exclusion of slow services** from userspace/total (e.g. `systemd-networkd-wait-online.service`)
 
@@ -63,13 +66,29 @@ The script has a built-in help that matches the implementation:
 Usage: ./run.sh [OPTIONS]
 
 Options:
-  --out DIR           Output directory for logs (default: ./logs_Boot_Systemd_Validate)
+  --out DIR           Output directory for logs
   --required FILE     File listing systemd units that must become active
-  --timeout S         Timeout per required unit (seconds, default: $TIMEOUT_PER_UNIT)
+  --timeout S         Timeout per required unit
   --no-svg            Skip systemd-analyze plot SVG generation
   --boot-type TYPE    Tag boot type (e.g. cold, warm, unknown)
   --disable-getty     Disable serial-getty@ttyS0.service for this KPI run
   --disable-sshd      Disable sshd.service for this KPI run
+
+  --goal SEC          Gate selected boot KPI metric against max allowed seconds
+
+  --goal-file FILE    Platform-aware goal file containing boot KPI goals
+
+  --goal-metric NAME  KPI metric to gate.
+                      Default: boot_total_effective_sec
+
+  --goal-tolerance-percent PCT
+                      Allowed percentage deviation above goal before FAIL.
+                      Default: 2
+
+  --goal-platform NAME
+                      Platform alias used to select a matching goal-file row.
+                      If omitted, the script auto-detects from device model,
+                      soc0 machine, family, soc_id, and hostname.
 
   --exclude-networkd-wait-online
                       Exclude systemd-networkd-wait-online.service time
@@ -96,6 +115,11 @@ Options:
 - `SVG=yes|no` – default for SVG generation (overridden by `--no-svg`)
 - `BOOT_TYPE` – default boot type tag (overridden by `--boot-type`)
 - `BOOT_KPI_ITERATIONS` – default for the `iterations` field in the KPI output
+- `BOOT_GOAL` – default inline KPI goal, same as passing `--goal`
+- `BOOT_GOAL_FILE` – default platform-aware goal file, same as passing `--goal-file`
+- `BOOT_GOAL_METRIC` – default metric for KPI gating
+- `BOOT_GOAL_TOLERANCE_PERCENT` – default allowed percentage deviation above goal before FAIL
+- `BOOT_GOAL_PLATFORM` – optional platform alias override for goal-file matching
 
 ---
 
@@ -123,16 +147,19 @@ All written under `OUT_DIR` (default: `./logs_Boot_Systemd_Validate`):
 - Journals  
   - `journal_boot.txt` – full boot journal  
   - `journal_warn.txt` – warnings and above  
-  - `journal_err.txt` – errors and above  
+  - `journal_err.txt` – errors and above
 
 - Bootchart (if enabled via `init=/lib/systemd/systemd-bootchart`)  
   - `bootchart.tgz` (if present under `/run/log/...`)
 
 - Required units  
-  - `failed_units.txt` (from `systemctl --failed`)  
+  - `failed_units.txt` (from `systemctl --failed`)
 
 - **KPI breakdown (this run)**  
   - `boot_kpi_this_run.txt` – structured, human-readable KPI summary
+
+- **Optional KPI goal check**  
+  - `boot_kpi_goal_check.txt` – written only when `--goal` or `--goal-file` is used
 
 ---
 
@@ -164,17 +191,11 @@ Fields:
   - `LoaderTimeInitUSec-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f`
   - `LoaderTimeExecUSec-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f`
 
-  with individual Init/Exec components also printed.
-
 - `firmware_time_sec`, `bootloader_time_sec`, `kernel_time_sec`,
   `userspace_time_sec`, `boot_total_sec`  
-  Parsed from `systemd-analyze time`:
+  Parsed from `systemd-analyze time`.
 
-  ```text
-  Startup finished in 3.801s (firmware) + 174ms (loader) + 6.106s (kernel) + 2min 7.045s (userspace) = 2min 17.127s
-  ```
-
-- `userspace_effective_time_sec`, `boot_total_effective_sec`  
+- `userspace_effective_time_sec`, `boot_total_effective_sec`
 
   These are derived from the raw userspace/total time by subtracting:
 
@@ -182,50 +203,170 @@ Fields:
      `--exclude-networkd-wait-online` is passed.
   2. Any additional services given via `--exclude-services "svc1 svc2"`.
 
-The script logs exclusions clearly, for example:
+If `systemd-analyze time` reports that boot is not yet finished, the script
+marks the timing fields as `unknown` and captures active jobs for debugging.
 
-```text
-[INFO] ... Excluded systemd-networkd-wait-online.service=120.117s from userspace/total; boot_total_effective_sec=16.891
-[INFO] ... Excluded services from userspace/total (sum=2.500s): docker.service=0.966s; NetworkManager.service=1.534s;  boot_total_effective_sec=14.391
+---
+
+### Optional KPI goal gating
+
+By default, `Boot_Systemd_Validate` is measurement-only. It collects boot KPI
+data and reports PASS/FAIL based on required unit validation and script health.
+
+KPI goal gating is enabled only when the user explicitly provides one of:
+
+```sh
+--goal <seconds>
+--goal-file <file>
 ```
 
-If `systemd-analyze time` reports:
+The default metric is:
 
 ```text
-Bootup is not yet finished (org.freedesktop.systemd1.Manager.FinishTimestampMonotonic=0).
+boot_total_effective_sec
 ```
 
-the script:
+Supported goal metrics:
 
-- Marks the timing fields as `unknown`.
-- Logs the active jobs from `systemctl list-jobs` to **console** so that
-  blocking services (including our own KPI service if misconfigured) are
-  visible during LAVA debugging.
+```text
+uefi_time_sec
+firmware_time_sec
+bootloader_time_sec
+kernel_time_sec
+userspace_time_sec
+userspace_effective_time_sec
+boot_total_sec
+boot_total_effective_sec
+```
 
-This diagnostic logging happens **even without `--verbose`**.
+All goal checks are lower-is-better.
+
+With tolerance enabled, the failure rule is:
+
+```text
+current_sec > goal_sec + tolerance_percent => FAIL
+```
+
+The default tolerance is:
+
+```text
+2%
+```
+
+For example, if:
+
+```text
+goal_sec=20.600
+tolerance_percent=2
+```
+
+then:
+
+```text
+allowed_max_sec=21.012
+```
+
+The check passes when:
+
+```text
+current_sec <= 21.012
+```
+
+#### Inline goal
+
+```sh
+./run.sh --goal 35 --goal-metric boot_total_effective_sec
+```
+
+To override tolerance:
+
+```sh
+./run.sh --goal 35 --goal-tolerance-percent 5
+```
+
+#### Platform-aware goal file
+
+A goal file uses this format:
+
+```text
+<platform_aliases> <metric> <goal_sec> [tolerance_percent]
+```
+
+Example:
+
+```text
+# platform aliases                  metric                    goal    tolerance
+qcm6490,qcs6490,rb3gen2-core-kit     boot_total_effective_sec  20.600  2
+qcs8300,iq-8275-evk                  boot_total_effective_sec  25.500  2
+```
+
+`platform_aliases` can be comma-separated.
+
+The script auto-detects the platform from:
+
+- `/proc/device-tree/model`
+- `/sys/devices/soc0/machine`
+- `/sys/devices/soc0/family`
+- `/sys/devices/soc0/soc_id`
+- hostname
+
+If the runtime machine string is not stable, pass an explicit alias:
+
+```sh
+./run.sh   --goal-file boot_kpi_goals --goal-platform rb3gen2-core-kit
+```
+
+#### Goal check report
+
+When goal gating is enabled, the script writes:
+
+```text
+boot_kpi_goal_check.txt
+```
+
+under `OUT_DIR`.
+
+Example PASS content:
+
+```text
+metric=boot_total_effective_sec
+current_sec=20.700
+goal_sec=20.600
+tolerance_percent=2
+direction=lower_or_equal_with_tolerance
+allowed_max_sec=21.012
+delta_from_allowed_sec=-0.312
+result=PASS
+```
+
+Example FAIL content:
+
+```text
+metric=boot_total_effective_sec
+current_sec=21.500
+goal_sec=20.600
+tolerance_percent=2
+direction=lower_or_equal_with_tolerance
+allowed_max_sec=21.012
+delta_from_allowed_sec=0.488
+result=FAIL
+```
+
+#### Notes
+
+- Goal gating is disabled unless `--goal` or `--goal-file` is provided.
+- The example goal file is not used automatically.
+- This keeps existing KPI collection behavior unchanged for normal runs.
+- CI/LAVA jobs can opt into gating only when they want boot KPI thresholds enforced.
+- The default tolerance is 2%, but CI can override it per job using
+  `--goal-tolerance-percent` or `BOOT_GOAL_TOLERANCE_PERCENT`.
 
 ---
 
 ### Verbose mode (`--verbose`)
 
-When `--verbose` is set, the script:
-
-- Prints all “reasonable” `.txt` artifacts from `OUT_DIR` to console
-  (excluding `journal_*.txt` for size reasons).
-- This is intended for LAVA and other CI where you cannot easily inspect the
-  filesystem but can scroll the job log.
-
-Example tail of the verbose section:
-
-```text
-[INFO] ... Verbose mode: dumping text artifacts from ./logs_Boot_Systemd_Validate (excluding journal_*.txt)
-===== analyze_time.txt =====
-Startup finished in ...
-...
-===== boot_kpi_this_run.txt =====
-Boot KPI (this run)
- ...
-```
+When `--verbose` is set, the script prints reasonable `.txt` artifacts from
+`OUT_DIR` to console, excluding large `journal_*.txt` files.
 
 ---
 
@@ -249,8 +390,41 @@ Boot KPI (this run)
 ./run.sh   --boot-type warm   --disable-getty   --exclude-networkd-wait-online   --iterations 5   --verbose
 ```
 
-In all cases, the main KPI is in `logs_Boot_Systemd_Validate/boot_kpi_this_run.txt`
-and echoed to console.
+**4) Gate boot total effective time with an inline goal**
+
+```sh
+./run.sh   --boot-type cold   --exclude-networkd-wait-online   --goal 35
+```
+
+**5) Gate a specific KPI metric**
+
+```sh
+./run.sh   --boot-type cold   --goal 25   --goal-metric userspace_effective_time_sec
+```
+
+**6) Gate using a platform-aware goal file**
+
+```sh
+./run.sh   --boot-type cold   --exclude-networkd-wait-online   --goal-file boot_kpi_goals --goal-platform rb3gen2-core-kit   --goal-metric boot_total_effective_sec
+```
+
+**7) Gate using a goal file with custom tolerance**
+
+```sh
+./run.sh   --goal-file boot_kpi_goals --goal-platform qcs8300   --goal-tolerance-percent 5
+```
+
+The main KPI is in:
+
+```text
+logs_Boot_Systemd_Validate/boot_kpi_this_run.txt
+```
+
+When goal gating is enabled, the goal check report is in:
+
+```text
+logs_Boot_Systemd_Validate/boot_kpi_goal_check.txt
+```
 
 ---
 
@@ -270,45 +444,17 @@ computes averages over the last **N boots** of a given `boot_type`.
 
 On each (re)boot it:
 
-1. Loads state from `Boot_Systemd_KPI_Loop.state` (if present) to determine:
-   - Total iterations requested
-   - Iterations already completed
-   - Boot type & options
-   - KPI script path + base out dir
-2. Computes **this iteration index**, and a per-iteration out dir:
+1. Loads state from `Boot_Systemd_KPI_Loop.state` if present.
+2. Computes this iteration index and a per-iteration out dir.
+3. Calls `Boot_Systemd_Validate/run.sh` once.
+4. Parses `boot_kpi_this_run.txt`.
+5. Appends a row into `Boot_Systemd_KPI_stats.csv`.
+6. Computes averages into `Boot_Systemd_KPI_summary.txt`.
+7. In auto-reboot mode, updates state and reboots until all iterations complete.
 
-   ```text
-   <base_out_dir>/iter_<N>
-   ```
-
-3. Calls `Boot_Systemd_Validate/run.sh` once with:
-   - `--out <base_out_dir>/iter_N`
-   - `--boot-type <TYPE>`
-   - `--iterations <TOTAL>`
-   - Forwarded flags (`--disable-getty`, `--exclude-...`, `--verbose`, etc.)
-4. Parses `boot_kpi_this_run.txt` for this iteration, appends a row into:
-
-   ```text
-   Boot_Systemd_KPI_stats.csv
-   ```
-
-5. Computes averages over the last **N entries** for this `boot_type` and writes:
-
-   ```text
-   Boot_Systemd_KPI_summary.txt
-   ```
-
-6. In **auto-reboot mode**, if more iterations are pending:
-   - Updates `Boot_Systemd_KPI_Loop.state`
-   - Triggers a reboot
-   - A small systemd service (`boot-systemd-kpi-loop.service`) invokes this
-     script again on the next boot until all iterations complete.
-
-When all iterations finish, the wrapper:
-
-- Prints the KPI average summary to console.
-- Leaves `.csv` and `.summary.txt` for further analysis.
-- Cleans up the systemd hook + state file in auto-reboot mode.
+When all iterations finish, the wrapper prints the KPI average summary,
+leaves `.csv` and `.summary.txt` for analysis, and cleans up the systemd
+hook and state file in auto-reboot mode.
 
 ---
 
@@ -318,40 +464,25 @@ When all iterations finish, the wrapper:
 Usage: ./run.sh [OPTIONS]
 
 This wrapper:
-  * Runs Boot_Systemd_Validate once for the *current boot*
-  * Uses a per-iteration KPI out dir when --iterations > 1:
-      base: ../Boot_Systemd_Validate/logs_Boot_Systemd_Validate
-      iter: <base>/iter_<N>
+  * Runs Boot_Systemd_Validate once for the current boot
+  * Uses a per-iteration KPI out dir when --iterations > 1
   * Parses boot_kpi_this_run.txt from that test
   * Appends a row into Boot_Systemd_KPI_stats.csv
-  * Computes averages over the last N boots (per boot_type) and prints summary.
+  * Computes averages over the last N boots and prints summary.
 
 Options:
-  --kpi-script PATH   Override Boot_Systemd_Validate script path
-                      (default: ../Boot_Systemd_Validate/run.sh)
-
-  --kpi-out-dir DIR   Override base KPI output dir
-                      (default: ../Boot_Systemd_Validate/logs_Boot_Systemd_Validate)
-
-  --iterations N      Number of boots to average over (default: 1)
-  --boot-type TYPE    Tag for this run (e.g. cold, warm, unknown)
-
-  # Options forwarded to Boot_Systemd_Validate:
-  --disable-getty     Disable serial-getty@ttyS0.service
-  --disable-sshd      Disable sshd.service
+  --kpi-script PATH
+  --kpi-out-dir DIR
+  --iterations N
+  --boot-type TYPE
+  --disable-getty
+  --disable-sshd
   --exclude-networkd-wait-online
-                      Exclude systemd-networkd-wait-online.service
   --exclude-services "A B"
-                      Exclude these services from userspace/total
-  --no-svg            Disable SVG plot generation
-  --verbose           Print KPI .txt artifacts to console for debug
-
-  # Auto-reboot orchestration:
-  --auto-reboot       Install systemd hook and auto-reboot until
-                      --iterations boots are collected. State is
-                      stored in: Boot_Systemd_KPI_Loop.state
-
-  -h, --help          Show this help and exit
+  --no-svg
+  --verbose
+  --auto-reboot
+  -h, --help
 ```
 
 ---
@@ -360,39 +491,11 @@ Options:
 
 Under the same directory as `Boot_Systemd_KPI_Loop/run.sh`:
 
-- `Boot_Systemd_KPI_Loop.res`  
-  PASS/FAIL status for the wrapper itself.
-
-- `Boot_Systemd_KPI_Loop.state`  
-  Persistent state across reboots (total iterations, done so far, boot_type,
-  options, KPI script path/out dir). Removed automatically when all iterations
-  complete or on error.
-
-- `Boot_Systemd_KPI_stats.csv`  
-  Rolling KPI database across boots. Each row corresponds to the parsed
-  `boot_kpi_this_run.txt` of one boot (for a given `boot_type`).
-
-- `Boot_Systemd_KPI_summary.txt`  
-  Human-readable summary of averages over the last **N** entries of that
-  `boot_type`, e.g.:
-
-  ```text
-  Boot KPI summary (last 5 cold boot(s))
-   entries_used : 5
-   target_iterations : 5
-   boot_type : cold
-   avg_uefi_time_sec : ...
-   avg_firmware_time_sec : ...
-   avg_bootloader_time_sec : ...
-   avg_kernel_time_sec : ...
-   avg_userspace_time_sec : ...
-   avg_userspace_effective_time_sec : ...
-   avg_boot_total_sec : ...
-   avg_boot_total_effective_sec : ...
-  ```
-
-- `Boot_Systemd_KPI_Loop_stdout_<timestamp>.log`  
-  Stdout/stderr log(s) for the wrapper itself (if you preserve them).
+- `Boot_Systemd_KPI_Loop.res`
+- `Boot_Systemd_KPI_Loop.state`
+- `Boot_Systemd_KPI_stats.csv`
+- `Boot_Systemd_KPI_summary.txt`
+- `Boot_Systemd_KPI_Loop_stdout_<timestamp>.log`
 
 Per-iteration artifacts from `Boot_Systemd_Validate` live under:
 
@@ -402,78 +505,39 @@ Per-iteration artifacts from `Boot_Systemd_Validate` live under:
 ...
 ```
 
-Each `iter_N` has its own `boot_kpi_this_run.txt`, `analyze_time.txt`, etc.
-
 ---
 
 ### Auto-reboot mode details
 
 When `--auto-reboot` is passed:
 
-- The wrapper installs a small systemd service (e.g. `boot-systemd-kpi-loop.service`)
-  that runs the wrapper at boot.
-- On each boot, the wrapper:
-  - Runs `Boot_Systemd_Validate` once.
-  - Updates the `.state` file with the new iteration count.
-  - If more iterations are required, it requests `reboot` again.
-- After the final iteration:
-  - KPI averages are computed and printed.
-  - The systemd hook is removed.
-  - The state file is deleted.
-
-The reboot logic is designed to:
-
-- Ensure the reboot actually happens (falling back between `reboot` and `/sbin/reboot`).
-- Avoid blocking `systemd-analyze` permanently: the KPI scripts finish quickly,
-  and if any unit (including our own) prevents boot from completing, it will
-  show up in the “Bootup is not yet finished … list-jobs” diagnostics inside
-  each `iter_N/analyze_time.txt` and in the **console logs**.
+- The wrapper installs a small systemd service.
+- On each boot, it runs `Boot_Systemd_Validate` once.
+- If more iterations are required, it requests reboot again.
+- After the final iteration, it computes averages, removes the hook, and
+  deletes the state file.
 
 ---
 
 ### Typical usage examples
 
-**1) Manual KPI over last 5 cold boots (no auto-reboot)**
-
-You manually reboot the board between runs:
+**1) Manual KPI over last 5 cold boots**
 
 ```sh
-# Boot 1 (cold boot)
 ./run.sh --iterations 5 --boot-type cold --disable-getty --exclude-networkd-wait-online
-
-# Reboot the board manually (power-cycle or reboot)
-
-# Boot 2..5 – re-run the same command each time
-./run.sh --iterations 5 --boot-type cold --disable-getty --exclude-networkd-wait-online
-...
 ```
 
-After the 5th run, `Boot_Systemd_KPI_summary.txt` will contain the averages over
-the last 5 `cold` entries.
-
-**2) Fully automated cold-boot KPI campaign (auto-reboot)**
+**2) Fully automated cold-boot KPI campaign**
 
 ```sh
 ./run.sh   --iterations 5   --boot-type cold   --disable-getty   --exclude-networkd-wait-online   --auto-reboot
 ```
-
-The wrapper will:
-
-- Run `Boot_Systemd_Validate` on this boot.
-- Reboot automatically until 5 iterations are captured.
-- Finally, print a KPI summary and clean up the systemd hook/state.
 
 **3) Warm-boot KPI with extra service exclusions and verbose logs**
 
 ```sh
 ./run.sh   --iterations 3   --boot-type warm   --disable-getty   --exclude-networkd-wait-online   --exclude-services "docker.service weston.service"   --auto-reboot   --verbose
 ```
-
-This gives:
-
-- Per-iteration directories: `iter_1`, `iter_2`, `iter_3`.
-- Detailed logs printed to console from `Boot_Systemd_Validate` via `--verbose`.
-- Aggregated averages in `Boot_Systemd_KPI_summary.txt`.
 
 ---
 
@@ -483,32 +547,31 @@ This gives:
 | Scenario                                      | Recommended test                      | Notes                                                                 |
 |----------------------------------------------|---------------------------------------|-----------------------------------------------------------------------|
 | Standard CI pipeline (no reboot-resume)      | `Boot_Systemd_Validate`               | Run once per job; no reboot inside the script.                        |
-| Manual KPI measurement on a single boot      | `Boot_Systemd_Validate`               | E.g. after changing kernel/systemd configs.                          |
+| Manual KPI measurement on a single boot      | `Boot_Systemd_Validate`               | E.g. after changing kernel/systemd configs.                           |
 | Quick health-check of systemd units          | `Boot_Systemd_Validate`               | Use `--required` to gate on critical services.                        |
-| Lab KPI across N cold/warm boots             | `Boot_Systemd_KPI_Loop`               | Wrapper handles per-boot dirs + CSV + averages; you may reboot manually. |
+| Lab KPI across N cold/warm boots             | `Boot_Systemd_KPI_Loop`               | Wrapper handles per-boot dirs + CSV + averages.                       |
 | Automated multi-boot campaign in lab         | `Boot_Systemd_KPI_Loop` with `--auto-reboot` | State file + systemd hook handle the full loop.                 |
-| CI with explicit reboot-resume support       | `Boot_Systemd_KPI_Loop` (if allowed)  | CI must re-run the script after each reboot.                          |
+| CI with explicit reboot-resume support       | `Boot_Systemd_KPI_Loop` if allowed    | CI must re-run the script after each reboot.                          |
 
 ---
 
 4. Design principles
 --------------------
 
-- **Single responsibility**  
-  - `Boot_Systemd_Validate`: _measure one boot and emit KPIs_.  
-  - `Boot_Systemd_KPI_Loop`: _across boots: state, reboots, aggregation_.
+- **Single responsibility**
+  - `Boot_Systemd_Validate`: measure one boot and emit KPIs.
+  - `Boot_Systemd_KPI_Loop`: across boots: state, reboots, aggregation.
 
-- **CI friendliness**  
-  - CI that cannot handle reboots should only use `Boot_Systemd_Validate`.  
+- **CI friendliness**
+  - CI that cannot handle reboots should only use `Boot_Systemd_Validate`.
   - Reboot orchestration via `--auto-reboot` is explicitly opt-in.
 
-- **Robust & transparent**  
-  - Rolling CSV + summary for long-term trends.  
-  - Clear console logs for:
-    - service time exclusions,
-    - non-finished boots (`Bootup is not yet finished` + `systemctl list-jobs`),
-    - per-iteration KPI values.
+- **Robust & transparent**
+  - Rolling CSV + summary for long-term trends.
+  - Clear console logs for service time exclusions, non-finished boots,
+    per-iteration KPI values, and optional goal gating results.
 
-- **Local logs only**  
-  - All artifacts (CSV, SVG, journals, etc.) are stored under the test’s
-    working directory, making log collection and LAVA parsing straightforward.
+- **Local logs only**
+  - All artifacts are stored under the test working directory, making log
+    collection and LAVA parsing straightforward.
+
