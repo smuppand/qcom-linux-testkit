@@ -3849,3 +3849,281 @@ perf_geekbench_run_n_dump_all_metrics() {
   printf "single_total_avg=%s multi_total_avg=%s\n" "${single_total_avg:-}" "${multi_total_avg:-}"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# Boot KPI goal/gating helpers
+# ---------------------------------------------------------------------------
+
+perf_goal_file_get() {
+    goal_file=$1
+    metric=$2
+
+    [ -n "$goal_file" ] || {
+        echo ""
+        return 0
+    }
+
+    [ -f "$goal_file" ] || {
+        echo ""
+        return 0
+    }
+
+    perf_baseline_get "$metric" "$goal_file"
+}
+
+perf_goal_inline_get() {
+    goal_spec=$1
+    metric=$2
+
+    [ -n "$goal_spec" ] || {
+        echo ""
+        return 0
+    }
+
+    # Accept either:
+    # --goal 35
+    # --goal boot_total_effective_sec=35
+    # --goal boot_total_effective_sec:35
+    case "$goal_spec" in
+        *=*|*:*)
+            printf '%s\n' "$goal_spec" | tr ',' ' ' | tr ';' ' ' | awk -v k="$metric" '
+              {
+                for (i = 1; i <= NF; i++) {
+                  token = $i
+                  split(token, a, /[=:]/)
+                  if (a[1] == k && a[2] != "") {
+                    print a[2]
+                    exit
+                  }
+                }
+              }'
+            ;;
+        *)
+            # Plain numeric goal applies to selected/default metric.
+            printf '%s\n' "$goal_spec"
+            ;;
+    esac
+}
+
+perf_goal_resolve() {
+    metric=$1
+    goal_spec=$2
+    goal_file=$3
+
+    goal=""
+
+    goal="$(perf_goal_inline_get "$goal_spec" "$metric")"
+    if [ -z "$goal" ]; then
+        goal="$(perf_goal_file_get "$goal_file" "$metric")"
+    fi
+
+    printf '%s\n' "$goal"
+}
+
+perf_goal_check_max_sec() {
+    metric=$1
+    current=$2
+    goal=$3
+    report_file=$4
+
+    [ -n "$report_file" ] || report_file="/dev/null"
+
+    {
+        echo "metric=$metric"
+        echo "current_sec=${current:-unknown}"
+        echo "goal_sec=${goal:-unknown}"
+        echo "direction=lower_or_equal"
+    } >"$report_file" 2>/dev/null || true
+
+    if ! perf_is_number "$goal"; then
+        log_fail "Goal gating requested, but invalid/missing goal for $metric: ${goal:-<empty>}"
+        echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+        echo "reason=invalid_or_missing_goal" >>"$report_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! perf_is_number "$current"; then
+        log_fail "Goal gating requested, but current KPI is not numeric for $metric: ${current:-unknown}"
+        echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+        echo "reason=invalid_or_missing_current_value" >>"$report_file" 2>/dev/null || true
+        return 1
+    fi
+
+    pass="$(awk -v cur="$current" -v goal="$goal" 'BEGIN { if (cur <= goal) print 1; else print 0 }')"
+    delta="$(awk -v cur="$current" -v goal="$goal" 'BEGIN { printf("%.3f", cur - goal) }')"
+
+    echo "delta_sec=$delta" >>"$report_file" 2>/dev/null || true
+
+    if [ "$pass" = "1" ]; then
+        log_pass "Goal check PASS: $metric current=${current}s goal<=${goal}s"
+        echo "result=PASS" >>"$report_file" 2>/dev/null || true
+        return 0
+    fi
+
+    log_fail "Goal check FAIL: $metric current=${current}s goal<=${goal}s delta=${delta}s"
+    echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+    return 1
+}
+
+perf_normalize_key() {
+    printf '%s\n' "$1" |
+        tr '[:upper:]' '[:lower:]' |
+        sed 's/[^a-z0-9]/ /g; s/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
+perf_platform_probe_string() {
+    platform_override="${1:-}"
+
+    if [ -n "$platform_override" ]; then
+        printf '%s\n' "$platform_override"
+        return 0
+    fi
+
+    {
+        cat /proc/device-tree/model 2>/dev/null
+        cat /sys/devices/soc0/machine 2>/dev/null
+        cat /sys/devices/soc0/family 2>/dev/null
+        cat /sys/devices/soc0/soc_id 2>/dev/null
+        uname -n 2>/dev/null
+    } | tr '\000' '\n' | tr '\n' ' '
+}
+
+perf_alias_matches_platform() {
+    alias_list="$1"
+    platform_text="$2"
+ 
+    platform_norm="$(perf_normalize_key "$platform_text")"
+    [ -n "$platform_norm" ] || return 1
+ 
+    alias_lines="$(printf '%s\n' "$alias_list" | tr ',' '\n')"
+ 
+    while IFS= read -r alias; do
+        alias_norm="$(perf_normalize_key "$alias")"
+        [ -n "$alias_norm" ] || continue
+ 
+        haystack=" $platform_norm "
+        needle=" $alias_norm "
+ 
+        case "$haystack" in
+            *"$needle"*)
+                return 0
+                ;;
+        esac
+    done <<EOF
+$alias_lines
+EOF
+ 
+    return 1
+}
+
+perf_goal_file_get_for_platform() {
+    goal_file="$1"
+    metric="$2"
+    platform_override="$3"
+
+    [ -f "$goal_file" ] || return 1
+
+    platform_text="$(perf_platform_probe_string "$platform_override")"
+
+    while read -r aliases file_metric goal_value tolerance_value _rest; do
+        case "$aliases" in
+            ""|\#*) continue ;;
+        esac
+
+        [ "$file_metric" = "$metric" ] || continue
+
+        if perf_alias_matches_platform "$aliases" "$platform_text"; then
+            printf '%s:%s:%s\n' "$goal_value" "${tolerance_value:-}" "$aliases"
+            return 0
+        fi
+    done < "$goal_file"
+
+    return 1
+}
+
+perf_goal_check_max_sec_with_tolerance() {
+    metric="$1"
+    current="$2"
+    goal="$3"
+    tolerance_percent="$4"
+    report_file="$5"
+
+    [ -n "$report_file" ] || report_file="/dev/null"
+    [ -n "$tolerance_percent" ] || tolerance_percent=0
+
+    {
+        echo "metric=$metric"
+        echo "current_sec=${current:-unknown}"
+        echo "goal_sec=${goal:-unknown}"
+        echo "tolerance_percent=$tolerance_percent"
+        echo "direction=lower_or_equal_with_tolerance"
+    } >"$report_file" 2>/dev/null || true
+
+    if ! perf_is_number "$goal"; then
+        log_fail "Goal gating requested, but invalid/missing goal for $metric: ${goal:-<empty>}"
+        echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+        echo "reason=invalid_or_missing_goal" >>"$report_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! perf_is_number "$current"; then
+        log_fail "Goal gating requested, but current KPI is not numeric for $metric: ${current:-unknown}"
+        echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+        echo "reason=invalid_or_missing_current_value" >>"$report_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! perf_is_number "$tolerance_percent"; then
+        log_fail "Invalid goal tolerance percent: $tolerance_percent"
+        echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+        echo "reason=invalid_tolerance_percent" >>"$report_file" 2>/dev/null || true
+        return 1
+    fi
+
+    allowed_max="$(awk -v goal="$goal" -v pct="$tolerance_percent" \
+        'BEGIN { printf("%.3f", goal + ((goal * pct) / 100.0)) }')"
+
+    delta="$(awk -v cur="$current" -v allowed="$allowed_max" \
+        'BEGIN { printf("%.3f", cur - allowed) }')"
+
+    pass="$(awk -v cur="$current" -v allowed="$allowed_max" \
+        'BEGIN { if (cur <= allowed) print 1; else print 0 }')"
+
+    {
+        echo "allowed_max_sec=$allowed_max"
+        echo "delta_from_allowed_sec=$delta"
+    } >>"$report_file" 2>/dev/null || true
+
+    if [ "$pass" = "1" ]; then
+        log_pass "Goal check PASS: $metric current=${current}s goal=${goal}s tolerance=${tolerance_percent}% allowed<=${allowed_max}s"
+        echo "result=PASS" >>"$report_file" 2>/dev/null || true
+        return 0
+    fi
+
+    log_fail "Goal check FAIL: $metric current=${current}s goal=${goal}s tolerance=${tolerance_percent}% allowed<=${allowed_max}s delta=${delta}s"
+    echo "result=FAIL" >>"$report_file" 2>/dev/null || true
+    return 1
+}
+
+dump_debug_file() {
+  title="$1"
+  file_path="$2"
+  max_lines="${3:-80}"
+
+  [ -f "$file_path" ] || return 0
+
+  log_info "===== ${title}: ${file_path} ====="
+
+  awk -v max_lines="$max_lines" '
+    NR <= max_lines {
+      print
+      next
+    }
+    NR == max_lines + 1 {
+      print "... truncated after " max_lines " lines ..."
+      exit
+    }
+  ' "$file_path" 2>/dev/null || true
+
+  log_info "===== end ${title} ====="
+}
