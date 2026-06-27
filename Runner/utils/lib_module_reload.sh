@@ -1,12 +1,13 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause-Clear
+# SPDX-License-Identifier: BSD-3-Clause
 
 MRV_LAST_CMD_PID=""
 MRV_LAST_CMD_ELAPSED="0"
 MRV_LAST_TIMEOUT_DIR=""
 MRV_PROFILE_REASON=""
 
+# Reset all profile-provided variables before sourcing a profile.
 mrv_reset_profile_vars() {
   PROFILE_NAME=""
   PROFILE_DESCRIPTION=""
@@ -21,17 +22,190 @@ mrv_reset_profile_vars() {
   PROFILE_DEVICE_PATTERNS=""
   PROFILE_SYSFS_PATTERNS=""
   PROFILE_SELECTED_MODE=""
+  PROFILE_EXPECT_ABSENT_AFTER_UNLOAD=""
+  PROFILE_EXPECT_PRESENT_AFTER_LOAD=""
+  PROFILE_SKIP_IF_MODULES_LOADED=""
+  PROFILE_TOP_MODULE_CANDIDATES=""
+  PROFILE_UNLOAD_STACK=""
+  PROFILE_EXTRA_UNLOAD_MODULES=""
+  PROFILE_QUIESCE_SERVICES=""
+  PROFILE_QUIESCE_PROC_PATTERNS=""
+  PROFILE_QUIESCE_DEVICE_PATTERNS=""
+  PROFILE_QUIESCE_ONCE="no"
+  MRV_PROFILE_QUIESCED="0"
 }
 
+# Convert module names to the form used by lsmod and /proc/modules.
 mrv_module_lsmod_name() {
   printf '%s\n' "$1" | tr '-' '_'
 }
 
+# Return success when a module is either loaded or available through modinfo.
+mrv_module_available() {
+  mod="$1"
+
+  if mrv_module_loaded "$mod"; then
+    return 0
+  fi
+
+  if modinfo "$mod" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Return the first sysfs holder for a module, if any.
+mrv_module_first_holder_sysfs() {
+  mod="$1"
+
+  for holder_path in /sys/module/"$mod"/holders/*; do
+    [ -e "$holder_path" ] || continue
+    holder="${holder_path##*/}"
+    [ -n "$holder" ] || continue
+    printf '%s\n' "$holder"
+    return 0
+  done
+
+  return 1
+}
+
+# Return the first /proc/modules holder for a module, if any.
+mrv_module_first_holder_proc() {
+  mod="$1"
+
+  [ -r /proc/modules ] || return 1
+
+  awk -v target="$mod" '
+    $1 == target && $4 != "-" {
+      n = split($4, holders, ",")
+      for (i = 1; i <= n; i++) {
+        if (holders[i] != "") {
+          print holders[i]
+          exit
+        }
+      }
+    }
+  ' /proc/modules 2>/dev/null
+}
+
+# Select the reload target for a stack: holder first, candidates second, primary last.
+mrv_select_reload_top_module() {
+  primary="$1"
+  candidates="$2"
+  top_module=""
+
+  top_module="$(mrv_module_first_holder_sysfs "$primary" 2>/dev/null || true)"
+  if [ -n "$top_module" ]; then
+    printf '%s\n' "$top_module"
+    return 0
+  fi
+
+  top_module="$(mrv_module_first_holder_proc "$primary" 2>/dev/null || true)"
+  if [ -n "$top_module" ]; then
+    printf '%s\n' "$top_module"
+    return 0
+  fi
+
+  for candidate in $candidates; do
+    [ -n "$candidate" ] || continue
+    if mrv_module_available "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  if mrv_module_available "$primary"; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  return 1
+}
+
+# Configure generic stack reload commands from profile data.
+#
+# Profiles can define:
+# MODULE_NAME primary module
+# PROFILE_TOP_MODULE_CANDIDATES optional holder/top-module candidates
+# PROFILE_UNLOAD_STACK explicit unload order
+# PROFILE_EXTRA_UNLOAD_MODULES extra modules to unload after stack
+#
+# This helper intentionally avoids ${var:-command-with-${m}} expansion because
+# nested braces inside command strings can break POSIX shell parsing.
+module_reload_profile_setup_stack() {
+  primary="${MODULE_NAME:-}"
+  top_module=""
+  unload_stack=""
+
+  if [ -z "$primary" ]; then
+    MODULE_RELOAD_SUPPORTED="no"
+    return 0
+  fi
+
+  top_module="$(mrv_select_reload_top_module "$primary" "$PROFILE_TOP_MODULE_CANDIDATES" 2>/dev/null || true)"
+  if [ -z "$top_module" ]; then
+    MODULE_RELOAD_SUPPORTED="no"
+    return 0
+  fi
+
+  MODULE_NAME="$top_module"
+  MODULE_RELOAD_SUPPORTED="${MODULE_RELOAD_SUPPORTED:-yes}"
+
+  if [ -n "$PROFILE_UNLOAD_STACK" ]; then
+    unload_stack="$PROFILE_UNLOAD_STACK"
+  elif [ "$top_module" != "$primary" ]; then
+    unload_stack="$top_module $primary"
+  else
+    unload_stack="$primary"
+  fi
+
+  if [ -n "$PROFILE_EXTRA_UNLOAD_MODULES" ]; then
+    unload_stack="$unload_stack $PROFILE_EXTRA_UNLOAD_MODULES"
+  fi
+
+  if [ -z "$MODULE_UNLOAD_CMD" ]; then
+    MODULE_UNLOAD_CMD="modprobe -r $unload_stack"
+  fi
+
+  if [ -z "$MODULE_LOAD_CMD" ]; then
+    MODULE_LOAD_CMD="modprobe $top_module"
+  fi
+
+  if [ -z "$PROFILE_EXPECT_ABSENT_AFTER_UNLOAD" ]; then
+    PROFILE_EXPECT_ABSENT_AFTER_UNLOAD="$top_module"
+  fi
+
+  if [ -z "$PROFILE_EXPECT_PRESENT_AFTER_LOAD" ]; then
+    PROFILE_EXPECT_PRESENT_AFTER_LOAD="$top_module"
+  fi
+
+  return 0
+}
+
+# Return success when the module is present in lsmod.
 mrv_module_loaded() {
   name="$(mrv_module_lsmod_name "$1")"
   is_module_loaded "$name"
 }
 
+# Return success when another mutually exclusive module variant is already active.
+mrv_should_skip_for_loaded_conflict_modules() {
+  [ -n "$PROFILE_SKIP_IF_MODULES_LOADED" ] || return 1
+
+  for conflict_mod in $PROFILE_SKIP_IF_MODULES_LOADED; do
+    [ -n "$conflict_mod" ] || continue
+
+    if mrv_module_loaded "$conflict_mod"; then
+      MRV_PROFILE_REASON="conflicting active module is loaded: $conflict_mod"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Return success when a module is built into the kernel and cannot be unloaded.
 mrv_module_builtin() {
   if [ -f "/lib/modules/$(uname -r)/modules.builtin" ]; then
     mod_pat="$(printf '%s\n' "$1" | sed 's/_/[-_]/g')"
@@ -41,6 +215,7 @@ mrv_module_builtin() {
   return 1
 }
 
+# Wait until a module reaches the requested state: present or absent.
 mrv_wait_module_state() {
   want="$1"
   name="$2"
@@ -72,6 +247,7 @@ mrv_wait_module_state() {
   return 0
 }
 
+# Capture existence and metadata for profile-provided path patterns.
 mrv_capture_patterns() {
   patterns="$1"
   outfile="$2"
@@ -82,10 +258,12 @@ mrv_capture_patterns() {
     return 0
   fi
 
+  # Intentional word splitting: patterns are space-separated profile data.
   # shellcheck disable=SC2086
   set -- $patterns
   for pat in "$@"; do
     found=0
+    # Intentional glob expansion from profile data.
     # shellcheck disable=SC2086
     for path in $pat; do
       if [ -e "$path" ] || [ -L "$path" ]; then
@@ -100,6 +278,7 @@ mrv_capture_patterns() {
   done
 }
 
+# Capture status and recent logs for profile services.
 mrv_capture_services() {
   services="$1"
   outfile="$2"
@@ -116,6 +295,7 @@ mrv_capture_services() {
     return 0
   fi
 
+  # Intentional word splitting: services are space-separated profile data.
   # shellcheck disable=SC2086
   set -- $services
   for svc in "$@"; do
@@ -128,6 +308,7 @@ mrv_capture_services() {
   done
 }
 
+# Capture module, process, service, sysfs, and device state for evidence.
 mrv_capture_module_state() {
   outdir="$1"
   mkdir -p "$outdir"
@@ -169,7 +350,7 @@ mrv_capture_module_state() {
     printf '/sys/module/%s not present\n' "$sys_mod" > "$outdir/holders.log"
   fi
 
-  mrv_capture_services "$PROFILE_SERVICES" "$outdir/services.log"
+  mrv_capture_services "$PROFILE_SERVICES $PROFILE_QUIESCE_SERVICES" "$outdir/services.log"
   mrv_capture_patterns "$PROFILE_DEVICE_PATTERNS" "$outdir/devices.log"
   mrv_capture_patterns "$PROFILE_SYSFS_PATTERNS" "$outdir/profile_sysfs.log"
 
@@ -178,6 +359,7 @@ mrv_capture_module_state() {
   fi
 }
 
+# Capture /proc evidence for a command that timed out.
 mrv_capture_pid_timeout_snapshot() {
   pid="$1"
   outdir="$2"
@@ -192,6 +374,7 @@ mrv_capture_pid_timeout_snapshot() {
   fi
 }
 
+# Execute a shell command with timeout and command evidence logging.
 mrv_exec_with_timeout() {
   timeout_s="$1"
   logfile="$2"
@@ -243,6 +426,7 @@ mrv_exec_with_timeout() {
   return "$rc"
 }
 
+# Capture hang evidence after unload/load timeout.
 mrv_capture_hang_evidence() {
   phase="$1"
   outdir="$2"
@@ -261,9 +445,11 @@ mrv_capture_hang_evidence() {
 
   if command -v fuser >/dev/null 2>&1; then
     : > "$outdir/fuser.log"
+    # Intentional word splitting: device patterns are profile data.
     # shellcheck disable=SC2086
     set -- $PROFILE_DEVICE_PATTERNS
     for pat in "$@"; do
+      # Intentional glob expansion from profile data.
       # shellcheck disable=SC2086
       for path in $pat; do
         if [ -e "$path" ] || [ -L "$path" ]; then
@@ -285,11 +471,13 @@ mrv_capture_hang_evidence() {
   } > "$outdir/timeout_summary.log"
 }
 
+# Return success when a profile hook function exists.
 mrv_profile_override_defined() {
   fn_name="$1"
   command -v "$fn_name" >/dev/null 2>&1
 }
 
+# Return success when a systemd service is known on the target.
 module_reload_service_known() {
   svc="$1"
 
@@ -297,9 +485,10 @@ module_reload_service_known() {
     return 1
   fi
 
-  systemctl list-unit-files "$svc" >/dev/null 2>&1
+  systemctl show "$svc" >/dev/null 2>&1
 }
 
+# Read one systemd service state property.
 module_reload_service_state_value() {
   svc="$1"
   prop="$2"
@@ -312,6 +501,86 @@ module_reload_service_state_value() {
   fi
 }
 
+# Return the file used to track services stopped/masked by module reload tests.
+#
+# The file is under RESULT_ROOT so it is shared between the profile subshell and
+# the top-level run.sh cleanup trap.
+module_reload_restore_services_file() {
+  printf '%s\n' "${MRV_RESTORE_SERVICES_FILE:-${RESULT_ROOT:-/tmp}/.module_reload_services_to_restore}"
+}
+
+# Record services before stopping/masking them.
+#
+# We store the previous ActiveState so final restore can avoid starting services
+# that were already inactive before this test touched them.
+module_reload_record_restore_services() {
+  services="$1"
+  restore_file="$(module_reload_restore_services_file)"
+  restore_dir="$(dirname "$restore_file")"
+
+  [ -n "$services" ] || return 0
+
+  mkdir -p "$restore_dir" 2>/dev/null || true
+
+  for svc in $services; do
+    [ -n "$svc" ] || continue
+
+    if module_reload_service_known "$svc"; then
+      svc_state="$(module_reload_service_state_value "$svc" "ActiveState")"
+
+      if [ ! -f "$restore_file" ] || ! grep -q "^${svc} " "$restore_file" 2>/dev/null; then
+        printf '%s %s\n' "$svc" "$svc_state" >> "$restore_file"
+      fi
+    fi
+  done
+
+  return 0
+}
+
+# Restore every service previously stopped/masked by the module reload test.
+#
+# This is best-effort and should not fail the test. It unblocks the target after
+# failed unloads, post-unload validation failures, timeouts, or interrupted runs.
+#
+# Services that were active before quiesce are started again. Services that were
+# inactive before quiesce are only unmasked/reset, not force-started.
+module_reload_restore_recorded_services() {
+  log_tag="${1:-module-reload}"
+  restore_file="$(module_reload_restore_services_file)"
+ 
+  [ -f "$restore_file" ] || return 0
+ 
+  if ! command -v systemctl >/dev/null 2>&1; then
+    rm -f "$restore_file" 2>/dev/null || true
+    return 0
+  fi
+ 
+  while IFS=' ' read -r svc old_state rest || [ -n "$svc" ]; do
+    : "${rest:=}"
+    [ -n "$svc" ] || continue
+ 
+    if module_reload_service_known "$svc"; then
+      log_info "[$log_tag] restore: unmasking/resetting $svc"
+      module_reload_run_cmd_quiet_timeout 5 systemctl unmask "$svc" || true
+      module_reload_run_cmd_quiet_timeout 5 systemctl reset-failed "$svc" || true
+ 
+      case "$old_state" in
+        active|activating|reloading)
+          log_info "[$log_tag] restore: starting previously active service $svc"
+          module_reload_run_cmd_quiet_timeout 15 systemctl start "$svc" || true
+          ;;
+        *)
+          log_info "[$log_tag] restore: not starting $svc because previous state was ${old_state:-unknown}"
+          ;;
+      esac
+    fi
+  done < "$restore_file"
+ 
+  rm -f "$restore_file" 2>/dev/null || true
+  return 0
+}
+
+# List process IDs whose command line contains a pattern.
 module_reload_list_pids_by_pattern() {
   proc_pat="$1"
 
@@ -334,6 +603,7 @@ module_reload_list_pids_by_pattern() {
   done
 }
 
+# Return success when any process matching a pattern is running.
 module_reload_proc_running_pattern() {
   proc_pat="$1"
   pids="$(module_reload_list_pids_by_pattern "$proc_pat")"
@@ -344,6 +614,7 @@ module_reload_proc_running_pattern() {
   return 1
 }
 
+# Signal all processes whose command line contains a pattern.
 module_reload_signal_pattern() {
   proc_pat="$1"
   sig="$2"
@@ -360,6 +631,7 @@ module_reload_signal_pattern() {
   return 0
 }
 
+# Wait until no processes match any pattern.
 module_reload_wait_no_procs_patterns() {
   proc_patterns="$1"
   timeout_s="${2:-10}"
@@ -392,6 +664,7 @@ module_reload_wait_no_procs_patterns() {
   return 0
 }
 
+# Log current service states and matching process command lines.
 module_reload_log_service_process_summary() {
   services="$1"
   proc_patterns="$2"
@@ -430,6 +703,7 @@ module_reload_log_service_process_summary() {
   done
 }
 
+# Wait until all known services are active.
 module_reload_wait_services_active() {
   services="$1"
   timeout_s="${2:-15}"
@@ -466,6 +740,7 @@ module_reload_wait_services_active() {
   return 0
 }
 
+# Wait until all known services are inactive.
 module_reload_wait_services_inactive() {
   services="$1"
   timeout_s="${2:-15}"
@@ -502,54 +777,100 @@ module_reload_wait_services_inactive() {
   return 0
 }
 
+module_reload_run_cmd_quiet_timeout() {
+  timeout_s="$1"
+  shift
+  elapsed=0
+
+  if [ "$#" -eq 0 ]; then
+    return 1
+  fi
+
+  "$@" >/dev/null 2>&1 &
+  cmd_pid=$!
+
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$timeout_s" ] 2>/dev/null; then
+      kill -TERM "$cmd_pid" 2>/dev/null || true
+      sleep 1
+
+      if kill -0 "$cmd_pid" 2>/dev/null; then
+        kill -KILL "$cmd_pid" 2>/dev/null || true
+        sleep 1
+      fi
+
+      wait "$cmd_pid" 2>/dev/null || true
+      return 124
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  wait "$cmd_pid"
+  return $?
+}
+
+# Start and unmask known services, then wait until active.
 module_reload_start_services() {
   services="$1"
   timeout_s="${2:-15}"
   log_tag="${3:-module-reload}"
-
+ 
   if ! command -v systemctl >/dev/null 2>&1; then
     return 0
   fi
-
+ 
   for svc in $services; do
     if module_reload_service_known "$svc"; then
-      log_info "[$log_tag] start: unmasking and starting $svc"
-      systemctl unmask "$svc" >/dev/null 2>&1 || true
-      systemctl reset-failed "$svc" >/dev/null 2>&1 || true
-      systemctl start "$svc" >/dev/null 2>&1 || true
+      log_info "[$log_tag] start: unmasking $svc"
+      module_reload_run_cmd_quiet_timeout 5 systemctl unmask "$svc" || true
+ 
+      log_info "[$log_tag] start: resetting $svc"
+      module_reload_run_cmd_quiet_timeout 5 systemctl reset-failed "$svc" || true
+ 
+      log_info "[$log_tag] start: starting $svc"
+      module_reload_run_cmd_quiet_timeout "$timeout_s" systemctl start "$svc" || true
     fi
   done
-
+ 
   module_reload_wait_services_active "$services" "$timeout_s"
 }
 
+# Stop, mask, and kill known services and matching processes.
 module_reload_stop_mask_kill_services() {
   services="$1"
   proc_patterns="$2"
   timeout_s="${3:-20}"
   log_tag="${4:-module-reload}"
-
+ 
   if ! command -v systemctl >/dev/null 2>&1; then
     return 0
   fi
-
+ 
+  module_reload_record_restore_services "$services"
+ 
   for svc in $services; do
     if module_reload_service_known "$svc"; then
       log_info "[$log_tag] quiesce: stopping $svc"
-      systemctl stop "$svc" >/dev/null 2>&1 || true
+      if ! module_reload_run_cmd_quiet_timeout "$timeout_s" systemctl stop "$svc"; then
+        log_warn "[$log_tag] quiesce: stop timed out or failed for $svc"
+      fi
+ 
       log_info "[$log_tag] quiesce: masking $svc"
-      systemctl mask "$svc" >/dev/null 2>&1 || true
+      module_reload_run_cmd_quiet_timeout 5 systemctl mask "$svc" || true
+ 
       log_info "[$log_tag] quiesce: killing remaining $svc cgroup processes"
-      systemctl kill --kill-who=all "$svc" >/dev/null 2>&1 || true
+      module_reload_run_cmd_quiet_timeout 5 systemctl kill --kill-who=all "$svc" || true
     fi
   done
-
+ 
   for proc_pat in $proc_patterns; do
     module_reload_signal_pattern "$proc_pat" TERM "$log_tag"
   done
-
+ 
   sleep 2
-
+ 
   if ! module_reload_wait_no_procs_patterns "$proc_patterns" 5; then
     log_warn "[$log_tag] quiesce: TERM was not enough, sending SIGKILL to remaining processes"
     for proc_pat in $proc_patterns; do
@@ -557,18 +878,21 @@ module_reload_stop_mask_kill_services() {
     done
     sleep 1
   fi
-
+ 
   if ! module_reload_wait_services_inactive "$services" "$timeout_s"; then
+    log_warn "[$log_tag] quiesce: one or more services still not inactive after timeout"
     return 1
   fi
-
+ 
   if ! module_reload_wait_no_procs_patterns "$proc_patterns" 2; then
+    log_warn "[$log_tag] quiesce: one or more process patterns still present after timeout"
     return 1
   fi
-
+ 
   return 0
 }
 
+# Restore known services after a profile finishes.
 module_reload_restore_services() {
   services="$1"
   timeout_s="${2:-15}"
@@ -590,6 +914,7 @@ module_reload_restore_services() {
   module_reload_wait_services_active "$services" "$timeout_s"
 }
 
+# Dump status for a list of services to a file.
 module_reload_dump_service_status() {
   services="$1"
   svc_log="$2"
@@ -611,6 +936,160 @@ module_reload_dump_service_status() {
   return 0
 }
 
+# Scan /proc/*/fd for open descriptors matching path patterns.
+module_reload_scan_open_fds_by_path_patterns() {
+  path_patterns="$1"
+  out_file="$2"
+
+  : > "$out_file"
+
+  [ -n "$path_patterns" ] || return 1
+
+  for pid_dir in /proc/[0-9]*; do
+    [ -d "$pid_dir/fd" ] || continue
+    pid="${pid_dir##*/}"
+
+    for fd in "$pid_dir"/fd/*; do
+      [ -e "$fd" ] || continue
+
+      target="$(readlink "$fd" 2>/dev/null || true)"
+      [ -n "$target" ] || continue
+  for pat in $path_patterns; do
+        # Intentional glob pattern match from profile data.
+        # shellcheck disable=SC2254
+        case "$target" in
+          $pat)
+            cmd="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null || true)"
+            [ -n "$cmd" ] || cmd="$(cat "$pid_dir/comm" 2>/dev/null || true)"
+            printf 'pid=%s fd=%s target=%s cmd=%s\n' "$pid" "${fd##*/}" "$target" "$cmd" >> "$out_file"
+            ;;
+        esac
+      done
+    done
+  done
+
+  [ -s "$out_file" ]
+}
+
+# Terminate processes that keep matching device paths open.
+module_reload_kill_open_fd_users_by_path_patterns() {
+  path_patterns="$1"
+  timeout_s="${2:-10}"
+  log_tag="${3:-module-reload}"
+  out_file="${4:-/tmp/module_reload_open_fds.log}"
+
+  if ! module_reload_scan_open_fds_by_path_patterns "$path_patterns" "$out_file"; then
+    return 0
+  fi
+
+  log_warn "[$log_tag] open users found for profiled device paths: $out_file"
+
+  awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^pid=/) {
+          sub(/^pid=/, "", $i)
+          print $i
+        }
+      }
+    }
+  ' "$out_file" | sort -u | while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    log_warn "[$log_tag] sending SIGTERM to open-fd user pid=$pid"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+
+  elapsed=0
+  while [ "$elapsed" -lt "$timeout_s" ] 2>/dev/null; do
+    if ! module_reload_scan_open_fds_by_path_patterns "$path_patterns" "$out_file"; then
+      return 0
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^pid=/) {
+          sub(/^pid=/, "", $i)
+          print $i
+        }
+      }
+    }
+  ' "$out_file" | sort -u | while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    log_warn "[$log_tag] sending SIGKILL to remaining open-fd user pid=$pid"
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+
+  sleep 1
+
+  if module_reload_scan_open_fds_by_path_patterns "$path_patterns" "$out_file"; then
+    log_warn "[$log_tag] open users still present after SIGKILL: $out_file"
+    return 1
+  fi
+
+  return 0
+}
+
+# Generic quiesce helper for services, process patterns, and open device users.
+module_reload_profile_quiesce_resources() {
+  log_tag="${1:-$PROFILE_NAME}"
+  iter_dir="${2:-}"
+  timeout_s="${3:-20}"
+
+  services="${PROFILE_QUIESCE_SERVICES:-$PROFILE_SERVICES}"
+  procs="${PROFILE_QUIESCE_PROC_PATTERNS:-$PROFILE_PROC_PATTERNS}"
+  devs="${PROFILE_QUIESCE_DEVICE_PATTERNS:-$PROFILE_DEVICE_PATTERNS}"
+
+  module_reload_log_service_process_summary "$services" "$procs" "$log_tag"
+
+  if [ -n "$services" ] || [ -n "$procs" ]; then
+    if ! module_reload_stop_mask_kill_services "$services" "$procs" "$timeout_s" "$log_tag"; then
+      log_warn "[$log_tag] service/process quiesce did not fully complete"
+      module_reload_log_service_process_summary "$services" "$procs" "$log_tag"
+    fi
+  fi
+
+  if [ -n "$devs" ]; then
+    if [ -n "$iter_dir" ]; then
+      open_fd_log="$iter_dir/open_fds_before_unload.log"
+    else
+      open_fd_log="/tmp/module_reload_open_fds_before_unload.log"
+    fi
+
+    if ! module_reload_kill_open_fd_users_by_path_patterns "$devs" 10 "$log_tag" "$open_fd_log"; then
+      log_warn "[$log_tag] open device users remain after quiesce; skipping unsafe unload"
+      return 1
+    fi
+  fi
+
+  sleep 2
+  return 0
+}
+
+# Generic smoke helper that validates expected modules are loaded.
+module_reload_profile_smoke_modules_present() {
+  log_tag="${1:-$PROFILE_NAME}"
+  modules="$2"
+
+  [ -n "$modules" ] || modules="$MODULE_NAME"
+
+  for mod in $modules; do
+    if ! mrv_module_loaded "$mod"; then
+      log_fail "[$log_tag] expected module not loaded after reload: $mod"
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+# Dispatch optional profile prepare hook.
 module_reload_profile_prepare() {
   profile_root="$1"
   : "${profile_root:=}"
@@ -623,6 +1102,7 @@ module_reload_profile_prepare() {
   return 0
 }
 
+# Dispatch optional warmup hook or generic daemon warmup.
 module_reload_profile_warmup() {
   iter_dir="$1"
   : "${iter_dir:=}"
@@ -655,38 +1135,86 @@ module_reload_profile_warmup() {
   return 0
 }
 
-module_reload_profile_quiesce() {
-  iter_dir="$1"
-  : "${iter_dir:=}"
+# Best-effort restore for services stopped/masked only for quiesce.
+#
+# Unlike module_reload_restore_services(), this does not require services to
+# become active. This is needed for oneshot or optional services such as
+# pulseaudio.service, alsa-restore.service, and distro-specific units.
+module_reload_restore_quiesce_services_best_effort() {
+  services="$1"
+  log_tag="${2:-module-reload}"
 
-  if mrv_profile_override_defined profile_quiesce; then
-    profile_quiesce "$iter_dir"
-    return $?
-  fi
+  [ -n "$services" ] || return 0
 
   if ! command -v systemctl >/dev/null 2>&1; then
     return 0
   fi
 
+  for svc in $services; do
+    if module_reload_service_known "$svc"; then
+      log_info "[$log_tag] restore: unmasking/resetting $svc"
+      systemctl unmask "$svc" >/dev/null 2>&1 || true
+      systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+      log_info "[$log_tag] restore: starting $svc"
+      systemctl start "$svc" >/dev/null 2>&1 || true
+    fi
+  done
+
+  return 0
+}
+
+# Dispatch optional quiesce hook or generic daemon quiesce.
+module_reload_profile_quiesce() {
+  iter_dir="$1"
+  : "${iter_dir:=}"
+ 
+  if mrv_profile_override_defined profile_quiesce; then
+    profile_quiesce "$iter_dir"
+    return $?
+  fi
+ 
+  quiesce_services="${PROFILE_QUIESCE_SERVICES:-$PROFILE_SERVICES}"
+  quiesce_proc_patterns="${PROFILE_QUIESCE_PROC_PATTERNS:-$PROFILE_PROC_PATTERNS}"
+ 
+  if [ -z "$quiesce_services" ] && [ -z "$quiesce_proc_patterns" ]; then
+    return 0
+  fi
+ 
+  if [ "${PROFILE_QUIESCE_ONCE:-no}" = "yes" ] && [ "${MRV_PROFILE_QUIESCED:-0}" = "1" ]; then
+    log_info "[$PROFILE_NAME] quiesce: already completed once for this profile, skipping repeated quiesce"
+    return 0
+  fi
+ 
+  module_reload_log_service_process_summary \
+    "$quiesce_services" \
+    "$quiesce_proc_patterns" \
+    "$PROFILE_NAME"
+ 
   case "$PROFILE_SELECTED_MODE" in
-    basic)
-      return 0
-      ;;
-    daemon_lifecycle|service_rebind)
-      if ! module_reload_stop_mask_kill_services "$PROFILE_SERVICES" "$PROFILE_PROC_PATTERNS" 20 "$PROFILE_NAME"; then
-        module_reload_log_service_process_summary "$PROFILE_SERVICES" "$PROFILE_PROC_PATTERNS" "$PROFILE_NAME"
+    basic|daemon_lifecycle|service_rebind)
+      if ! module_reload_stop_mask_kill_services \
+        "$quiesce_services" \
+        "$quiesce_proc_patterns" \
+        20 \
+        "$PROFILE_NAME"; then
+        module_reload_log_service_process_summary \
+          "$quiesce_services" \
+          "$quiesce_proc_patterns" \
+          "$PROFILE_NAME"
         log_error "[$PROFILE_NAME] quiesce: services/processes did not fully stop"
         return 1
       fi
+      MRV_PROFILE_QUIESCED="1"
       ;;
     *)
       log_warn "[$PROFILE_NAME] unknown mode '$PROFILE_SELECTED_MODE', continuing without quiesce actions"
       ;;
   esac
-
+ 
   return 0
 }
 
+# Dispatch optional post-unload hook.
 module_reload_profile_post_unload() {
   iter_dir="$1"
   : "${iter_dir:=}"
@@ -699,41 +1227,54 @@ module_reload_profile_post_unload() {
   return 0
 }
 
+# Dispatch optional post-load hook or generic daemon restart.
 module_reload_profile_post_load() {
   iter_dir="$1"
-  svc_log="$iter_dir/post_load_services.log"
   : "${iter_dir:=}"
-
+  svc_log="$iter_dir/post_load_services.log"
+ 
   if mrv_profile_override_defined profile_post_load; then
     profile_post_load "$iter_dir"
     return $?
   fi
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 0
-  fi
-
+ 
   case "$PROFILE_SELECTED_MODE" in
     basic)
+      # Do not restore quiesced services after every basic-mode iteration.
+      #
+      # Restoring here causes repeated start/stop cycles for services such as
+      # pipewire, wireplumber, NetworkManager, and wpa_supplicant. For audio,
+      # repeated pipewire-pulse stop/start can stall the test.
+      #
+      # Services are restored once in module_reload_profile_finalize() or from
+      # the run.sh cleanup trap if the test exits early.
+      module_reload_dump_service_status "$PROFILE_QUIESCE_SERVICES" "$svc_log"
       return 0
       ;;
     daemon_lifecycle|service_rebind)
+      if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+      fi
+ 
       if ! module_reload_start_services "$PROFILE_SERVICES" 15 "$PROFILE_NAME"; then
         module_reload_log_service_process_summary "$PROFILE_SERVICES" "$PROFILE_PROC_PATTERNS" "$PROFILE_NAME"
         log_error "[$PROFILE_NAME] post-load: services failed to become active after reload"
+        module_reload_restore_recorded_services "$PROFILE_NAME"
         return 1
       fi
-
+ 
       module_reload_dump_service_status "$PROFILE_SERVICES" "$svc_log"
+      module_reload_restore_recorded_services "$PROFILE_NAME"
       ;;
     *)
       log_warn "[$PROFILE_NAME] unknown mode '$PROFILE_SELECTED_MODE', continuing without post-load actions"
       ;;
   esac
-
+ 
   return 0
 }
 
+# Dispatch optional smoke hook.
 module_reload_profile_smoke() {
   iter_dir="$1"
   : "${iter_dir:=}"
@@ -746,32 +1287,42 @@ module_reload_profile_smoke() {
   return 0
 }
 
+# Dispatch optional finalize hook or restore services that were managed.
 module_reload_profile_finalize() {
   profile_root="$1"
   : "${profile_root:=}"
-
+ 
   if mrv_profile_override_defined profile_finalize; then
     profile_finalize "$profile_root"
-    return $?
+    profile_finalize_rc=$?
+    module_reload_restore_recorded_services "$PROFILE_NAME"
+    return "$profile_finalize_rc"
   fi
-
+ 
+  module_reload_restore_recorded_services "$PROFILE_NAME"
+ 
   if ! command -v systemctl >/dev/null 2>&1; then
     return 0
   fi
-
+ 
   if ! module_reload_restore_services "$PROFILE_SERVICES" 15 "$PROFILE_NAME"; then
     log_error "[$PROFILE_NAME] finalize: failed to restore services"
     return 1
   fi
-
+ 
   return 0
 }
 
+# Validate the profile after it is sourced and before iterations run.
 mrv_profile_check() {
   requested_mode="$1"
 
   if [ -z "$PROFILE_NAME" ] || [ -z "$MODULE_NAME" ]; then
     MRV_PROFILE_REASON="profile missing PROFILE_NAME or MODULE_NAME"
+    return 2
+  fi
+
+  if mrv_should_skip_for_loaded_conflict_modules; then
     return 2
   fi
 
@@ -804,6 +1355,7 @@ mrv_profile_check() {
 
   required="${PROFILE_REQUIRED_CMDS:-}"
   if [ -n "$required" ]; then
+    # Intentional word splitting: required commands are profile data.
     # shellcheck disable=SC2086
     set -- $required
     for req in "$@"; do
@@ -821,22 +1373,68 @@ mrv_profile_check() {
   return 0
 }
 
+# Validate that a list of modules is present or absent.
+mrv_validate_module_list_state() {
+  want="$1"
+  modules="$2"
+
+  [ -n "$modules" ] || return 0
+
+  for mod in $modules; do
+    [ -n "$mod" ] || continue
+
+    case "$want" in
+      absent)
+        if mrv_module_loaded "$mod"; then
+          log_fail "[$PROFILE_NAME] expected module absent after unload, but still loaded: $mod"
+          return 1
+        fi
+        ;;
+      present)
+        if ! mrv_module_loaded "$mod"; then
+          log_fail "[$PROFILE_NAME] expected module present after load, but missing: $mod"
+          return 1
+        fi
+        ;;
+      *)
+        log_error "[$PROFILE_NAME] invalid module state request: $want"
+        return 1
+        ;;
+    esac
+  done
+
+  return 0
+}
+
+# Validate module state after unload completes.
 mrv_post_unload_validate() {
   if ! mrv_wait_module_state absent "$MODULE_NAME" "$TIMEOUT_SETTLE"; then
     log_fail "[$PROFILE_NAME] module still present after unload settle timeout"
     return 1
   fi
+
+  if ! mrv_validate_module_list_state absent "$PROFILE_EXPECT_ABSENT_AFTER_UNLOAD"; then
+    return 1
+  fi
+
   return 0
 }
 
+# Validate module state after load completes.
 mrv_post_load_validate() {
   if ! mrv_wait_module_state present "$MODULE_NAME" "$TIMEOUT_SETTLE"; then
     log_fail "[$PROFILE_NAME] module did not reappear after load settle timeout"
     return 1
   fi
+
+  if ! mrv_validate_module_list_state present "$PROFILE_EXPECT_PRESENT_AFTER_LOAD"; then
+    return 1
+  fi
+
   return 0
 }
 
+# Execute one unload/reload iteration for the active profile.
 mrv_run_iteration() {
   iter="$1"
   iter_dir="$RESULT_ROOT/$PROFILE_NAME/iter_$(printf '%02d' "$iter")"
@@ -967,6 +1565,7 @@ mrv_run_iteration() {
   return 0
 }
 
+# Run one profile in a subshell so profile variables and hooks do not leak.
 mrv_run_one_profile() (
   profile_file="$1"
   requested_mode="$2"
@@ -1021,6 +1620,7 @@ mrv_run_one_profile() (
   exit 0
 )
 
+# Resolve explicit module, profile list, enabled list, or all profile files.
 mrv_resolve_profiles() {
   target_module="$1"
   profile_dir="$2"
@@ -1059,3 +1659,4 @@ mrv_resolve_profiles() {
 
   return 0
 }
+
