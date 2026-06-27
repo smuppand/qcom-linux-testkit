@@ -1,6 +1,6 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause-Clear
+# SPDX-License-Identifier: BSD-3-Clause
 
 SCRIPT_DIR="$(
   cd "$(dirname "$0")" || exit 1
@@ -60,7 +60,7 @@ Usage: $0 [options]
   --mode MODE Profile mode override
   --profile-dir PATH Override profile directory
   --profile-list FILE Override enabled profile list file
-  --enable-sysrq-hang-dump Enable sysrq dump on timeout paths
+  --enable-sysrq-hang-dump [0|1] Enable sysrq dump on timeout paths, optional value accepted
   --disable-sysrq-hang-dump Disable sysrq dump on timeout paths
   --verbose Enable verbose shell logging
   --help|-h Show this help
@@ -69,17 +69,39 @@ EOF
 
 # shellcheck disable=SC2317  # invoked via trap
 cleanup() {
+  if command -v module_reload_restore_recorded_services >/dev/null 2>&1; then
+    module_reload_restore_recorded_services "$TESTNAME-cleanup" >/dev/null 2>&1 || true
+  fi
+ 
   if [ -n "$PROFILE_TMP_LIST" ]; then
     rm -f "$PROFILE_TMP_LIST" 2>/dev/null
   fi
 }
- 
+
+parse_sysrq_value() {
+  value="$1"
+
+  case "$value" in
+    1|yes|true|enable|enabled|on)
+      ENABLE_SYSRQ_HANG_DUMP=1
+      ;;
+    0|no|false|disable|disabled|off)
+      ENABLE_SYSRQ_HANG_DUMP=0
+      ;;
+    *)
+      log_error "Invalid sysrq hang dump value: $value"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
 trap 'cleanup' EXIT INT TERM
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --module)
-      if [ $# -lt 2 ] || [ -z "$2" ]; then
+      if [ $# -lt 2 ]; then
         log_error "Missing value for --module"
         usage
         exit 1
@@ -124,7 +146,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --mode)
-      if [ $# -lt 2 ] || [ -z "$2" ]; then
+      if [ $# -lt 2 ]; then
         log_error "Missing value for --mode"
         usage
         exit 1
@@ -142,7 +164,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --profile-list)
-      if [ $# -lt 2 ] || [ -z "$2" ]; then
+      if [ $# -lt 2 ]; then
         log_error "Missing value for --profile-list"
         usage
         exit 1
@@ -151,8 +173,21 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --enable-sysrq-hang-dump)
-      ENABLE_SYSRQ_HANG_DUMP=1
-      shift
+      if [ $# -ge 2 ]; then
+        case "$2" in
+          --*)
+            ENABLE_SYSRQ_HANG_DUMP=1
+            shift
+            ;;
+          *)
+            parse_sysrq_value "$2"
+            shift 2
+            ;;
+        esac
+      else
+        ENABLE_SYSRQ_HANG_DUMP=1
+        shift
+      fi
       ;;
     --disable-sysrq-hang-dump)
       ENABLE_SYSRQ_HANG_DUMP=0
@@ -174,6 +209,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ -z "$PROFILE_LIST_FILE" ]; then
+  PROFILE_LIST_FILE="$PROFILE_LIST_DEFAULT"
+fi
+
 if [ "$VERBOSE" -eq 1 ] 2>/dev/null; then
   set -x
 fi
@@ -189,6 +228,10 @@ case "$TIMEOUT_LOAD" in
 esac
 case "$TIMEOUT_SETTLE" in
   ''|*[!0-9]*) log_error "Invalid --timeout-settle: $TIMEOUT_SETTLE"; exit 1 ;;
+esac
+case "$ENABLE_SYSRQ_HANG_DUMP" in
+  0|1) ;;
+  *) log_error "Invalid sysrq hang dump setting: $ENABLE_SYSRQ_HANG_DUMP"; exit 1 ;;
 esac
 
 test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
@@ -211,7 +254,7 @@ else
   log_info "Platform Details: unknown"
 fi
 
-log_info "Args: module='${TARGET_MODULE:-all-enabled}' iterations=$ITERATIONS unload_timeout=$TIMEOUT_UNLOAD load_timeout=$TIMEOUT_LOAD settle_timeout=$TIMEOUT_SETTLE mode='${PROFILE_MODE:-profile-default}' sysrq_dump=$ENABLE_SYSRQ_HANG_DUMP"
+log_info "Args: module='${TARGET_MODULE:-all-enabled}' profile_list='${PROFILE_LIST_FILE}' iterations=$ITERATIONS unload_timeout=$TIMEOUT_UNLOAD load_timeout=$TIMEOUT_LOAD settle_timeout=$TIMEOUT_SETTLE mode='${PROFILE_MODE:-profile-default}' sysrq_dump=$ENABLE_SYSRQ_HANG_DUMP"
 
 if [ "$ENABLE_SYSRQ_HANG_DUMP" -eq 1 ] 2>/dev/null; then
   log_info "Sysrq hang dump policy: enabled on timeout paths only"
