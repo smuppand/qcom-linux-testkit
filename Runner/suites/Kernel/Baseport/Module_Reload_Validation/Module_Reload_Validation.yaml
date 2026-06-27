@@ -3,7 +3,7 @@ metadata:
   format: "Lava-Test Test Definition 1.0"
   description: "Generic profiled kernel module unload/reload regression validation"
   maintainer:
-    - Srikanth kumar
+    - Srikanth Kumar
   os:
     - linux
   scope:
@@ -11,6 +11,7 @@ metadata:
 
 params:
   PROFILE: ""
+  PROFILE_LIST: ""
   ITERATIONS: "3"
   MODE: ""
   TIMEOUT_UNLOAD: "30"
@@ -22,7 +23,5 @@ run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Kernel/Baseport/Module_Reload_Validation
-    - SYSRQ_ARG=""
-    - if [ "${ENABLE_SYSRQ_HANG_DUMP}" = "0" ]; then SYSRQ_ARG="--disable-sysrq-hang-dump"; fi
-    - ./run.sh --module "${PROFILE}" --iterations "${ITERATIONS}" --mode "${MODE}" --timeout-unload "${TIMEOUT_UNLOAD}" --timeout-load "${TIMEOUT_LOAD}" --timeout-settle "${TIMEOUT_SETTLE}" ${SYSRQ_ARG} || true
+    - ./run.sh --module "${PROFILE}" --profile-list "${PROFILE_LIST}" --iterations "${ITERATIONS}" --mode "${MODE}" --timeout-unload "${TIMEOUT_UNLOAD}" --timeout-load "${TIMEOUT_LOAD}" --timeout-settle "${TIMEOUT_SETTLE}" --enable-sysrq-hang-dump "${ENABLE_SYSRQ_HANG_DUMP}" || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh Module_Reload_Validation.res
