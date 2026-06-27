@@ -1,0 +1,14 @@
+fastrpc
+dwmac_qcom_eth
+tc956x_pcie_eth
+ath11k_pci
+ath11k_ahb
+ath12k_pci
+qcedev_mod_dlkm
+qcrypto_msm_dlkm
+qrng_dlkm
+spcom
+mvm
+venus_core
+qcom_iris
+snd_soc_qcom_sdw
