@@ -28,8 +28,12 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     . "$INIT_ENV"
     __INIT_ENV_LOADED=1
 fi
+
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
+
+# shellcheck disable=SC1090,SC1091
+. "$TOOLS/lib_fastrpc.sh"
 # ---------------------------------------------------------------
 
 # Defaults
@@ -85,12 +89,20 @@ Env:
 
 Notes:
 - Script *cd*s into the binary directory and launches ./fastrpc_test.
-- Libraries are resolved via:
-    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/fastrpc_test[:\$LD_LIBRARY_PATH]
-- DSP skeletons are resolved via (if present):
-    ADSP_LIBRARY_PATH=/usr/local/share/fastrpc_test/v75[:v68]
-    CDSP_LIBRARY_PATH=/usr/local/share/fastrpc_test/v75[:v68]
-    SDSP_LIBRARY_PATH=/usr/local/share/fastrpc_test/v75[:v68]
+- Libraries and DSP skeletons are auto-discovered using lib_fastrpc.sh.
+- Supported layouts include:
+    Yocto/current:
+      /usr/local/lib
+      /usr/local/lib/fastrpc_test
+      /usr/local/share/fastrpc_test
+    Debian:
+      /usr/lib/<multiarch>
+      /usr/lib/<multiarch>/fastrpc_test
+      /usr/share/fastrpc_test
+- Optional overrides:
+    FASTRPC_LIB_SYS_DIR
+    FASTRPC_LIB_TEST_DIR
+    FASTRPC_SKEL_BASE
 - Domain mapping: ADSP=0 MDSP=1 SDSP=2 CDSP=3 CDSP1=4 GPDSP0=5 GPDSP1=6
 - PD support: ADSP/MDSP/SDSP support signed only; CDSP/CDSP1/GPDSP support both.
 EOF
@@ -115,12 +127,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# ---- Back-compat: accept --assets-dir but ignore in the new /usr/local layout.
+# ---- Back-compat: accept --assets-dir but ignore in the new auto-discovered layout.
 # Export so external tooling (or legacy wrappers) can still read it.
 if [ -n "${ASSETS_DIR:-}" ]; then
     export ASSETS_DIR
-    log_info "(compat) --assets-dir provided: $ASSETS_DIR (ignored with /usr/local layout)"
+    log_info "(compat) --assets-dir provided: $ASSETS_DIR (ignored with auto-discovered FastRPC runtime layout)"
 fi
+
+# Variables consumed by sourced FastRPC helper functions in lib_fastrpc.sh.
+# Export them so ShellCheck treats this as an explicit run.sh -> lib_fastrpc.sh
+# interface instead of reporting SC2034.
+export CLI_DOMAIN
+export CLI_DOMAIN_NAME
+export UNSIGNED_PD_FLAG
+export VERBOSE
 
 # ---------- Validation ----------
 case "$REPEAT" in *[!0-9]*|"") log_error "Invalid --repeat: $REPEAT"; echo "$TESTNAME : FAIL" >"$RESULT_FILE"; exit 0 ;; esac
@@ -143,245 +163,7 @@ cd "$test_path" || {
     exit 0
 }
 
-# -------------------- Helpers --------------------
-# shellcheck disable=SC2317 # Helper kept for optional debug use.
-log_debug() {
-    if [ "$VERBOSE" -eq 1 ]; then
-        log_info "[debug] $*" >&2
-    fi
-}
-
-cmd_to_string() {
-    out=""
-    for a in "$@"; do
-        case "$a" in
-            *[!A-Za-z0-9._:/-]*|"")
-                q=$(printf "%s" "$a" | sed "s/'/'\\\\''/g")
-                out="$out '$q'"
-                ;;
-            *)
-                out="$out $a"
-                ;;
-        esac
-    done
-    printf "%s" "$out"
-}
-
-extract_test_summary_counts() {
-    log_file="$1"
-
-    total="$(sed -n 's/^[[:space:]]*Total tests run:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$log_file" | tail -n 1)"
-    passed="$(sed -n 's/^[[:space:]]*Passed:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$log_file" | tail -n 1)"
-    failed="$(sed -n 's/^[[:space:]]*Failed:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$log_file" | tail -n 1)"
-    skipped="$(sed -n 's/^[[:space:]]*Skipped:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$log_file" | tail -n 1)"
-
-    case "$total" in ''|*[!0-9]*) total=0 ;; esac
-    case "$passed" in ''|*[!0-9]*) passed=0 ;; esac
-    case "$failed" in ''|*[!0-9]*) failed=0 ;; esac
-    case "$skipped" in ''|*[!0-9]*) skipped=0 ;; esac
-
-    printf '%s:%s:%s:%s\n' "$total" "$passed" "$failed" "$skipped"
-}
-
-# Returns true if the only failing subtest is libhap_example.so
-# Used to treat HAP_mem DMA failures as known-skip on affected SoCs
-only_hap_example_failed() {
-    log_file="$1"
-    [ -r "$log_file" ] || return 1
-    grep -F -q "[FAIL]" "$log_file" || return 1
-    ! grep -F "[FAIL]" "$log_file" | grep -q -v "libhap_example.so"
-}
-
-log_dsp_remoteproc_status() {
-    fw_list="adsp mdsp sdsp cdsp cdsp0 cdsp1 gdsp0 gdsp1 gpdsp0 gpdsp1"
-    any=0
-    for fw in $fw_list; do
-        if dt_has_remoteproc_fw "$fw" || [ -n "$(get_remoteproc_by_firmware "$fw" "" all 2>/dev/null || true)" ]; then
-            entries="$(get_remoteproc_by_firmware "$fw" "" all 2>/dev/null)" || entries=""
-            if [ -n "$entries" ]; then
-                any=1
-                while IFS='|' read -r rpath rstate rfirm rname; do
-                    [ -n "$rpath" ] || continue
-                    inst="$(basename "$rpath")"
-                    log_info "rproc.$fw: $inst path=$rpath state=$rstate fw=$rfirm name=$rname"
-                done <<__RPROC__
-$entries
-__RPROC__
-            fi
-        fi
-    done
-    [ $any -eq 0 ] && log_info "rproc: no *dsp remoteproc entries detected via DT"
-}
-
-name_to_domain() {
-    case "$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')" in
-        adsp) echo 0 ;;
-        mdsp) echo 1 ;;
-        sdsp) echo 2 ;;
-        cdsp) echo 3 ;;
-        cdsp1) echo 4 ;;
-        gpdsp0|gdsp0) echo 5 ;;
-        gpdsp1|gdsp1) echo 6 ;;
-        *) echo "" ;;
-    esac
-}
-
-# Helper to get domain name from id
-domain_to_name() {
-    case "$1" in
-        0) echo "ADSP" ;;
-        1) echo "MDSP" ;;
-        2) echo "SDSP" ;;
-        3) echo "CDSP" ;;
-        4) echo "CDSP1" ;;
-        5) echo "GPDSP0" ;;
-        6) echo "GPDSP1" ;;
-        *) echo "UNKNOWN" ;;
-    esac
-}
-
-# Helper to append unique word
-append_unique() {
-    current="$1"
-    new="$2"
-    for word in $current; do
-        [ "$word" = "$new" ] && { printf "%s" "$current"; return; }
-    done
-    [ -n "$current" ] && printf "%s %s" "$current" "$new" || printf "%s" "$new"
-}
-
-# Helper to normalize remoteproc/firmware names
-canonicalize_domain_name() {
-    norm="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    case "$norm" in
-        cdsp0) echo "cdsp" ;;
-        gdsp0) echo "gpdsp0" ;;
-        gdsp1) echo "gpdsp1" ;;
-        *) printf "%s" "$norm" ;;
-    esac
-}
-
-# Discover all supported domains
-discover_supported_domains() {
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - discover_supported_domains: helper-backed discovery active" >&2
-
-    for fw in adsp mdsp sdsp cdsp cdsp0 cdsp1 gpdsp0 gpdsp1 gdsp0 gdsp1; do
-        entries="$(get_remoteproc_by_firmware "$fw" "" all 2>/dev/null || true)"
-
-        if [ -n "$entries" ]; then
-            while IFS='|' read -r rpath rstate rfirm rname; do
-                nameguess=""
-
-                if [ -n "$rname" ]; then
-                    nameguess="$rname"
-                elif [ -n "$rfirm" ]; then
-                    nameguess=$(basename "$rfirm" 2>/dev/null | sed 's/\.[^.]*$//')
-                fi
-
-                [ -n "$nameguess" ] || continue
-
-                canon="$(canonicalize_domain_name "$nameguess")"
-                d="$(name_to_domain "$canon")"
-
-                if [ -n "$d" ]; then
-                    printf '%s\n' "$d"
-                    log_debug "discover: fw=$fw rname=$rname rfirm=$rfirm canon=$canon domain=$d state=$rstate"
-                else
-                    log_debug "discover: fw=$fw rname=$rname rfirm=$rfirm canon=$canon domain=<none>"
-                fi
-            done <<EOF
-$entries
-EOF
-        elif dt_has_remoteproc_fw "$fw"; then
-            canon="$(canonicalize_domain_name "$fw")"
-            d="$(name_to_domain "$canon")"
-
-            if [ -n "$d" ]; then
-                printf '%s\n' "$d"
-                log_debug "discover: fw=$fw dt-only canon=$canon domain=$d"
-            fi
-        else
-            log_debug "discover: fw=$fw not present"
-        fi
-    done
-}
-
-# Resolve which domains to test
-resolve_domains_to_test() {
-    resolved=""
-    if [ -n "$CLI_DOMAIN_NAME" ]; then
-        resolved="$(name_to_domain "$CLI_DOMAIN_NAME")"
-    elif [ -n "$CLI_DOMAIN" ]; then
-        resolved="$CLI_DOMAIN"
-    elif [ "$DOMAIN_MODE" = "single" ]; then
-        if [ -n "${FASTRPC_DOMAIN_NAME:-}" ]; then
-            resolved="$(name_to_domain "$FASTRPC_DOMAIN_NAME")"
-        elif [ -n "${FASTRPC_DOMAIN:-}" ]; then
-            resolved="$FASTRPC_DOMAIN"
-        fi
-    else
-        resolved="$(discover_supported_domains)"
-    fi
-
-    log_debug "resolve: raw domains='$resolved'"
-
-    valid=""
-    for d in $resolved; do
-        case "$d" in
-            0|1|2|3|4|5|6)
-                case " $valid " in
-                    *" $d "*) : ;;
-                    *)
-                        if [ -n "$valid" ]; then
-                            valid="${valid} ${d}"
-                        else
-                            valid="$d"
-                        fi
-                        ;;
-                esac
-                ;;
-            *)
-                log_warn "Ignoring invalid domain '$d'"
-                ;;
-        esac
-    done
-    printf '%s' "$valid"
-}
-
-# Get supported PD values for a domain
-domain_supported_pds() {
-    case "$1" in
-        0|1|2) printf "%s" "0" ;; # ADSP/MDSP/SDSP: signed only
-        3|4|5|6) printf "%s" "0 1" ;; # CDSP/CDSP1/GPDSP: both
-        *) printf "%s" "" ;;
-    esac
-}
-
-# Get requested PD values
-# Priority: --unsigned-pd CLI flag > FASTRPC_UNSIGNED_PD env > --pd-mode
-requested_pds() {
-    [ "$UNSIGNED_PD_FLAG" -eq 1 ] && { printf "%s" "1"; return; }
-    [ "${FASTRPC_UNSIGNED_PD:-0}" -eq 1 ] && { printf "%s" "1"; return; }
-    case "$PD_MODE" in
-        signed-only) printf "%s" "0" ;;
-        unsigned-only) printf "%s" "1" ;;
-        both) printf "%s" "0 1" ;;
-    esac
-}
-
-# Get effective PD values for a domain
-effective_pds_for_domain() {
-    domain="$1"
-    requested="$(requested_pds)"
-    supported="$(domain_supported_pds "$domain")"
-    effective=""
-    for req in $requested; do
-        for sup in $supported; do
-            [ "$req" = "$sup" ] && effective="$(append_unique "$effective" "$req")"
-        done
-    done
-    printf "%s" "$effective"
-}
+# FastRPC helper functions are provided by Runner/utils/lib_fastrpc.sh.
 
 # -------------------- Banner --------------------
 log_info "--------------------------------------------------------------------------"
@@ -405,7 +187,7 @@ case "$BIN_DIR" in
             echo "$TESTNAME : SKIP" >"$RESULT_FILE"
             exit 0
         fi
-    ;;
+        ;;
 esac
 
 RUN_DIR="$BIN_DIR"
@@ -417,18 +199,8 @@ if [ ! -x "$RUN_BIN" ]; then
     exit 0
 fi
 
-# New layout checks (replace legacy 'linux/' checks)
-LIB_SYS_DIR="/usr/local/lib"
-LIB_TEST_DIR="/usr/local/lib/fastrpc_test"
-SKEL_BASE="/usr/local/share/fastrpc_test"
-
-SKEL_PATH=""
-[ -d "$SKEL_BASE/v75" ] && SKEL_PATH="${SKEL_PATH:+$SKEL_PATH:}$SKEL_BASE/v75"
-[ -d "$SKEL_BASE/v68" ] && SKEL_PATH="${SKEL_PATH:+$SKEL_PATH:}$SKEL_BASE/v68"
-
-[ -d "$LIB_SYS_DIR" ] || log_warn "Missing system libs dir: $LIB_SYS_DIR (lib{adsp,cdsp,sdsp}rpc*.so expected)"
-[ -d "$LIB_TEST_DIR" ] || log_warn "Missing test libs dir: $LIB_TEST_DIR (libcalculator.so, etc.)"
-[ -n "$SKEL_PATH" ] || log_warn "No DSP skeleton dirs found under: $SKEL_BASE (expected v75/ v68/)"
+# -------------------- Runtime layout discovery --------------------
+fastrpc_setup_runtime_layout
 
 log_info "Using binary: $RUN_BIN"
 log_info "Run dir: $RUN_DIR (launching ./fastrpc_test)"
@@ -436,20 +208,6 @@ log_info "Binary details:"
 log_info " ls -l: $(ls -l "$RUN_BIN" 2>/dev/null || echo 'N/A')"
 log_info " file : $(file "$RUN_BIN" 2>/dev/null || echo 'N/A')"
 
-# >>>>>>>>>>>>>>>>>>>>>> ENV for your initramfs layout <<<<<<<<<<<<<<<<<<<<<<
-# Libraries: system + test payloads
-export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/fastrpc_test${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# Skeletons: export if present (don't clobber if user already set)
-[ -n "$SKEL_PATH" ] && {
-    : "${ADSP_LIBRARY_PATH:=$SKEL_PATH}"; export ADSP_LIBRARY_PATH
-    : "${CDSP_LIBRARY_PATH:=$SKEL_PATH}"; export CDSP_LIBRARY_PATH
-    : "${SDSP_LIBRARY_PATH:=$SKEL_PATH}"; export SDSP_LIBRARY_PATH
-}
-log_info "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
-[ -n "${ADSP_LIBRARY_PATH:-}" ] && log_info "ADSP_LIBRARY_PATH=${ADSP_LIBRARY_PATH}"
-[ -n "${CDSP_LIBRARY_PATH:-}" ] && log_info "CDSP_LIBRARY_PATH=${CDSP_LIBRARY_PATH}"
-[ -n "${SDSP_LIBRARY_PATH:-}" ] && log_info "SDSP_LIBRARY_PATH=${SDSP_LIBRARY_PATH}"
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # Ensure /usr/lib/dsp has the expected DSP artifacts (generic, idempotent)
 ensure_usr_lib_dsp_symlinks
 # Log *dsp remoteproc statuses via existing helpers
@@ -466,12 +224,16 @@ if [ -z "$DOMAINS_TO_TEST" ]; then
 fi
 
 # -------------------- SoC-specific domain blacklist --------------------
-# QRB2210, Glymur CRD : FastRPC not supported - skip entire test
+# QRB2210: FastRPC not supported - skip entire test
 # QCS9075, QCS8275, QCS8300, QCS9100: GPDSP0 (domain 5) and GPDSP1 (domain 6) not supported currently
 # SM8850: libhap_example HAP_mem DMA not supported - treat as known skip per invocation
+#
+# Do not skip Glymur CRD by SoC name. Newer Glymur/Debian images expose
+# ADSP/CDSP remoteproc instances and FastRPC skeletons, so runtime discovery
+# should decide whether the test can run.
 soc_skip_all=0
 soc_skip_gpdsp=0
-
+ 
 case "$SOC_MACHINE" in
     *QRB2210*|*"Glymur CRD"*)
         soc_skip_all=1
@@ -492,7 +254,7 @@ if [ "$soc_skip_gpdsp" -eq 1 ]; then
     for d in $DOMAINS_TO_TEST; do
         case "$d" in
             5|6) log_info "SoC $SOC_MACHINE: skipping $(domain_to_name "$d") (not supported)" ;;
-            *)   filtered="${filtered:+$filtered }$d" ;;
+            *) filtered="${filtered:+$filtered }$d" ;;
         esac
     done
     DOMAINS_TO_TEST="$filtered"
@@ -651,9 +413,9 @@ for DOMAIN in $DOMAINS_TO_TEST; do
                 iter_f="$(printf '%s' "$iter_counts" | awk -F: '{print $3}')"
                 iter_s="$(printf '%s' "$iter_counts" | awk -F: '{print $4}')"
                 combo_subtests_total=$((combo_subtests_total + iter_t))
-                combo_subtests_pass=$((combo_subtests_pass  + iter_p))
-                combo_subtests_fail=$((combo_subtests_fail  + iter_f))
-                combo_subtests_skip=$((combo_subtests_skip  + iter_s))
+                combo_subtests_pass=$((combo_subtests_pass + iter_p))
+                combo_subtests_fail=$((combo_subtests_fail + iter_f))
+                combo_subtests_skip=$((combo_subtests_skip + iter_s))
             fi
 
             # Track invocation result immediately
@@ -702,7 +464,7 @@ overall_subtests_pass=0
 overall_subtests_fail=0
 overall_subtests_skip=0
 
-# shellcheck disable=SC2034  # _pass_cnt/_fail_cnt consumed from tracker but not used in display
+# shellcheck disable=SC2034 # _pass_cnt/_fail_cnt consumed from tracker but not used in display
 while IFS=: read -r domain pd_val _pass_cnt _fail_cnt combo_total_tests combo_pass_tests combo_fail_tests combo_skip_tests; do
     [ -z "$domain" ] && continue
 
@@ -715,14 +477,14 @@ while IFS=: read -r domain pd_val _pass_cnt _fail_cnt combo_total_tests combo_pa
 
     # Sanitize counts read from tracker
     case "$combo_total_tests" in ''|*[!0-9]*) combo_total_tests=0 ;; esac
-    case "$combo_pass_tests"  in ''|*[!0-9]*) combo_pass_tests=0  ;; esac
-    case "$combo_fail_tests"  in ''|*[!0-9]*) combo_fail_tests=0  ;; esac
-    case "$combo_skip_tests"  in ''|*[!0-9]*) combo_skip_tests=0  ;; esac
+    case "$combo_pass_tests" in ''|*[!0-9]*) combo_pass_tests=0 ;; esac
+    case "$combo_fail_tests" in ''|*[!0-9]*) combo_fail_tests=0 ;; esac
+    case "$combo_skip_tests" in ''|*[!0-9]*) combo_skip_tests=0 ;; esac
 
     overall_subtests_total=$((overall_subtests_total + combo_total_tests))
-    overall_subtests_pass=$((overall_subtests_pass  + combo_pass_tests))
-    overall_subtests_fail=$((overall_subtests_fail  + combo_fail_tests))
-    overall_subtests_skip=$((overall_subtests_skip  + combo_skip_tests))
+    overall_subtests_pass=$((overall_subtests_pass + combo_pass_tests))
+    overall_subtests_fail=$((overall_subtests_fail + combo_fail_tests))
+    overall_subtests_skip=$((overall_subtests_skip + combo_skip_tests))
 
     if [ "$combo_total_tests" -eq 0 ]; then
         status="SKIP"
