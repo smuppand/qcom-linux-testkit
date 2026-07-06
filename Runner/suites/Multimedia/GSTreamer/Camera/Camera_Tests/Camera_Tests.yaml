@@ -29,4 +29,4 @@ run:
     - cd "$REPO_PATH/Runner/suites/Multimedia/GSTreamer/Camera/Camera_Tests"
     - export CAMERA_ID CAMERA_PLUGIN CAMERA_TEST_MODES CAMERA_FORMATS CAMERA_RESOLUTIONS CAMERA_FRAMERATE CAMERA_DURATION CAMERA_GST_DEBUG
     - ./run.sh --lava-testcase-id "${LAVA_TESTCASE_ID}" || true
-    - "$REPO_PATH/Runner/utils/send-to-lava.sh" Camera_Tests.res
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Camera_Tests.res
