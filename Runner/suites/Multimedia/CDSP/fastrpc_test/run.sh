@@ -4,8 +4,10 @@
 # --------- Robustly source init_env and functestlib.sh ----------
 
 TESTNAME="fastrpc_test"
-RESULT_FILE="$TESTNAME.res"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
+RESULT_FILE="$RES_FILE"
+ 
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
 while [ "$SEARCH" != "/" ]; do
@@ -15,26 +17,38 @@ while [ "$SEARCH" != "/" ]; do
     fi
     SEARCH=$(dirname "$SEARCH")
 done
-
+ 
 if [ -z "$INIT_ENV" ]; then
     echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
-    echo "$TESTNAME : FAIL" >"$RESULT_FILE" 2>/dev/null || true
+    echo "$TESTNAME FAIL" >"$RES_FILE" 2>/dev/null || true
     exit 0
 fi
-
+ 
 # Only source once (idempotent)
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
     __INIT_ENV_LOADED=1
 fi
-
+ 
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
-
+ 
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/lib_fastrpc.sh"
-# ---------------------------------------------------------------
+ 
+# Optional generic package-set recovery.
+# This must be a clean no-op when no package-set mapping exists for the active OS/provider.
+if [ -f "$TOOLS/lib_pkg_provider.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+ 
+    if ! pkg_ensure_package_set fastrpc; then
+        log_skip "$TESTNAME SKIP - required package set is not available: fastrpc"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+    fi
+fi
 
 # Defaults
 REPEAT=1
