@@ -2698,3 +2698,243 @@ weston_prepare_runtime() {
 
     return 0
 }
+
+# Ensure Qualcomm graphics package set is available when package recovery is supported.
+#
+# This helper is intentionally display/graphics specific only for choosing the
+# package-set name and temporary Debusine source. Generic package-manager details
+# such as apt/rpm/opkg behavior, DKMS header checks, package-set upgrade, and
+# source installation are handled by lib_pkg_provider.sh.
+#
+# Args:
+#   $1 - package-set name, default: graphics
+#   $2 - Debusine source, default: qli-staging
+#   $3 - Debusine suite, default: auto
+#
+# Return:
+#   0 - package-set ready, skipped cleanly, or no mapping for this provider
+#   1 - package-set recovery failed
+display_ensure_graphics_package_set() {
+    graphics_set_name="${1:-graphics}"
+    graphics_source="${2:-qli-staging}"
+    graphics_suite="${3:-auto}"
+
+    if [ -z "${TOOLS:-}" ] || [ ! -f "$TOOLS/lib_pkg_provider.sh" ]; then
+        log_warn "Package provider helper not found; continuing without graphics package recovery"
+        return 0
+    fi
+
+    # shellcheck disable=SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+
+    # Load provider config first. Otherwise pkg_provider.conf can overwrite
+    # caller-provided/default values such as apt_debusine_source.
+    pkg_provider_init || true
+
+    old_graphics_source="${PKG_APT_DEBUSINE_SOURCE:-none}"
+    old_graphics_suite="${PKG_APT_DEBUSINE_SUITE:-auto}"
+
+    case "$old_graphics_source" in
+        ""|none|disabled)
+            PKG_APT_DEBUSINE_SOURCE="$graphics_source"
+            ;;
+    esac
+
+    case "$old_graphics_suite" in
+        "")
+            PKG_APT_DEBUSINE_SUITE="$graphics_suite"
+            ;;
+    esac
+
+    # If this helper changed the apt source/suite after a previous package op,
+    # force apt update again so the new source becomes visible.
+    if [ "${PKG_APT_DEBUSINE_SOURCE:-none}" != "$old_graphics_source" ] ||
+       [ "${PKG_APT_DEBUSINE_SUITE:-auto}" != "$old_graphics_suite" ]; then
+        rm -f "${PKG_APT_UPDATED_MARK:-/tmp/qcom_testkit_apt_updated}" 2>/dev/null || true
+    fi
+
+    pkg_log_info "Graphics package recovery source, source=${PKG_APT_DEBUSINE_SOURCE:-none} suite=${PKG_APT_DEBUSINE_SUITE:-auto} set=${graphics_set_name}"
+
+    pkg_ensure_package_set "$graphics_set_name"
+}
+
+###############################################################################
+# GLVND EGL vendor selection
+###############################################################################
+
+# Select a single GLVND EGL vendor for the current process and its children.
+#
+# Usage:
+#   display_select_egl_vendor mesa
+#   display_select_egl_vendor adreno
+#   display_select_egl_vendor native
+display_select_egl_vendor() {
+    dsev_mode="${1:-native}"
+    dsev_json=""
+    dsev_mesa_json="${DISPLAY_MESA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
+    dsev_adreno_json="${DISPLAY_ADRENO_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/10_adreno.json}"
+
+    case "$dsev_mode" in
+        native)
+            unset __EGL_VENDOR_LIBRARY_FILENAMES
+            log_info "Using native GLVND EGL vendor discovery"
+            return 0
+            ;;
+        mesa)
+            dsev_json="$dsev_mesa_json"
+            ;;
+        adreno)
+            dsev_json="$dsev_adreno_json"
+            ;;
+        *)
+            log_error "Unsupported EGL vendor mode: $dsev_mode"
+            return 1
+            ;;
+    esac
+
+    if [ ! -f "$dsev_json" ] || [ ! -r "$dsev_json" ]; then
+        log_error "EGL vendor JSON is unavailable: $dsev_json"
+        return 1
+    fi
+
+    if ! grep -q '"library_path"[[:space:]]*:' "$dsev_json" 2>/dev/null; then
+        log_error "Invalid EGL vendor JSON, library_path missing: $dsev_json"
+        return 1
+    fi
+
+    __EGL_VENDOR_LIBRARY_FILENAMES="$dsev_json"
+    export __EGL_VENDOR_LIBRARY_FILENAMES
+
+    log_info "Selected EGL vendor mode: $dsev_mode"
+    log_info "Selected EGL vendor JSON: $__EGL_VENDOR_LIBRARY_FILENAMES"
+    return 0
+}
+
+###############################################################################
+# Display-manager DRM ownership helpers
+###############################################################################
+
+# Stop an active display service and record enough state to restore it.
+#
+# Usage:
+#   display_stop_service_for_drm SERVICE DRM_DEVICE STATE_FILE
+#
+# The state file is created only when this helper actually stops the service.
+display_stop_service_for_drm() {
+    dssfd_service="${1:-display-manager.service}"
+    dssfd_drm_device="${2:-}"
+    dssfd_state_file="$3"
+    dssfd_wait=0
+
+    [ -n "$dssfd_state_file" ] || return 1
+    rm -f "$dssfd_state_file"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_info "Display-manager handling skipped because systemctl is unavailable"
+        return 0
+    fi
+
+    if ! systemctl is-active --quiet "$dssfd_service"; then
+        log_info "No active display manager requires stopping"
+        return 0
+    fi
+
+    log_info "Stopping display manager to release DRM master: $dssfd_service"
+
+    if [ -n "$dssfd_drm_device" ] &&
+       command -v fuser >/dev/null 2>&1; then
+        fuser -v "$dssfd_drm_device" 2>&1 |
+            while IFS= read -r dssfd_line; do
+                [ -n "$dssfd_line" ] || continue
+                log_info "[DRM-OWNER] $dssfd_line"
+            done
+    fi
+
+    printf '%s\n' "$dssfd_service" >"$dssfd_state_file"
+
+    if ! systemctl stop "$dssfd_service"; then
+        if systemctl is-active --quiet "$dssfd_service"; then
+            rm -f "$dssfd_state_file"
+        fi
+
+        log_error "Failed to stop display manager: $dssfd_service"
+        return 1
+    fi
+
+    while [ "$dssfd_wait" -lt 10 ]; do
+        if ! systemctl is-active --quiet "$dssfd_service"; then
+            break
+        fi
+
+        sleep 1
+        dssfd_wait=$((dssfd_wait + 1))
+    done
+
+    if systemctl is-active --quiet "$dssfd_service"; then
+        rm -f "$dssfd_state_file"
+        log_error "Display manager is still active after stop: $dssfd_service"
+        return 1
+    fi
+
+    if [ -n "$dssfd_drm_device" ] &&
+       command -v fuser >/dev/null 2>&1; then
+        dssfd_wait=0
+
+        while [ "$dssfd_wait" -lt 5 ]; do
+            if ! fuser "$dssfd_drm_device" >/dev/null 2>&1; then
+                break
+            fi
+
+            sleep 1
+            dssfd_wait=$((dssfd_wait + 1))
+        done
+
+        if fuser "$dssfd_drm_device" >/dev/null 2>&1; then
+            log_warn "DRM device still has open users after stopping display manager: $dssfd_drm_device"
+
+            fuser -v "$dssfd_drm_device" 2>&1 |
+                while IFS= read -r dssfd_line; do
+                    [ -n "$dssfd_line" ] || continue
+                    log_info "[DRM-OWNER] $dssfd_line"
+                done
+        fi
+    fi
+
+    log_pass "Display manager stopped; DRM master is available for validation"
+    return 0
+}
+
+# Restore a display service previously stopped by display_stop_service_for_drm.
+display_restore_service_from_state() {
+    drsfs_state_file="$1"
+    drsfs_service=""
+
+    [ -n "$drsfs_state_file" ] || return 0
+    [ -s "$drsfs_state_file" ] || return 0
+
+    drsfs_service="$(sed -n '1p' "$drsfs_state_file" 2>/dev/null || true)"
+    [ -n "$drsfs_service" ] || return 0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_warn "Cannot restore display manager because systemctl is unavailable"
+        return 1
+    fi
+
+    if systemctl is-active --quiet "$drsfs_service"; then
+        rm -f "$drsfs_state_file"
+        log_info "Display manager is already active: $drsfs_service"
+        return 0
+    fi
+
+    log_info "Restoring display manager: $drsfs_service"
+
+    if ! systemctl start "$drsfs_service" >/dev/null 2>&1; then
+        log_error "Failed to restore display manager: $drsfs_service"
+        return 1
+    fi
+
+    rm -f "$drsfs_state_file"
+    log_pass "Display manager restored: $drsfs_service"
+    return 0
+}
+

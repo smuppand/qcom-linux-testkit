@@ -1660,3 +1660,263 @@ mrv_resolve_profiles() {
   return 0
 }
 
+###############################################################################
+# Qualcomm GPU boot-state helpers
+###############################################################################
+
+# Report the GPU ownership selected during the current boot.
+#
+# Output:
+#   kgsl    - msm skip_gpu is enabled and KGSL owns the GPU
+#   msm     - upstream MSM/freedreno owns the GPU
+#   unknown - the state is incomplete or contradictory
+mrv_qcom_gpu_boot_mode() {
+    mqgbm_kgsl_module="${1:-msm_kgsl}"
+    mqgbm_kgsl_device="${2:-/dev/kgsl-3d0}"
+    mqgbm_msm_module="${3:-msm}"
+    mqgbm_skip_gpu=""
+    mqgbm_kgsl_loaded=0
+    mqgbm_msm_loaded=0
+
+    if [ -r "/sys/module/$mqgbm_msm_module/parameters/skip_gpu" ]; then
+        mqgbm_skip_gpu="$(
+            cat "/sys/module/$mqgbm_msm_module/parameters/skip_gpu" \
+                2>/dev/null || true
+        )"
+    fi
+
+    if mrv_module_loaded "$mqgbm_kgsl_module"; then
+        mqgbm_kgsl_loaded=1
+    fi
+
+    if mrv_module_loaded "$mqgbm_msm_module"; then
+        mqgbm_msm_loaded=1
+    fi
+
+    case "$mqgbm_skip_gpu" in
+        Y|y|1)
+            if [ "$mqgbm_kgsl_loaded" -eq 1 ] &&
+               [ -e "$mqgbm_kgsl_device" ]; then
+                printf '%s\n' "kgsl"
+                return 0
+            fi
+            ;;
+        N|n|0)
+            if [ "$mqgbm_msm_loaded" -eq 1 ] &&
+               [ "$mqgbm_kgsl_loaded" -eq 0 ] &&
+               [ ! -e "$mqgbm_kgsl_device" ]; then
+                printf '%s\n' "msm"
+                return 0
+            fi
+            ;;
+    esac
+
+    printf '%s\n' "unknown"
+    return 1
+}
+
+# Return success when the current boot contains the known unsafe KGSL reload
+# failure. The msm_kgsl module must not be unloaded/reloaded after this event.
+mrv_qcom_gpu_unsafe_reload_detected() {
+    if ! command -v dmesg >/dev/null 2>&1; then
+        return 1
+    fi
+
+    dmesg 2>/dev/null |
+        grep -Eq "kobject_add_internal failed for genpd:kgsl_cx_pd|cannot create duplicate filename.*/devices/genpd:kgsl_cx_pd"
+}
+
+# Validate the requested Qualcomm GPU boot ownership.
+#
+# Usage:
+#   mrv_qcom_gpu_validate_boot_mode msm
+#   mrv_qcom_gpu_validate_boot_mode kgsl
+#
+# Return values:
+#   0 - requested boot mode is active
+#   1 - state is contradictory or unavailable
+#   2 - the other valid boot mode is active, so reboot is required
+mrv_qcom_gpu_validate_boot_mode() {
+    mqgvbm_expected="$1"
+    mqgvbm_kgsl_module="${2:-msm_kgsl}"
+    mqgvbm_kgsl_device="${3:-/dev/kgsl-3d0}"
+    mqgvbm_msm_module="${4:-msm}"
+    mqgvbm_mode="unknown"
+    mqgvbm_skip_gpu="<unavailable>"
+
+    if mrv_qcom_gpu_unsafe_reload_detected; then
+        log_warn "Unsafe msm_kgsl reload failure detected in this boot"
+        log_warn "A reboot is required before further GPU validation"
+        return 2
+    fi
+
+    mqgvbm_mode="$(
+        mrv_qcom_gpu_boot_mode \
+            "$mqgvbm_kgsl_module" \
+            "$mqgvbm_kgsl_device" \
+            "$mqgvbm_msm_module" 2>/dev/null || true
+    )"
+
+    [ -n "$mqgvbm_mode" ] || mqgvbm_mode="unknown"
+
+    if [ -r "/sys/module/$mqgvbm_msm_module/parameters/skip_gpu" ]; then
+        mqgvbm_skip_gpu="$(
+            cat "/sys/module/$mqgvbm_msm_module/parameters/skip_gpu" \
+                2>/dev/null || true
+        )"
+        [ -n "$mqgvbm_skip_gpu" ] || mqgvbm_skip_gpu="<empty>"
+    fi
+
+    log_info "Detected Qualcomm GPU boot mode: $mqgvbm_mode"
+    log_info "$mqgvbm_msm_module skip_gpu=$mqgvbm_skip_gpu"
+
+    if mrv_module_loaded "$mqgvbm_kgsl_module"; then
+        log_info "$mqgvbm_kgsl_module loaded=yes"
+    else
+        log_info "$mqgvbm_kgsl_module loaded=no"
+    fi
+
+    if [ -e "$mqgvbm_kgsl_device" ]; then
+        log_info "KGSL device present: $mqgvbm_kgsl_device"
+    else
+        log_info "KGSL device missing: $mqgvbm_kgsl_device"
+    fi
+
+    case "$mqgvbm_expected:$mqgvbm_mode" in
+        msm:msm|kgsl:kgsl)
+            return 0
+            ;;
+        msm:kgsl|kgsl:msm)
+            return 2
+            ;;
+    esac
+
+    return 1
+}
+
+# Remove stale KGSL boot policy after kgsl-dkms has been removed and rebuild
+# the boot metadata that can retain msm skip_gpu=1 or msm_kgsl.
+#
+# Arguments:
+#   $1 - KGSL package name, default kgsl-dkms
+#   $2 - force refresh: 1 when the package set changed, otherwise 0
+#
+# Return values:
+#   0 - no boot artifacts changed
+#   1 - cleanup failed
+#   2 - boot artifacts changed/refreshed; reboot is required
+mrv_qcom_gpu_cleanup_kgsl_boot_artifacts() {
+    mqgc_kernel="${1:-$(uname -r)}"
+    mqgc_changed=0
+    mqgc_modules_file="${MRV_QCOM_GPU_INITRAMFS_MODULES_FILE:-/etc/initramfs-tools/modules}"
+ 
+    # Do not remove boot configuration while the KGSL package is installed.
+    if command -v dpkg-query >/dev/null 2>&1; then
+        if dpkg-query -W \
+            -f='${db:Status-Abbrev}' \
+            kgsl-dkms 2>/dev/null |
+            grep -q '^ii'; then
+            log_info "kgsl-dkms is still installed; KGSL boot artifacts are retained"
+            return 1
+        fi
+    elif command -v rpm >/dev/null 2>&1; then
+        if rpm -q kgsl-dkms >/dev/null 2>&1; then
+            log_info "kgsl-dkms is still installed; KGSL boot artifacts are retained"
+            return 1
+        fi
+    fi
+ 
+    # Remove only known KGSL-specific configuration files.
+    for mqgc_path in \
+        /etc/modprobe.d/kgsl-dkms.conf \
+        /usr/lib/modprobe.d/kgsl-dkms.conf \
+        /lib/modprobe.d/kgsl-dkms.conf \
+        /etc/modules-load.d/kgsl-dkms.conf \
+        /usr/lib/modules-load.d/kgsl-dkms.conf \
+        /lib/modules-load.d/kgsl-dkms.conf \
+        /etc/modules-load.d/msm_kgsl.conf \
+        /usr/lib/modules-load.d/msm_kgsl.conf \
+        /lib/modules-load.d/msm_kgsl.conf \
+        /etc/initramfs-tools/hooks/kgsl \
+        /etc/initramfs-tools/hooks/kgsl-dkms \
+        /etc/initramfs-tools/hooks/msm_kgsl \
+        /usr/share/initramfs-tools/hooks/kgsl \
+        /usr/share/initramfs-tools/hooks/kgsl-dkms \
+        /usr/share/initramfs-tools/hooks/msm_kgsl
+    do
+        if [ -e "$mqgc_path" ] || [ -L "$mqgc_path" ]; then
+            log_info "Removing stale KGSL boot artifact: $mqgc_path"
+ 
+            if ! rm -f "$mqgc_path"; then
+                log_error "Failed to remove KGSL boot artifact: $mqgc_path"
+                return 2
+            fi
+ 
+            mqgc_changed=1
+        fi
+    done
+ 
+    # Remove only an active msm_kgsl entry from initramfs-tools/modules.
+    # Preserve all unrelated module entries and comments.
+    if [ -f "$mqgc_modules_file" ] &&
+       grep -Eq '^[[:space:]]*msm_kgsl([[:space:]]|$)' \
+           "$mqgc_modules_file" 2>/dev/null; then
+        mqgc_tmp="${mqgc_modules_file}.tmp.$$"
+ 
+        log_info "Removing msm_kgsl from $mqgc_modules_file"
+ 
+        if ! awk '$1 != "msm_kgsl"' \
+            "$mqgc_modules_file" >"$mqgc_tmp"; then
+            rm -f "$mqgc_tmp"
+            log_error "Failed to filter $mqgc_modules_file"
+            return 2
+        fi
+ 
+        if ! cat "$mqgc_tmp" >"$mqgc_modules_file"; then
+            rm -f "$mqgc_tmp"
+            log_error "Failed to update $mqgc_modules_file"
+            return 2
+        fi
+ 
+        rm -f "$mqgc_tmp"
+        mqgc_changed=1
+    fi
+ 
+    # No files were modified. Do not rebuild initramfs and do not request
+    # another reboot.
+    if [ "$mqgc_changed" -eq 0 ]; then
+        log_pass "No stale KGSL boot artifacts found"
+        return 1
+    fi
+ 
+    if command -v depmod >/dev/null 2>&1; then
+        log_info "Refreshing module dependency metadata"
+ 
+        if ! depmod -a "$mqgc_kernel"; then
+            log_error "Failed to refresh module metadata for $mqgc_kernel"
+            return 2
+        fi
+    fi
+ 
+    if command -v update-initramfs >/dev/null 2>&1; then
+        log_info "Refreshing initramfs for kernel $mqgc_kernel"
+ 
+        if ! update-initramfs -u -k "$mqgc_kernel"; then
+            log_error "Failed to refresh initramfs for $mqgc_kernel"
+            return 2
+        fi
+    elif command -v dracut >/dev/null 2>&1; then
+        mqgc_initramfs="/boot/initramfs-${mqgc_kernel}.img"
+        log_info "Refreshing initramfs for kernel $mqgc_kernel"
+ 
+        if ! dracut -f "$mqgc_initramfs" "$mqgc_kernel"; then
+            log_error "Failed to refresh initramfs for $mqgc_kernel"
+            return 2
+        fi
+    else
+        log_warn "No initramfs update utility found"
+    fi
+ 
+    log_pass "Stale KGSL boot artifacts were removed"
+    return 0
+}
