@@ -31,6 +31,8 @@ PKG_DEBUG="0"
 PKG_APT_DEBUSINE_SOURCE="${PKG_APT_DEBUSINE_SOURCE:-none}"
 PKG_APT_DEBUSINE_SUITE="${PKG_APT_DEBUSINE_SUITE:-auto}"
 PKG_PACKAGE_SET_UPGRADE="${PKG_PACKAGE_SET_UPGRADE:-1}"
+PKG_DKMS_CHECK_HEADERS="${PKG_DKMS_CHECK_HEADERS:-1}"
+PKG_DKMS_MISSING_HEADERS_ACTION="${PKG_DKMS_MISSING_HEADERS_ACTION:-fail}"
 
 PKG_NETWORK_REQUIRED="1"
 PKG_NETWORK_RECOVER="1"
@@ -184,6 +186,12 @@ pkg_apply_config_entry() {
             ;;
         package_set_upgrade)
             PKG_PACKAGE_SET_UPGRADE="$cfg_value"
+            ;;
+	dkms_check_headers)
+            PKG_DKMS_CHECK_HEADERS="$cfg_value"
+            ;;
+        dkms_missing_headers_action)
+            PKG_DKMS_MISSING_HEADERS_ACTION="$cfg_value"
             ;;
         *)
             pkg_debug "Ignoring unknown package provider config key, $cfg_key"
@@ -475,6 +483,277 @@ pkg_lookup_package_set() {
     fi
 
     return 1
+}
+
+# Return success when the current test invocation explicitly requests optional
+# overlay package-set recovery.
+#
+# Default is base mode: optional package-sets are not installed unless the user
+# or LAVA job passes one of the overlay flags.
+#
+# Supported args:
+#   --overlay
+#   --qcom-overlay
+#   --enable-overlay
+#   --base
+#   --no-overlay
+#
+# Last matching option wins.
+pkg_overlay_requested_from_args() {
+    overlay_requested=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --overlay|--qcom-overlay|--enable-overlay)
+                overlay_requested=1
+                ;;
+            --base|--no-overlay)
+                overlay_requested=0
+                ;;
+        esac
+
+        shift
+    done
+
+    [ "$overlay_requested" -eq 1 ]
+}
+
+# Return success when optional overlay package-set recovery is applicable.
+#
+# Yocto/qcom-distro and other embedded images must not regress. They should keep
+# their existing image-provided packages and skip optional overlay package-set
+# recovery unless explicitly supported later.
+pkg_optional_package_set_supported_os() {
+    optional_os_id="$1"
+
+    case "$optional_os_id" in
+        debian|ubuntu|centos)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Ensure an optional package-set only when overlay mode is explicitly requested.
+#
+# This is used by tests that support both:
+#   base    - upstream distro/rootfs packages only
+#   overlay - Qualcomm package-set installed over the base distro/rootfs
+#
+# Args:
+#   $1 - package-set name, for example: graphics, audio, video, display
+#   $2 - apt Debusine source for overlay packages, default: qli-staging
+#   $3 - apt Debusine suite, default: auto
+#   $4... - original run.sh arguments
+#
+# Return:
+#   0 - overlay not requested, unsupported OS skipped, no mapping, or set ready
+#   1 - overlay requested but package-set recovery failed
+pkg_ensure_optional_package_set() {
+    optional_set_name="$1"
+    optional_apt_source="${2:-qli-staging}"
+    optional_apt_suite="${3:-auto}"
+
+    if [ "$#" -ge 3 ]; then
+        shift 3
+    else
+        shift "$#"
+    fi
+
+    if [ -z "$optional_set_name" ]; then
+        pkg_log_warn "pkg_ensure_optional_package_set called with empty set name"
+        return 1
+    fi
+
+    # Yocto-safe default behavior:
+    # no --overlay means no optional package-set work at all.
+    if ! pkg_overlay_requested_from_args "$@"; then
+        pkg_log_info "Optional package-set recovery not requested, set=$optional_set_name mode=base"
+        return 0
+    fi
+
+    pkg_provider_init || true
+
+    optional_provider="$(pkg_active_provider)"
+    optional_os_id="$(pkg_detect_os_id)"
+
+    if ! pkg_optional_package_set_supported_os "$optional_os_id"; then
+        pkg_log_info "Optional package-set recovery not applicable, os=$optional_os_id provider=$optional_provider set=$optional_set_name"
+        return 0
+    fi
+
+    optional_packages="$(pkg_lookup_package_set "$optional_set_name" || true)"
+    if [ -z "$optional_packages" ]; then
+        pkg_log_info "Optional package-set mapping not found, os=$optional_os_id provider=$optional_provider set=$optional_set_name"
+        return 0
+    fi
+
+    case "$optional_provider" in
+        apt)
+            old_optional_source="${PKG_APT_DEBUSINE_SOURCE:-none}"
+            old_optional_suite="${PKG_APT_DEBUSINE_SUITE:-auto}"
+
+            case "$old_optional_source" in
+                ""|none|disabled)
+                    PKG_APT_DEBUSINE_SOURCE="$optional_apt_source"
+                    ;;
+            esac
+
+            case "$old_optional_suite" in
+                ""|auto)
+                    PKG_APT_DEBUSINE_SUITE="$optional_apt_suite"
+                    ;;
+            esac
+
+            if [ "${PKG_APT_DEBUSINE_SOURCE:-none}" != "$old_optional_source" ] ||
+               [ "${PKG_APT_DEBUSINE_SUITE:-auto}" != "$old_optional_suite" ]; then
+                rm -f "${PKG_APT_UPDATED_MARK:-/tmp/qcom_testkit_apt_updated}" 2>/dev/null || true
+            fi
+            ;;
+    esac
+
+    pkg_log_info "Optional package-set recovery requested, os=$optional_os_id provider=$optional_provider set=$optional_set_name packages=$optional_packages"
+
+    pkg_ensure_package_set "$optional_set_name"
+}
+
+# Check whether the running kernel has headers/build tree available for DKMS.
+#
+# DKMS packages require a matching kernel build directory for the active kernel
+# returned by uname -r. Without this, apt/rpm can leave the package in a
+# half-configured state during postinst/autoinstall.
+#
+# Return:
+#   0 - matching kernel headers/build tree found
+#   1 - missing kernel version or no usable headers/build tree found
+pkg_have_dkms_kernel_headers() {
+    dkms_kernel="$(uname -r 2>/dev/null || true)"
+
+    [ -n "$dkms_kernel" ] || return 1
+
+    if [ -e "/lib/modules/${dkms_kernel}/build/Makefile" ] ||
+       [ -e "/usr/src/linux-headers-${dkms_kernel}/Makefile" ] ||
+       [ -e "/usr/src/kernels/${dkms_kernel}/Makefile" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Detect whether a package is a DKMS package.
+#
+# First handles common DKMS package naming patterns, then for apt providers
+# checks package metadata for a Depends/PreDepends relation on "dkms".
+#
+# Return:
+#   0 - package appears to be DKMS-backed
+#   1 - package is not detected as DKMS-backed or cannot be inspected
+pkg_is_dkms_package() {
+    dkms_pkg="$1"
+
+    [ -n "$dkms_pkg" ] || return 1
+
+    case "$dkms_pkg" in
+        *-dkms|dkms-*)
+            return 0
+            ;;
+    esac
+
+    if [ "$(pkg_active_provider 2>/dev/null || true)" = "apt" ] &&
+       command -v apt-cache >/dev/null 2>&1; then
+        apt-cache depends "$dkms_pkg" 2>/dev/null |
+            grep -Eq '^[[:space:]]*(Depends|PreDepends):[[:space:]]*dkms([[:space:]]|$)' &&
+            return 0
+    fi
+
+    return 1
+}
+
+# Preflight DKMS package install/upgrade operations.
+#
+# This prevents package recovery from attempting to install or upgrade DKMS
+# packages when matching kernel headers are missing. That avoids leaving dpkg/rpm
+# in a broken or half-configured state.
+#
+# Controlled by:
+#   PKG_DKMS_CHECK_HEADERS=1|0
+#   PKG_DKMS_MISSING_HEADERS_ACTION=skip|fail
+#
+# Return:
+#   0 - not a DKMS package, DKMS check disabled, or headers are available
+#   1 - DKMS headers are missing and policy is "fail"
+#   2 - DKMS headers are missing and policy is "skip"
+pkg_dkms_preflight() {
+    dkms_pkg="$1"
+    dkms_action="$2"
+
+    [ "${PKG_DKMS_CHECK_HEADERS:-1}" = "1" ] || return 0
+    pkg_is_dkms_package "$dkms_pkg" || return 0
+    pkg_have_dkms_kernel_headers && return 0
+
+    dkms_kernel="$(uname -r 2>/dev/null || true)"
+    [ -n "$dkms_kernel" ] || dkms_kernel="unknown"
+
+    pkg_log_warn "DKMS package ${dkms_action:-operation} skipped - missing kernel headers, pkg=$dkms_pkg kernel=$dkms_kernel"
+    pkg_log_warn "Install linux-headers-${dkms_kernel} or provide /lib/modules/${dkms_kernel}/build before installing DKMS packages"
+
+    case "${PKG_DKMS_MISSING_HEADERS_ACTION:-skip}" in
+        fail)
+            return 1
+            ;;
+        skip|*)
+            return 2
+            ;;
+    esac
+}
+
+# Clean up a failed DKMS package installation so package-manager state is not
+# left half-configured after a postinst/autoinstall failure.
+#
+# This is best-effort only. The original install failure is still returned to
+# the caller.
+pkg_cleanup_failed_dkms_package() {
+    cleanup_pkg="$1"
+    cleanup_provider="$(pkg_active_provider)"
+
+    [ -n "$cleanup_pkg" ] || return 0
+    pkg_is_dkms_package "$cleanup_pkg" || return 0
+
+    pkg_log_warn "Attempting cleanup for failed DKMS package, pkg=$cleanup_pkg provider=$cleanup_provider"
+
+    case "$cleanup_provider" in
+        apt)
+            if command -v "$PKG_APT_GET" >/dev/null 2>&1; then
+                pkg_run_cmd_retry "apt-purge-failed-dkms-$cleanup_pkg" \
+                    env DEBIAN_FRONTEND=noninteractive \
+                    "$PKG_APT_GET" purge -y \
+                    -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                    "$cleanup_pkg" || true
+
+                pkg_run_cmd_retry "apt-fix-after-failed-dkms-$cleanup_pkg" \
+                    env DEBIAN_FRONTEND=noninteractive \
+                    "$PKG_APT_GET" -f install -y \
+                    -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" || true
+            fi
+            ;;
+        rpm)
+            rpm_tool="$(pkg_rpm_tool || true)"
+            if [ -n "$rpm_tool" ]; then
+                pkg_run_cmd_retry "$rpm_tool-remove-failed-dkms-$cleanup_pkg" \
+                    "$rpm_tool" remove -y "$cleanup_pkg" || true
+            fi
+            ;;
+        opkg)
+            if command -v opkg >/dev/null 2>&1; then
+                pkg_run_cmd_retry "opkg-remove-failed-dkms-$cleanup_pkg" \
+                    opkg remove "$cleanup_pkg" || true
+            fi
+            ;;
+    esac
+
+    return 0
 }
 
 # Return installed package version for the active package provider.
@@ -1339,34 +1618,54 @@ pkg_opkg_install_package() {
 pkg_install_package() {
     install_pkg="$1"
     install_provider="$(pkg_active_provider)"
-
+ 
     if [ -z "$install_pkg" ]; then
         pkg_log_warn "pkg_install_package called with empty package name"
         return 1
     fi
-
+ 
     if pkg_have_package "$install_pkg"; then
         pkg_log_package_present "$install_pkg"
         pkg_log_package_dependencies "$install_pkg"
         return 0
     fi
-
+ 
     if ! pkg_can_install; then
         pkg_log_warn "Package missing and package install disabled, $install_pkg"
         return 1
     fi
-
+ 
+    # DKMS packages require matching kernel headers. For mandatory overlay
+    # packages, missing headers should fail before apt/rpm/opkg install begins.
+    pkg_dkms_preflight "$install_pkg" "install"
+    dkms_rc=$?
+    case "$dkms_rc" in
+        0)
+            ;;
+        1)
+            return 1
+            ;;
+        2)
+            return 0
+            ;;
+    esac
+ 
     pkg_provider_summary
-
+ 
+    install_rc=1
+ 
     case "$install_provider" in
         apt)
             pkg_apt_install_package "$install_pkg"
+            install_rc=$?
             ;;
         rpm)
             pkg_rpm_install_package "$install_pkg"
+            install_rc=$?
             ;;
         opkg)
             pkg_opkg_install_package "$install_pkg"
+            install_rc=$?
             ;;
         check)
             pkg_log_warn "Check-only provider does not support package installation"
@@ -1377,6 +1676,13 @@ pkg_install_package() {
             return 1
             ;;
     esac
+ 
+    if [ "$install_rc" -ne 0 ]; then
+        pkg_cleanup_failed_dkms_package "$install_pkg" || true
+        return "$install_rc"
+    fi
+ 
+    return 0
 }
 
 # Ensure a single package is installed through the active provider.
@@ -1400,12 +1706,33 @@ pkg_ensure_package() {
 pkg_upgrade_installed_package() {
     upgrade_pkg="$1"
     upgrade_provider="$(pkg_active_provider)"
-
+ 
     [ -n "$upgrade_pkg" ] || return 1
-
+ 
+    # DKMS package upgrades can also trigger postinst/autoinstall. Avoid that
+    # when matching kernel headers are missing.
+    pkg_dkms_preflight "$upgrade_pkg" "upgrade"
+    dkms_rc=$?
+    case "$dkms_rc" in
+        0)
+            ;;
+        1)
+            return 1
+            ;;
+        2)
+            return 0
+            ;;
+    esac
+ 
     case "$upgrade_provider" in
         apt)
             pkg_apt_update || return 1
+ 
+            if command -v apt-cache >/dev/null 2>&1; then
+                apt-cache policy "$upgrade_pkg" 2>&1 |
+                    sed "s/^/[APT-POLICY:$upgrade_pkg] /" || true
+            fi
+ 
             pkg_log_info "Checking package-specific upgrade, $upgrade_pkg"
             pkg_run_cmd_retry "apt-only-upgrade-$upgrade_pkg" \
                 env DEBIAN_FRONTEND=noninteractive \
@@ -1505,6 +1832,130 @@ pkg_ensure_package_set() {
     return 0
 }
 
+# Remove an explicit list of installed packages using the active provider.
+pkg_remove_package_list() {
+    prpl_provider="$(pkg_active_provider)"
+    prpl_installed=""
+
+    for prpl_pkg in "$@"; do
+        [ -n "$prpl_pkg" ] || continue
+
+        if pkg_have_package "$prpl_pkg"; then
+            prpl_installed="$prpl_installed $prpl_pkg"
+        fi
+    done
+
+    prpl_installed="$(printf '%s\n' "$prpl_installed" | sed 's/^[[:space:]]*//')"
+
+    if [ -z "$prpl_installed" ]; then
+        pkg_log_pass "Requested packages are already absent"
+        return 0
+    fi
+
+    if ! pkg_can_install; then
+        return 1
+    fi
+
+    pkg_log_info "Removing package list, provider=$prpl_provider packages=$prpl_installed"
+
+    case "$prpl_provider" in
+        apt)
+            # Intentional splitting: package names are read from the trusted map.
+            # shellcheck disable=SC2086
+            pkg_run_cmd_retry "apt-purge-package-set" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" purge -y \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                $prpl_installed || return 1
+            ;;
+        rpm)
+            prpl_rpm_tool="$(pkg_rpm_tool || true)"
+            [ -n "$prpl_rpm_tool" ] || return 1
+
+            # Intentional splitting: package names are read from the trusted map.
+            # shellcheck disable=SC2086
+            pkg_run_cmd_retry "$prpl_rpm_tool-remove-package-set" \
+                "$prpl_rpm_tool" remove -y $prpl_installed || return 1
+            ;;
+        opkg)
+            # Intentional splitting: package names are read from the trusted map.
+            # shellcheck disable=SC2086
+            pkg_run_cmd_retry "opkg-remove-package-set" \
+                opkg remove $prpl_installed || return 1
+            ;;
+        *)
+            pkg_log_fail "Provider does not support package removal, provider=$prpl_provider"
+            return 1
+            ;;
+    esac
+
+    for prpl_pkg in $prpl_installed; do
+        if pkg_have_package "$prpl_pkg"; then
+            pkg_log_fail "Package remains installed after removal, $prpl_pkg"
+            return 1
+        fi
+
+        pkg_log_pass "Package removed, $prpl_pkg"
+    done
+
+    return 0
+}
+
+# Restore a named optional package set to the base image state by removing all
+# currently installed packages mapped to that set.
+#
+# Return values:
+#   0 - package set was already absent
+#   1 - restore failed or package-set mapping is missing
+#   2 - packages were removed successfully; reboot is required
+pkg_restore_package_set() {
+    prps_set_name="$1"
+
+    if [ -z "$prps_set_name" ]; then
+        pkg_log_warn "pkg_restore_package_set called with empty set name"
+        return 1
+    fi
+
+    prps_provider="$(pkg_active_provider)"
+    prps_os_id="$(pkg_detect_os_id)"
+    prps_packages="$(pkg_lookup_package_set "$prps_set_name" || true)"
+
+    if [ -z "$prps_packages" ]; then
+        pkg_log_fail "No package-set mapping available for restore, set=$prps_set_name provider=$prps_provider os=$prps_os_id"
+        return 1
+    fi
+
+    prps_installed=""
+
+    for prps_pkg in $prps_packages; do
+        [ -n "$prps_pkg" ] || continue
+
+        if pkg_have_package "$prps_pkg"; then
+            prps_installed="$prps_installed $prps_pkg"
+        fi
+    done
+
+    prps_installed="$(printf '%s\n' "$prps_installed" | sed 's/^[[:space:]]*//')"
+
+    if [ -z "$prps_installed" ]; then
+        pkg_log_pass "Optional package set already restored to base state, set=$prps_set_name"
+        return 0
+    fi
+
+    pkg_log_info "Restoring base package state, set=$prps_set_name installed_overlay_packages=$prps_installed"
+
+    # Intentional splitting: package names are read from the trusted map.
+    # shellcheck disable=SC2086
+    if ! pkg_remove_package_list $prps_installed; then
+        pkg_log_fail "Failed to remove optional package set, set=$prps_set_name"
+        return 1
+    fi
+
+    pkg_log_pass "Optional package set removed, set=$prps_set_name"
+    pkg_log_warn "A reboot is required before the base kernel driver can own the device"
+    return 2
+}
+
 # Ensure command is available, recovering missing commands through mapped packages.
 pkg_ensure_command() {
     ensure_cmd="$1"
@@ -1573,3 +2024,148 @@ pkg_provider_summary() {
             ;;
     esac
 }
+
+###############################################################################
+# Package-set state helpers
+###############################################################################
+# Return success when a mapped package set contains a package name.
+pkg_package_set_contains() {
+    ppsc_set="$1"
+    ppsc_package="$2"
+    ppsc_packages=""
+
+    [ -n "$ppsc_set" ] || return 1
+    [ -n "$ppsc_package" ] || return 1
+
+    if ! command -v pkg_lookup_package_set >/dev/null 2>&1; then
+        return 1
+    fi
+
+    ppsc_packages="$(pkg_lookup_package_set "$ppsc_set" 2>/dev/null || true)"
+
+    case " $ppsc_packages " in
+        *" $ppsc_package "*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# Return success only when every package in a mapped set is installed.
+pkg_verify_package_set_installed() {
+    pvpsi_set="$1"
+    pvpsi_packages=""
+    pvpsi_missing=""
+
+    [ -n "$pvpsi_set" ] || return 1
+
+    if ! command -v pkg_lookup_package_set >/dev/null 2>&1; then
+        log_error "Package-set lookup helper is unavailable"
+        return 1
+    fi
+
+    pvpsi_packages="$(pkg_lookup_package_set "$pvpsi_set" 2>/dev/null || true)"
+
+    if [ -z "$pvpsi_packages" ]; then
+        log_error "Package-set mapping is unavailable: $pvpsi_set"
+        return 1
+    fi
+
+    for pvpsi_package in $pvpsi_packages; do
+        [ -n "$pvpsi_package" ] || continue
+
+        if ! pkg_have_package "$pvpsi_package"; then
+            pvpsi_missing="${pvpsi_missing}${pvpsi_missing:+ }$pvpsi_package"
+        fi
+    done
+
+    if [ -n "$pvpsi_missing" ]; then
+        log_warn "Package set is incomplete, set=$pvpsi_set missing=$pvpsi_missing"
+        return 1
+    fi
+
+    log_pass "Package set is already installed, set=$pvpsi_set"
+    return 0
+}
+
+# Avoid package-manager/network work when a required package set is complete.
+pkg_ensure_required_package_set_present() {
+    perps_set="$1"
+
+    [ -n "$perps_set" ] || return 1
+
+    if pkg_verify_package_set_installed "$perps_set"; then
+        return 0
+    fi
+
+    if ! command -v pkg_ensure_package_set >/dev/null 2>&1; then
+        log_error "Required package-set helper is unavailable"
+        return 1
+    fi
+
+    if ! pkg_ensure_package_set "$perps_set"; then
+        return 1
+    fi
+
+    pkg_verify_package_set_installed "$perps_set"
+}
+
+# Avoid package-manager/network work when an optional package set is complete.
+pkg_ensure_optional_package_set_present() {
+    peops_set="$1"
+    peops_source="$2"
+    peops_mode="$3"
+    shift 3
+
+    [ -n "$peops_set" ] || return 1
+    [ -n "$peops_source" ] || peops_source="auto"
+    [ -n "$peops_mode" ] || peops_mode="auto"
+
+    if pkg_verify_package_set_installed "$peops_set"; then
+        return 0
+    fi
+
+    if ! command -v pkg_ensure_optional_package_set >/dev/null 2>&1; then
+        log_error "Optional package-set helper is unavailable"
+        return 1
+    fi
+
+    if ! pkg_ensure_optional_package_set \
+        "$peops_set" \
+        "$peops_source" \
+        "$peops_mode" \
+        "$@"; then
+        return 1
+    fi
+
+    pkg_verify_package_set_installed "$peops_set"
+}
+
+# Return success when an installed package owns a file matching an ERE.
+pkg_package_has_file_matching() {
+    pphfm_package="$1"
+    pphfm_pattern="$2"
+
+    [ -n "$pphfm_package" ] || return 1
+    [ -n "$pphfm_pattern" ] || return 1
+
+    if ! pkg_have_package "$pphfm_package"; then
+        return 1
+    fi
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -L "$pphfm_package" 2>/dev/null |
+            grep -Eq "$pphfm_pattern"
+        return $?
+    fi
+
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -ql "$pphfm_package" 2>/dev/null |
+            grep -Eq "$pphfm_pattern"
+        return $?
+    fi
+
+    return 1
+}
+

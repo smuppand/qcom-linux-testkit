@@ -7,11 +7,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
+
 while [ "$SEARCH" != "/" ]; do
     if [ -f "$SEARCH/init_env" ]; then
         INIT_ENV="$SEARCH/init_env"
         break
     fi
+
     SEARCH=$(dirname "$SEARCH")
 done
 
@@ -20,115 +22,365 @@ if [ -z "$INIT_ENV" ]; then
     exit 1
 fi
 
-# Only source once (idempotent)
-if [ -z "$__INIT_ENV_LOADED" ]; then
+if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
 fi
 
-# Always source functestlib.sh, using $TOOLS exported by init_env
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/lib_display.sh"
 
+if [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+fi
+
+if [ -r "$TOOLS/lib_module_reload.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$TOOLS/lib_module_reload.sh"
+fi
+
 # --- Test metadata -----------------------------------------------------------
 TESTNAME="KMSCube"
-FRAME_COUNT="${FRAME_COUNT:-999}" # allow override via env
-EXPECTED_MIN=$((FRAME_COUNT - 1)) # tolerate off-by-one under-reporting
+FRAME_COUNT="${FRAME_COUNT:-999}"
+EXPECTED_MIN=$((FRAME_COUNT - 1))
 
-# Ensure we run from the testcase directory so .res/logs land next to run.sh
 test_path="$(find_test_case_by_name "$TESTNAME")"
 cd "$test_path" || exit 1
 
 RES_FILE="./$TESTNAME.res"
 LOG_FILE="./${TESTNAME}_run.log"
+
 KMSCUBE_DRM_CONNECTOR=""
 KMSCUBE_DRM_DEV=""
-rm -f "$RES_FILE" "$LOG_FILE"
+
+OVERLAY_REQUESTED=0
+OS_ID="unknown"
+DISTRO_GPU_HANDLING_SUPPORTED=0
+
+PACKAGE_TRANSITION_RC=0
+BOOT_ARTIFACT_RC=0
+GPU_BOOT_VALIDATE_RC=0
+
+PACKAGE_SET_CHANGED=0
+GPU_BOOT_ARTIFACTS_CHANGED=0
+
+GPU_MODULE="msm_kgsl"
+GPU_OVERLAY_DEVICE="/dev/kgsl-3d0"
+GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-libgbm-msm1}"
+
+DISPLAY_MANAGER_SERVICE="${DISPLAY_MANAGER_SERVICE:-display-manager.service}"
+DISPLAY_MANAGER_STATE_FILE="/tmp/qcom-testkit-${TESTNAME}-display-manager.$$.state"
+weston_stopped_by_test=0
+
+rm -f "$RES_FILE" "$LOG_FILE" "$DISPLAY_MANAGER_STATE_FILE"
+
+trap '
+if [ "${weston_stopped_by_test:-0}" -eq 1 ] &&
+   command -v weston_restore_runtime >/dev/null 2>&1; then
+    weston_restore_runtime 15 >/dev/null 2>&1 || true
+fi
+if command -v display_restore_service_from_state >/dev/null 2>&1; then
+    display_restore_service_from_state "$DISPLAY_MANAGER_STATE_FILE" >/dev/null 2>&1 || true
+fi
+rm -f "$DISPLAY_MANAGER_STATE_FILE"
+' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# --- Resolve requested graphics runtime mode ---------------------------------
+for kmscube_arg in "$@"; do
+    case "$kmscube_arg" in
+        --overlay)
+            OVERLAY_REQUESTED=1
+            ;;
+    esac
+done
+
+# --- Detect OS once ----------------------------------------------------------
+if command -v pkg_detect_os_id >/dev/null 2>&1; then
+    OS_ID="$(pkg_detect_os_id 2>/dev/null || true)"
+elif [ -r /etc/os-release ]; then
+    OS_ID="$(
+        sed -n 's/^ID=//p' /etc/os-release |
+            head -n 1 |
+            tr -d '"' |
+            tr '[:upper:]' '[:lower:]'
+    )"
+fi
+
+[ -n "$OS_ID" ] || OS_ID="unknown"
+
+case "$OS_ID" in
+    debian|ubuntu|centos|rhel|fedora)
+        DISTRO_GPU_HANDLING_SUPPORTED=1
+        ;;
+esac
+
+# --- Configure requested package and boot stack ------------------------------
+# Yocto/qcom-distro images keep their native image-selected graphics stack.
+if [ "$DISTRO_GPU_HANDLING_SUPPORTED" -eq 1 ]; then
+    for required_helper in \
+        pkg_package_set_contains \
+        pkg_ensure_required_package_set_present \
+        pkg_ensure_optional_package_set_present \
+        pkg_restore_package_set \
+        pkg_package_has_file_matching \
+        mrv_qcom_gpu_boot_mode \
+        mrv_qcom_gpu_cleanup_kgsl_boot_artifacts \
+        mrv_qcom_gpu_validate_boot_mode \
+        display_select_egl_vendor \
+        display_stop_service_for_drm \
+        display_restore_service_from_state; do
+        if ! command -v "$required_helper" >/dev/null 2>&1; then
+            log_fail "$TESTNAME FAIL - required helper is unavailable: $required_helper"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+    done
+
+    if [ "$OVERLAY_REQUESTED" -eq 1 ]; then
+        if ! pkg_package_set_contains graphics "$GPU_OVERLAY_GBM_PACKAGE"; then
+            log_fail "$TESTNAME FAIL - graphics package set is incomplete; missing $GPU_OVERLAY_GBM_PACKAGE"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+
+        if ! pkg_ensure_optional_package_set_present \
+            graphics \
+            qli-staging \
+            auto \
+            "$@"; then
+            log_fail "$TESTNAME FAIL - failed to ensure Qualcomm graphics overlay package set"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+
+        if ! pkg_package_has_file_matching \
+            "$GPU_OVERLAY_GBM_PACKAGE" \
+            '/gbm/msm_gbm[.]so$'; then
+            log_fail "$TESTNAME FAIL - Qualcomm GBM backend is unavailable from $GPU_OVERLAY_GBM_PACKAGE"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+
+        mrv_qcom_gpu_validate_boot_mode \
+            kgsl \
+            "$GPU_MODULE" \
+            "$GPU_OVERLAY_DEVICE" \
+            msm
+        GPU_BOOT_VALIDATE_RC=$?
+
+        case "$GPU_BOOT_VALIDATE_RC" in
+            0)
+                ;;
+            2)
+                log_skip "$TESTNAME SKIP - Qualcomm overlay packages are ready; reboot required to activate KGSL"
+                echo "$TESTNAME SKIP" >"$RES_FILE"
+                exit 0
+                ;;
+            *)
+                log_skip "$TESTNAME SKIP - unable to confirm a valid KGSL boot runtime"
+                echo "$TESTNAME SKIP" >"$RES_FILE"
+                exit 0
+                ;;
+        esac
+
+        if command -v ldconfig >/dev/null 2>&1 && ! ldconfig; then
+            log_fail "$TESTNAME FAIL - ldconfig failed after overlay package validation"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+
+        if ! display_select_egl_vendor adreno; then
+            log_fail "$TESTNAME FAIL - failed to select Qualcomm Adreno EGL vendor"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+
+        log_pass "Qualcomm overlay packages, GBM backend, and KGSL boot runtime are ready"
+    else
+        PACKAGE_SET_CHANGED=0
+        GPU_BOOT_ARTIFACTS_CHANGED=0
+
+        pkg_restore_package_set graphics
+        PACKAGE_TRANSITION_RC=$?
+
+        case "$PACKAGE_TRANSITION_RC" in
+            0)
+                # Qualcomm overlay package set was already absent.
+                PACKAGE_SET_CHANGED=0
+                ;;
+            2)
+                # Qualcomm overlay packages were removed successfully.
+                PACKAGE_SET_CHANGED=1
+                ;;
+            *)
+                log_fail "$TESTNAME FAIL - failed to remove Qualcomm graphics overlay package set"
+                echo "$TESTNAME FAIL" >"$RES_FILE"
+                exit 0
+                ;;
+        esac
+
+        mrv_qcom_gpu_cleanup_kgsl_boot_artifacts
+        BOOT_ARTIFACT_RC=$?
+
+        case "$BOOT_ARTIFACT_RC" in
+            0)
+                # Stale KGSL boot artifacts were removed. The helper
+                # refreshed initramfs, so one reboot is required.
+                GPU_BOOT_ARTIFACTS_CHANGED=1
+                ;;
+            1)
+                # No stale KGSL boot artifacts were found.
+                GPU_BOOT_ARTIFACTS_CHANGED=0
+                ;;
+            2)
+                log_fail "$TESTNAME FAIL - failed to clean stale KGSL boot artifacts"
+                echo "$TESTNAME FAIL" >"$RES_FILE"
+                exit 0
+                ;;
+            *)
+                log_fail "$TESTNAME FAIL - unexpected KGSL boot-artifact cleanup result: rc=$BOOT_ARTIFACT_RC"
+                echo "$TESTNAME FAIL" >"$RES_FILE"
+                exit 0
+                ;;
+        esac
+
+        if ! pkg_ensure_required_package_set_present graphics-base; then
+            log_fail "$TESTNAME FAIL - failed to ensure upstream Mesa graphics package set"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+
+        if [ "$PACKAGE_SET_CHANGED" -eq 1 ] ||
+           [ "$GPU_BOOT_ARTIFACTS_CHANGED" -eq 1 ]; then
+            log_skip "$TESTNAME SKIP - Qualcomm graphics packages or KGSL boot artifacts changed; reboot required to activate upstream MSM/freedreno"
+            echo "$TESTNAME SKIP" >"$RES_FILE"
+            exit 0
+        fi
+
+        mrv_qcom_gpu_validate_boot_mode \
+            msm \
+            "$GPU_MODULE" \
+            "$GPU_OVERLAY_DEVICE" \
+            msm
+        GPU_BOOT_VALIDATE_RC=$?
+
+        case "$GPU_BOOT_VALIDATE_RC" in
+            0)
+                ;;
+            2)
+                log_skip "$TESTNAME SKIP - current boot still uses KGSL; reboot required to restore upstream MSM/freedreno ownership"
+                echo "$TESTNAME SKIP" >"$RES_FILE"
+                exit 0
+                ;;
+            *)
+                log_skip "$TESTNAME SKIP - unable to confirm upstream MSM/freedreno ownership"
+                echo "$TESTNAME SKIP" >"$RES_FILE"
+                exit 0
+                ;;
+        esac
+
+        if ! display_select_egl_vendor mesa; then
+            log_skip "$TESTNAME SKIP - Mesa EGL vendor is unavailable"
+            echo "$TESTNAME SKIP" >"$RES_FILE"
+            exit 0
+        fi
+
+        log_pass "Upstream MSM/freedreno packages and boot runtime are ready"
+    fi
+else
+    log_info "Graphics package-stack and GPU boot-mode handling skipped for os=$OS_ID"
+fi
 
 log_info "-------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase -------------------"
 
-# ---------------------------------------------------------------------------
-# Display snapshot
-# ---------------------------------------------------------------------------
+# --- Display snapshot --------------------------------------------------------
 if command -v display_debug_snapshot >/dev/null 2>&1; then
     display_debug_snapshot "pre-display-check"
 fi
 
-# Always print modetest as part of the snapshot (best-effort).
 if command -v modetest >/dev/null 2>&1; then
     log_info "----- modetest -M msm -ac (capped at 200 lines) -----"
-    modetest -M msm -ac 2>&1 | sed -n '1,200p' | while IFS= read -r l; do
-        [ -n "$l" ] && log_info "[modetest] $l"
-    done
+
+    modetest -M msm -ac 2>&1 |
+        sed -n '1,200p' |
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            log_info "[modetest] $line"
+        done
+
     log_info "----- End modetest -M msm -ac -----"
 else
-    log_warn "modetest not found in PATH skipping modetest snapshot."
+    log_warn "modetest not found in PATH, skipping modetest snapshot"
 fi
 
 have_connector=0
+
 if command -v display_connected_summary >/dev/null 2>&1; then
-    sysfs_summary=$(display_connected_summary)
-    if [ -n "$sysfs_summary" ] && [ "$sysfs_summary" != "none" ]; then
+    sysfs_summary="$(display_connected_summary)"
+
+    if [ -n "$sysfs_summary" ] &&
+       [ "$sysfs_summary" != "none" ]; then
         have_connector=1
         log_info "Connected display (sysfs): $sysfs_summary"
     fi
 fi
 
 if [ "$have_connector" -eq 0 ]; then
-    log_warn "No connected DRM display found, skipping ${TESTNAME}."
-    echo "${TESTNAME} SKIP" >"$RES_FILE"
+    log_skip "$TESTNAME SKIP - no connected DRM display found"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
 fi
 
-# Select the DRM card that owns the connected display.
-# This avoids kmscube auto-selecting the wrong card on multi-DRM-card systems.
 if command -v display_select_primary_connector >/dev/null 2>&1; then
     if KMSCUBE_DRM_CONNECTOR="$(display_select_primary_connector)"; then
-        if [ -z "$KMSCUBE_DRM_CONNECTOR" ]; then
-            log_warn "display_select_primary_connector returned empty output."
-        fi
+        [ -n "$KMSCUBE_DRM_CONNECTOR" ] ||
+            log_warn "display_select_primary_connector returned empty output"
     else
         KMSCUBE_DRM_CONNECTOR=""
-        log_warn "display_select_primary_connector failed; connected display mapping may be unavailable."
+        log_warn "display_select_primary_connector failed; connected display mapping may be unavailable"
     fi
 else
-    log_warn "display_select_primary_connector helper not found; connected display mapping may be unavailable."
+    log_warn "display_select_primary_connector helper not found; connected display mapping may be unavailable"
 fi
 
 if command -v display_select_primary_drm_device >/dev/null 2>&1; then
     if KMSCUBE_DRM_DEV="$(display_select_primary_drm_device)"; then
-        if [ -z "$KMSCUBE_DRM_DEV" ]; then
-            log_warn "display_select_primary_drm_device returned empty output; kmscube will use default DRM device selection."
-        fi
+        [ -n "$KMSCUBE_DRM_DEV" ] ||
+            log_warn "display_select_primary_drm_device returned empty output; kmscube will use default DRM device selection"
     else
         KMSCUBE_DRM_DEV=""
-        log_warn "display_select_primary_drm_device failed; kmscube will use default DRM device selection."
+        log_warn "display_select_primary_drm_device failed; kmscube will use default DRM device selection"
     fi
 else
-    log_warn "display_select_primary_drm_device helper not found; kmscube will use default DRM device selection."
+    log_warn "display_select_primary_drm_device helper not found; kmscube will use default DRM device selection"
 fi
 
 if [ -n "$KMSCUBE_DRM_DEV" ]; then
     log_info "Selected KMS connector: ${KMSCUBE_DRM_CONNECTOR:-<unknown>}"
     log_info "Selected KMS DRM device: $KMSCUBE_DRM_DEV"
 else
-    log_warn "Could not map connected display to a DRM card; kmscube will use default device selection."
+    log_warn "Could not map connected display to a DRM card; kmscube will use default device selection"
 fi
+
 # --- Basic DRM availability guard -------------------------------------------
 set -- /dev/dri/card* 2>/dev/null
+
 if [ ! -e "$1" ]; then
-    log_skip "$TESTNAME SKIP: no /dev/dri/card* nodes"
+    log_skip "$TESTNAME SKIP - no /dev/dri/card* nodes"
     echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
 fi
 
 # --- Dependencies ------------------------------------------------------------
-# With patched check_dependencies(): ask for return code instead of exit
-if ! CHECK_DEPS_NO_EXIT=1 check_dependencies kmscube; then
-    log_skip "$TESTNAME SKIP: missing dependencies: kmscube"
+if ! CHECK_DEPS_NO_EXIT=1 check_dependencies kmscube modetest; then
+    log_skip "$TESTNAME SKIP - missing dependencies: kmscube and/or modetest"
     echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
 fi
@@ -136,52 +388,65 @@ fi
 KMSCUBE_BIN="$(command -v kmscube 2>/dev/null || true)"
 log_info "Using kmscube: ${KMSCUBE_BIN:-<not found>}"
 
-# --- Track whether this test stopped Weston ----------------------------------
-weston_stopped_by_test=0
-
-# --- GPU acceleration gating (avoid auto/Wayland for kmscube) ----------------
-# KMSCube is a DRM/KMS test. Using "auto" can start/adopt Weston and steal DRM master.
+# --- GPU acceleration gating -------------------------------------------------
 if command -v display_is_cpu_renderer >/dev/null 2>&1; then
     if display_is_cpu_renderer gbm >/dev/null 2>&1; then
         if display_is_cpu_renderer gbm; then
-            log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected on GBM)"
+            log_skip "$TESTNAME SKIP - CPU/software renderer detected on GBM"
             echo "$TESTNAME SKIP" >"$RES_FILE"
             exit 0
         fi
     else
-        log_warn "display_is_cpu_renderer gbm not supported, falling back to auto (may touch Wayland/Weston)."
+        log_warn "display_is_cpu_renderer gbm not supported, falling back to auto"
+
         if display_is_cpu_renderer auto; then
-            log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected)"
+            log_skip "$TESTNAME SKIP - CPU/software renderer detected"
             echo "$TESTNAME SKIP" >"$RES_FILE"
             exit 0
         fi
     fi
 else
-    log_warn "display_is_cpu_renderer helper not found, cannot enforce GPU accel gating (continuing)."
+    log_warn "display_is_cpu_renderer helper not found; continuing without GPU acceleration gating"
 fi
 
-# --- Ensure Weston is NOT running before kmscube (DRM master) -----------------
-# Stop weston after gating too, because some helpers may have started it.
+# --- Release DRM master ------------------------------------------------------
 if weston_is_running; then
-    log_info "Weston is running, stopping it so kmscube can modeset (DRM master)"
+    log_info "Weston is running, stopping it so kmscube can acquire DRM master"
+
     if weston_stop >/dev/null 2>&1; then
         weston_stopped_by_test=1
     else
         log_warn "weston_stop returned non-zero, re-checking Weston state"
+
         if ! weston_is_running; then
             weston_stopped_by_test=1
         fi
     fi
 fi
 
-# Double-check and be strict: kmscube will fail if weston still holds DRM master.
 if weston_is_running; then
-    log_warn "Weston still running after weston_stop, kmscube may fail to set mode"
+    log_warn "Weston remains running; kmscube may fail to acquire DRM master"
 fi
 
-# --- Execute kmscube (avoid Wayland env leakage) ------------------------------
+case "$OS_ID" in
+    debian|ubuntu|centos|rhel|fedora)
+        if ! display_stop_service_for_drm \
+            "$DISPLAY_MANAGER_SERVICE" \
+            "$KMSCUBE_DRM_DEV" \
+            "$DISPLAY_MANAGER_STATE_FILE"; then
+            log_fail "$TESTNAME FAIL - failed to release display-manager DRM ownership"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+        ;;
+    *)
+        log_info "Display-manager handling skipped for os=$OS_ID"
+        ;;
+esac
+
+# --- Execute kmscube ---------------------------------------------------------
 unset WAYLAND_DISPLAY
-# Keep XDG_RUNTIME_DIR intact for system sanity, but force GBM platform for EGL where honored.
+
 EGL_PLATFORM_SAVED="${EGL_PLATFORM:-}"
 export EGL_PLATFORM=gbm
 
@@ -189,64 +454,92 @@ rc=0
 
 if [ -n "$KMSCUBE_DRM_DEV" ]; then
     log_info "Running kmscube on $KMSCUBE_DRM_DEV with --count=${FRAME_COUNT} ..."
-    kmscube -D "$KMSCUBE_DRM_DEV" --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1
+
+    "$KMSCUBE_BIN" \
+        -D "$KMSCUBE_DRM_DEV" \
+        --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1
     rc=$?
 else
     log_info "Running kmscube with default DRM device selection and --count=${FRAME_COUNT} ..."
-    kmscube --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1
+
+    "$KMSCUBE_BIN" \
+        --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1
     rc=$?
 fi
 
-if [ "$rc" -ne 0 ]; then
-    log_fail "$TESTNAME : Execution failed (rc=$rc) — see $LOG_FILE"
-    cat "$LOG_FILE"
-    echo "$TESTNAME FAIL" >"$RES_FILE"
-
-    # Restore EGL_PLATFORM
-    if [ -n "$EGL_PLATFORM_SAVED" ]; then
-        export EGL_PLATFORM="$EGL_PLATFORM_SAVED"
-    else
-        unset EGL_PLATFORM
-    fi
-
-    # Restore Weston if we stopped it
-    if [ "$weston_stopped_by_test" -eq 1 ]; then
-        log_info "Restoring Weston after failure"
-        if ! weston_restore_runtime 15; then
-            log_error "Failed to restore Weston runtime after $TESTNAME failure"
-        fi
-    fi
-    exit 1
-fi
-
-# Restore EGL_PLATFORM
 if [ -n "$EGL_PLATFORM_SAVED" ]; then
     export EGL_PLATFORM="$EGL_PLATFORM_SAVED"
 else
     unset EGL_PLATFORM
 fi
 
-# --- Parse 'Rendered N frames' (case-insensitive), use the last N ------------
+if [ "$rc" -ne 0 ]; then
+    log_fail "$TESTNAME : Execution failed (rc=$rc) - see $LOG_FILE"
+    cat "$LOG_FILE"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+
+    if [ "$weston_stopped_by_test" -eq 1 ]; then
+        log_info "Restoring Weston after failure"
+
+        if weston_restore_runtime 15; then
+            weston_stopped_by_test=0
+        else
+            log_error "Failed to restore Weston runtime after $TESTNAME failure"
+        fi
+    fi
+
+    display_restore_service_from_state "$DISPLAY_MANAGER_STATE_FILE" || true
+    exit 1
+fi
+
+# --- Parse rendered frame count ----------------------------------------------
 FRAMES_RENDERED="$(
-    awk 'BEGIN{IGNORECASE=1}
-         /Rendered[[:space:]][0-9]+[[:space:]]+frames/{
-             for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) n=$i
-             last=n
-         }
-         END{if (last!="") print last}' "$LOG_FILE"
+    awk '
+        BEGIN {
+            IGNORECASE = 1
+        }
+
+        /Rendered[[:space:]][0-9]+[[:space:]]+frames/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+$/) {
+                    n = $i
+                }
+            }
+
+            last = n
+        }
+
+        END {
+            if (last != "") {
+                print last
+            }
+        }
+    ' "$LOG_FILE"
 )"
+
 [ -n "$FRAMES_RENDERED" ] || FRAMES_RENDERED=0
-[ "$EXPECTED_MIN" -lt 0 ] && EXPECTED_MIN=0
+
+if [ "$EXPECTED_MIN" -lt 0 ]; then
+    EXPECTED_MIN=0
+fi
+
 log_info "kmscube reported: Rendered ${FRAMES_RENDERED} frames (requested ${FRAME_COUNT}, min acceptable ${EXPECTED_MIN})"
 
-# --- Restore Weston if we stopped it -----------------------------------------
 restore_failed=0
+
 if [ "$weston_stopped_by_test" -eq 1 ]; then
     log_info "Restoring Weston after $TESTNAME completion"
-    if ! weston_restore_runtime 15; then
+
+    if weston_restore_runtime 15; then
+        weston_stopped_by_test=0
+    else
         restore_failed=1
         log_error "Failed to restore Weston runtime after $TESTNAME"
     fi
+fi
+
+if ! display_restore_service_from_state "$DISPLAY_MANAGER_STATE_FILE"; then
+    restore_failed=1
 fi
 
 # --- Verdict -----------------------------------------------------------------
@@ -257,7 +550,7 @@ if [ "$FRAMES_RENDERED" -lt "$EXPECTED_MIN" ]; then
 fi
 
 if [ "$restore_failed" -ne 0 ]; then
-    log_fail "$TESTNAME : FAIL (rendered ${FRAMES_RENDERED}, but Weston restore failed)"
+    log_fail "$TESTNAME : FAIL (rendered ${FRAMES_RENDERED}, but display runtime restore failed)"
     echo "$TESTNAME FAIL" >"$RES_FILE"
     exit 1
 fi
