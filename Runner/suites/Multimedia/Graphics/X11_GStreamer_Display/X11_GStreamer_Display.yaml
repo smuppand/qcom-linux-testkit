@@ -1,0 +1,15 @@
+metadata:
+  name: X11_GStreamer_Display
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validates live GStreamer X11 sinks in bounded mode with exact-window fullscreen control."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Graphics/X11_GStreamer_Display
+    - ./run.sh --fullscreen || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh X11_GStreamer_Display.res || true

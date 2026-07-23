@@ -1,0 +1,15 @@
+metadata:
+  name: X11_EGL_GLES
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validates strict hardware X11 EGL/GLES and bounded X11 clients with exact-window fullscreen control."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Graphics/X11_EGL_GLES
+    - ./run.sh --fullscreen || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh X11_EGL_GLES.res || true

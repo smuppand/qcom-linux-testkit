@@ -1,0 +1,15 @@
+metadata:
+  name: X11_Glmark2
+  format: "Lava-Test Test Definition 1.0"
+  description: "Runs bounded hardware glmark2 X11 variants using native fullscreen mode and validates numeric scores."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Graphics/X11_Glmark2
+    - ./run.sh --fullscreen || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh X11_Glmark2.res || true
