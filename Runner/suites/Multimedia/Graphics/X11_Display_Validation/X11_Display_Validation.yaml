@@ -1,0 +1,15 @@
+metadata:
+  name: X11_Display_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Dynamically validates the active X11 server, authority, connected output, current XRandR mode and root-window state."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Graphics/X11_Display_Validation
+    - ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh X11_Display_Validation.res || true

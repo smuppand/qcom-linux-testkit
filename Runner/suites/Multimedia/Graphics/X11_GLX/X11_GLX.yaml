@@ -1,0 +1,15 @@
+metadata:
+  name: X11_GLX
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validates hardware GLX and refresh-synchronised glxgears frame progress using native fullscreen X11 mode."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Graphics/X11_GLX
+    - ./run.sh --fullscreen || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh X11_GLX.res || true
