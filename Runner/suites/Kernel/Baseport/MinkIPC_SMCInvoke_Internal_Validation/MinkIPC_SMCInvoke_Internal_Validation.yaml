@@ -1,0 +1,22 @@
+metadata:
+  name: MinkIPC_SMCInvoke_Internal_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Runs a safe MinkIPC internal filesystem command with the optional smplap TA."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  CLIENT: ""
+  TA_PATH: ""
+  COMMAND: "6"
+  ITERATIONS: "1"
+  TYPE: "0"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_SMCInvoke_Internal_Validation
+    - ./run.sh --client "${CLIENT}" --ta "${TA_PATH}" --command "${COMMAND}" --iterations "${ITERATIONS}" --type "${TYPE}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_SMCInvoke_Internal_Validation.res

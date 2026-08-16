@@ -1,0 +1,15 @@
+metadata:
+  name: MinkIPC_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Qualcomm MinkIPC health validation for legacy SMCInvoke and modern QCOMTEE-backed TEE deployments across Yocto, Debian, Ubuntu, and CentOS."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_Validation
+    - ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_Validation.res

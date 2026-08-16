@@ -1,0 +1,19 @@
+metadata:
+  name: MinkIPC_SMCInvoke_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Runs the MinkIPC smcinvoke_client QTEE diagnostic as a focused, asset-optional test."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  CLIENT: ""
+  ITERATIONS: "1"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_SMCInvoke_Validation
+    - ./run.sh --client "${CLIENT}" --iterations "${ITERATIONS}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_SMCInvoke_Validation.res

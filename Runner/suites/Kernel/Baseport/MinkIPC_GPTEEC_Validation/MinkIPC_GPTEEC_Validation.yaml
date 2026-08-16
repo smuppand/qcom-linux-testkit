@@ -1,0 +1,19 @@
+metadata:
+  name: MinkIPC_GPTEEC_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Runs gp_test_client with explicitly pre-loaded GlobalPlatform test TAs against the MinkIPC/QCOMTEE path."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  CLIENT: ""
+  TA_PATH: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_GPTEEC_Validation
+    - ./run.sh --client "${CLIENT}" --ta-path "${TA_PATH}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_GPTEEC_Validation.res
