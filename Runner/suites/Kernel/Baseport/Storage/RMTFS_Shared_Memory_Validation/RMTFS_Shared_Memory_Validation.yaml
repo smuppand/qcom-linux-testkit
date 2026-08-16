@@ -1,0 +1,15 @@
+metadata:
+  name: RMTFS_Shared_Memory_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validates reversible rmtfs_mem loading plus mainline, UIO, and reserved-memory shared-memory paths."
+  os:
+    - linux
+  scope:
+    - functional
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/Storage/RMTFS_Shared_Memory_Validation
+    - ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh RMTFS_Shared_Memory_Validation.res

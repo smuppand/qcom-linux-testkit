@@ -1,0 +1,18 @@
+metadata:
+  name: RMTFS_Partition_Read_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Performs reversible RMTFS setup and isolated one-sector read-only checks of partition labels."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  PARTITIONS: "modemst1 modemst2 fsc fsg"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/Storage/RMTFS_Partition_Read_Validation
+    - ./run.sh --partitions "${PARTITIONS}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh RMTFS_Partition_Read_Validation.res

@@ -1,0 +1,20 @@
+metadata:
+  name: RMTFS_QMI_Service_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validates reversible RMTFS startup and QRTR registration for QMI service 14, version 1, instance 0."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  SERVICE_ID: "14"
+  SERVICE_VERSION: "1"
+  SERVICE_INSTANCE: "0"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/Storage/RMTFS_QMI_Service_Validation
+    - RMTFS_QMI_SERVICE="${SERVICE_ID}" RMTFS_QMI_VERSION="${SERVICE_VERSION}" RMTFS_QMI_INSTANCE="${SERVICE_INSTANCE}" ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh RMTFS_QMI_Service_Validation.res
