@@ -2566,6 +2566,44 @@ run_with_timeout() {
     return $status
 }
 
+# Purpose: Run a command with a timeout and capture stdout and stderr.
+# Arguments:
+#   $1 - Timeout in seconds.
+#   $2 - Destination log-file path.
+#   $3... - Command and arguments to execute.
+# Side effects:
+#   Creates or replaces the destination log with command stdout and stderr.
+# Returns:
+#   The command status returned by run_with_timeout(), including a nonzero
+#   status when the command fails or is terminated after the timeout.
+run_with_timeout_log() {
+    rwtl_timeout="$1"
+    rwtl_log_file="$2"
+    shift 2
+
+    run_with_timeout "$rwtl_timeout" "$@" > "$rwtl_log_file" 2>&1
+}
+
+# Purpose: Replay every line from a file through the common information logger.
+# Arguments:
+#   $1 - Label prepended to each logged line.
+#   $2 - Log-file path to replay.
+# Output:
+#   Sends each readable input line through log_info().
+# Returns:
+#   0 after replaying the file. An unreadable file is treated as empty.
+log_file_with_label() {
+    lfwl_label="$1"
+    lfwl_file="$2"
+
+    [ -r "$lfwl_file" ] || return 0
+    while IFS= read -r lfwl_line || [ -n "$lfwl_line" ]; do
+        log_info "[$lfwl_label] $lfwl_line"
+    done < "$lfwl_file"
+
+    return 0
+}
+
 # Only apply a timeout if TIMEOUT is set; prefer `timeout`; avoid functestlib here
 runWithTimeoutIfSet() {
   # Normalize TIMEOUT: treat empty or non-numeric as 0
