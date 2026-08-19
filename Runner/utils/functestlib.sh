@@ -883,6 +883,24 @@ check_kernel_config() {
     return 0
 }
 
+###############################################################################
+# kernel_config_value <CONFIG_NAME>
+# Prints the active CONFIG_NAME=value line from /proc/config.gz. Returns 0
+# when found, 1 when it is absent or the kernel config cannot be read, and 3
+# when the config name is omitted.
+###############################################################################
+kernel_config_value() {
+    config_name="$1"
+    [ -n "$config_name" ] || return 3
+    [ -r /proc/config.gz ] || return 1
+
+    if command -v zgrep >/dev/null 2>&1; then
+        zgrep -m 1 -E "^${config_name}=" /proc/config.gz 2>/dev/null
+    else
+        gzip -dc /proc/config.gz 2>/dev/null | grep -m 1 -E "^${config_name}="
+    fi
+}
+
 check_dt_nodes() {
     node_paths="$1"
     log_info "$node_paths"
@@ -3129,8 +3147,14 @@ dt_has_remoteproc_fw() {
     fw="$1"
     [ -n "$fw" ] || return 3
  
-    base="/proc/device-tree"
-    [ -d "$base" ] || return 1
+    base=""
+    for candidate in /proc/device-tree /sys/firmware/devicetree/base; do
+        if [ -d "$candidate" ]; then
+            base="$candidate"
+            break
+        fi
+    done
+    [ -n "$base" ] || return 1
  
     # lower-case match key
     fw_lc=$(printf '%s\n' "$fw" | tr '[:upper:]' '[:lower:]')
@@ -3158,6 +3182,182 @@ dt_has_remoteproc_fw() {
     fi
  
     return 1
+}
+
+###############################################################################
+# dt_list_compatible_nodes <compatible-substring>
+# Prints one enabled device-tree node directory per line from both standard DT
+# roots.  Returns 0 when at least one node is found, 1 when none are found,
+# and 3 when the compatible substring is omitted.
+###############################################################################
+dt_list_compatible_nodes() {
+    compatible="$1"
+    [ -n "$compatible" ] || return 3
+
+    found=0
+    previous_root=""
+    for dt_root in /proc/device-tree /sys/firmware/devicetree/base; do
+        [ -d "$dt_root" ] || continue
+        resolved_root=$(readlink -f "$dt_root" 2>/dev/null)
+        [ -n "$resolved_root" ] || resolved_root="$dt_root"
+        [ "$resolved_root" = "$previous_root" ] && continue
+        previous_root="$resolved_root"
+
+        matches_file=$(mktemp "${TMPDIR:-/tmp}/dt-compatible.XXXXXX") || return 1
+        grep -r -l -a -F "$compatible" "$dt_root" 2>/dev/null >"$matches_file" || true
+        while IFS= read -r compatible_file || [ -n "$compatible_file" ]; do
+            [ -n "$compatible_file" ] || continue
+            node_dir=$(dirname "$compatible_file")
+            [ -r "$node_dir/status" ] && IFS= read -r node_status <"$node_dir/status"
+            case "${node_status:-okay}" in
+                disabled|fail|failed)
+                    continue
+                    ;;
+            esac
+            printf '%s\n' "$node_dir"
+            found=1
+        done <"$matches_file"
+        rm -f "$matches_file"
+    done
+    [ "$found" -eq 1 ]
+}
+
+###############################################################################
+# dt_node_has_property <node-dir> <property>
+# Returns 0 if the exact DT property file exists, otherwise 1.  The function
+# does not interpret property values.
+###############################################################################
+dt_node_has_property() {
+    node_dir="$1"
+    property="$2"
+    [ -n "$node_dir" ] && [ -n "$property" ] || return 3
+    [ -e "$node_dir/$property" ]
+}
+
+###############################################################################
+# dt_property_hex <node-dir> <property>
+# Prints the exact device-tree property bytes as one lowercase hexadecimal
+# string. Returns 0 when the property is readable, 1 when absent or unreadable,
+# and 3 when either argument is omitted.
+###############################################################################
+dt_property_hex() {
+    node_dir="$1"
+    property="$2"
+    [ -n "$node_dir" ] && [ -n "$property" ] || return 3
+    [ -r "$node_dir/$property" ] || return 1
+    od -An -v -tx1 "$node_dir/$property" 2>/dev/null | tr -d ' \n'
+}
+
+###############################################################################
+# dt_property_text <node-dir> <property>
+# Prints NUL-separated text values from a device-tree property as one
+# space-separated, printable line. Returns 0 for a readable property, 1 when
+# absent or unreadable, and 3 when either argument is omitted.
+###############################################################################
+dt_property_text() {
+    node_dir="$1"
+    property="$2"
+    [ -n "$node_dir" ] && [ -n "$property" ] || return 3
+    [ -r "$node_dir/$property" ] || return 1
+    tr '\000' ' ' <"$node_dir/$property" | tr -cd '[:print:] \n' | sed 's/[[:space:]]*$//'
+}
+
+###############################################################################
+# list_remoteproc_instances [outfile]
+# Prints or appends '<path>|<name>|<firmware>|<state>' for every runtime
+# remoteproc. Returns 0 if one or more instances exist, otherwise 1.
+###############################################################################
+list_remoteproc_instances() {
+    outfile="$1"
+    found=0
+    for remoteproc_path in /sys/class/remoteproc/remoteproc*; do
+        [ -d "$remoteproc_path" ] || continue
+        remoteproc_name=""
+        remoteproc_firmware=""
+        remoteproc_state="unknown"
+        [ -r "$remoteproc_path/name" ] && IFS= read -r remoteproc_name <"$remoteproc_path/name"
+        [ -r "$remoteproc_path/firmware" ] && IFS= read -r remoteproc_firmware <"$remoteproc_path/firmware"
+        [ -r "$remoteproc_path/state" ] && IFS= read -r remoteproc_state <"$remoteproc_path/state"
+        if [ -n "$outfile" ]; then
+            printf '%s|%s|%s|%s\n' "$remoteproc_path" "$remoteproc_name" "$remoteproc_firmware" "$remoteproc_state" >>"$outfile"
+        else
+            printf '%s|%s|%s|%s\n' "$remoteproc_path" "$remoteproc_name" "$remoteproc_firmware" "$remoteproc_state"
+        fi
+        found=1
+    done
+    [ "$found" -eq 1 ]
+}
+
+###############################################################################
+# find_image_firmware <firmware-name>
+# Prints the first matching image-provided firmware path under the standard
+# firmware roots, accepting uncompressed, .xz, and .zst files. Returns 0 on a
+# match, 1 when no asset is exposed, and 3 when no name is supplied.
+###############################################################################
+find_image_firmware() {
+    firmware_name="$1"
+    [ -n "$firmware_name" ] || return 3
+
+    for firmware_root in /lib/firmware /usr/lib/firmware; do
+        for firmware_path in \
+            "$firmware_root/$firmware_name" \
+            "$firmware_root/$firmware_name.xz" \
+            "$firmware_root/$firmware_name.zst"; do
+            if [ -f "$firmware_path" ]; then
+                printf '%s\n' "$firmware_path"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+###############################################################################
+# smp2p_runtime_devices
+# Prints bound platform-device names owned by the qcom_smp2p driver. Returns 0
+# if at least one device is bound, otherwise 1.
+###############################################################################
+smp2p_runtime_devices() {
+    driver_dir="/sys/bus/platform/drivers/qcom_smp2p"
+    [ -d "$driver_dir" ] || return 1
+    found=0
+    for device_link in "$driver_dir"/*; do
+        [ -e "$device_link" ] || continue
+        case "$(basename "$device_link")" in
+            bind|unbind|uevent|module)
+                continue
+                ;;
+        esac
+        basename "$(readlink -f "$device_link")"
+        found=1
+    done
+    [ "$found" -eq 1 ]
+}
+
+###############################################################################
+# smp2p_tracepoints_available
+# Prints available upstream SMP2P tracepoint names from tracefs. Returns 0 if
+# at least one event is exposed, otherwise 1. It only inspects tracefs and
+# never enables tracing or changes the tracing buffer.
+###############################################################################
+smp2p_tracepoints_available() {
+    trace_root=""
+    for candidate in /sys/kernel/tracing /sys/kernel/debug/tracing; do
+        if [ -d "$candidate/events/smp2p" ]; then
+            trace_root="$candidate"
+            break
+        fi
+    done
+    [ -n "$trace_root" ] || return 1
+
+    found=0
+    for tracepoint in smp2p_negotiate smp2p_ssr_ack smp2p_notify_in smp2p_update_bits; do
+        if [ -d "$trace_root/events/smp2p/$tracepoint" ]; then
+            printf '%s\n' "$tracepoint"
+            found=1
+        fi
+    done
+    [ "$found" -eq 1 ]
 }
 
 # Find the remoteproc path for a given firmware substring (e.g., "adsp", "cdsp", "gdsp").

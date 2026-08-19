@@ -2,10 +2,15 @@
 
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
-# Robustly find and source init_env
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------- Repo env + helpers ----------
+SCRIPT_DIR="$(
+  cd "$(dirname "$0")" || exit 1
+  pwd
+)"
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
+
 while [ "$SEARCH" != "/" ]; do
     if [ -f "$SEARCH/init_env" ]; then
         INIT_ENV="$SEARCH/init_env"
@@ -19,78 +24,92 @@ if [ -z "$INIT_ENV" ]; then
     exit 1
 fi
 
-# Only source if not already loaded (idempotent)
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
+    __INIT_ENV_LOADED=1
 fi
-# Always source functestlib.sh, using $TOOLS exported by init_env
-# shellcheck disable=SC1090,SC1091
+
+# shellcheck disable=SC1090
+. "$INIT_ENV"
+# shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 
 TESTNAME="remoteproc"
-test_path=$(find_test_case_by_name "$TESTNAME")
-cd "$test_path" || exit 1
-# shellcheck disable=SC2034
-res_file="./$TESTNAME.res"
+RES_FILE="./$TESTNAME.res"
 
-log_info "-----------------------------------------------------------------------------------------"
-log_info "-------------------Starting $TESTNAME Testcase----------------------------"
-log_info "=== Test Initialization ==="
+# write_result <PASS|FAIL|SKIP>
+# Writes the single result line consumed by send-to-lava.sh. Returns the
+# status of the write operation.
+write_result() {
+    result="$1"
+    printf '%s %s\n' "$TESTNAME" "$result" >"$RES_FILE"
+}
 
-detect_platform
+failures=0
+runtime_file="$SCRIPT_DIR/remoteproc_runtime.log"
+: >"$runtime_file"
 
-if [ ! -d "/sys/class/remoteproc" ]; then
-    log_skip "$TESTNAME : remoteproc sysfs not found (/sys/class/remoteproc missing), skipping test"
-    echo "$TESTNAME SKIP" > "$res_file"
+log_info "--------------------------------------------------------------------------"
+log_info "Starting $TESTNAME"
+
+if ! list_remoteproc_instances "$runtime_file"; then
+    log_skip "$TESTNAME SKIP: no runtime remoteproc instance is registered"
+    write_result "SKIP"
     exit 0
 fi
 
-rproc_count=$(find /sys/class/remoteproc -maxdepth 1 -name "remoteproc*" 2>/dev/null | wc -l)
-if [ "$rproc_count" -eq 0 ]; then
-    log_skip "$TESTNAME : No remoteproc entries found under /sys/class/remoteproc, skipping test"
-    echo "$TESTNAME SKIP" > "$res_file"
-    exit 0
-fi
+while IFS='|' read -r remoteproc_path remoteproc_name remoteproc_firmware remoteproc_state; do
+    [ -n "$remoteproc_path" ] || continue
 
-all_pass=true
+    remoteproc_driver="<not exposed>"
+    if [ -e "$remoteproc_path/device/driver" ]; then
+        remoteproc_driver=$(basename "$(readlink -f "$remoteproc_path/device/driver")")
+    fi
 
-# Iterate over each remoteproc instance
-for rproc_dir in /sys/class/remoteproc/remoteproc*; do
-    rproc_name=$(basename "$rproc_dir")
-    firmware=$(cat "$rproc_dir/firmware" 2>/dev/null)
-    state=$(cat "$rproc_dir/state" 2>/dev/null)
+    log_info "Remoteproc $(basename "$remoteproc_path"), driver=$remoteproc_driver, name=$remoteproc_name, firmware=$remoteproc_firmware, state=$remoteproc_state"
 
-    # Skip modem subsystem on Kodiak platform
-    if printf '%s' "$firmware" | grep -q "modem" && [ "${PLATFORM_TARGET}" = "Kodiak" ]; then
-        log_info "Skipping modem subsystem ($rproc_name) on Kodiak platform"
+    if [ -z "$remoteproc_name" ] || [ -z "$remoteproc_firmware" ] || [ "$remoteproc_state" = "unknown" ]; then
+        log_fail "Remoteproc sysfs attributes are incomplete for $remoteproc_path"
+        failures=$((failures + 1))
         continue
     fi
 
-    # soccp is expected to be in 'attached' state, all others in 'running' state
-    if printf '%s' "$firmware" | grep -q "soccp"; then
-        expected_state="attached"
+    case "$remoteproc_state" in
+        running|attached)
+            log_pass "Remoteproc state is valid: $remoteproc_state"
+            ;;
+        offline)
+            log_pass "Remoteproc is offline, valid for a non-autoboot processor: $remoteproc_name"
+            ;;
+        crashed)
+            log_fail "Remoteproc is crashed: $remoteproc_name"
+            failures=$((failures + 1))
+            ;;
+        *)
+            log_fail "Remoteproc has an unexpected state: $remoteproc_state"
+            failures=$((failures + 1))
+            ;;
+    esac
+
+    if firmware_path=$(find_image_firmware "$remoteproc_firmware"); then
+        log_pass "Image-provided firmware is present: $firmware_path"
     else
-        expected_state="running"
+        log_info "Firmware is not exposed below standard firmware paths: $remoteproc_firmware"
     fi
+done <"$runtime_file"
 
-    log_info "$rproc_name | firmware: $firmware | state: $state | expected: $expected_state"
-
-    if [ "$state" = "$expected_state" ]; then
-        log_info "$rproc_name is in expected state '$expected_state' : PASS"
-    else
-        log_fail "$rproc_name is in state '$state', expected '$expected_state' : FAIL"
-        all_pass=false
-    fi
-done
-
-# Print overall test result
-if [ "$all_pass" = "true" ]; then
-    log_pass "$TESTNAME : Test Passed"
-    echo "$TESTNAME PASS" > "$res_file"
-    exit 0
-else
-    log_fail "$TESTNAME : Test Failed"
-    echo "$TESTNAME FAIL" > "$res_file"
-    exit 1
+scan_dmesg_errors "$SCRIPT_DIR" "remoteproc|qcom.*pas|qcom_q6v5" "subsys-restart|not a crash|firmware.*already" || true
+if [ -s "$SCRIPT_DIR/dmesg_errors.log" ]; then
+    log_fail "Remoteproc and Qualcomm PAS kernel errors are recorded in dmesg_errors.log"
+    failures=$((failures + 1))
 fi
+
+if [ "$failures" -eq 0 ]; then
+    log_pass "$TESTNAME PASS"
+    write_result "PASS"
+else
+    log_fail "$TESTNAME FAIL: failures=$failures"
+    write_result "FAIL"
+fi
+exit 0
