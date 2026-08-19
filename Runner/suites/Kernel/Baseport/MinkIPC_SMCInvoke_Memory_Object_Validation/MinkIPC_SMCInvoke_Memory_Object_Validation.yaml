@@ -1,0 +1,20 @@
+metadata:
+  name: MinkIPC_SMCInvoke_Memory_Object_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Runs the MinkIPC memory object test with the optional tzecotestapp TA."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  CLIENT: ""
+  TA_DIR: ""
+  ITERATIONS: "1"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_SMCInvoke_Memory_Object_Validation
+    - ./run.sh --client "${CLIENT}" --ta-dir "${TA_DIR}" --iterations "${ITERATIONS}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_SMCInvoke_Memory_Object_Validation.res

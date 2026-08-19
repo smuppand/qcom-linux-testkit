@@ -28,35 +28,83 @@ get_kernel_log() {
     fi
 }
 
-# Locate a kernel module (.ko) file by name
-# Tries to find it under current kernel version first, then all module trees
+# Locate a kernel module file by name.
+# Supports uncompressed and commonly compressed module formats.
+# Tries the running kernel first, then all module trees.
 find_kernel_module() {
     module_name="$1"
     kver=$(uname -r)
 
-    # Attempt to find module under the currently running kernel
-    module_path=$(find "/lib/modules/$kver" -name "${module_name}.ko" 2>/dev/null | head -n 1)
+    module_path=""
 
-    # If not found, search all available module directories
-    if [ -z "$module_path" ]; then
-        log_warn "Module not found under /lib/modules/$kver, falling back to full search in /lib/modules/"
-        module_path=$(find /lib/modules/ -name "${module_name}.ko" 2>/dev/null | head -n 1)
+    if [ -d "/lib/modules/$kver" ]; then
+        module_path=$(
+            find "/lib/modules/$kver" -type f \
+                \( -name "${module_name}.ko" \
+                -o -name "${module_name}.ko.xz" \
+                -o -name "${module_name}.ko.gz" \
+                -o -name "${module_name}.ko.zst" \) \
+                2>/dev/null |
+            head -n 1
+        )
+    fi
 
-        # Warn if found outside current kernel version
+    if [ -z "$module_path" ] && [ -d /lib/modules ]; then
+        log_warn "Module $module_name not found under /lib/modules/$kver, searching all module trees"
+        module_path=$(
+            find /lib/modules -type f \
+                \( -name "${module_name}.ko" \
+                -o -name "${module_name}.ko.xz" \
+                -o -name "${module_name}.ko.gz" \
+                -o -name "${module_name}.ko.zst" \) \
+                2>/dev/null |
+            head -n 1
+        )
+
         if [ -n "$module_path" ]; then
-            found_version=$(echo "$module_path" | cut -d'/' -f4)
+            found_version=${module_path#/lib/modules/}
+            found_version=${found_version%%/*}
             if [ "$found_version" != "$kver" ]; then
-                log_warn "Found ${module_name}.ko under $found_version, not under current kernel ($kver)"
+                log_warn "Found $module_name under kernel $found_version, running kernel is $kver"
             fi
         fi
     fi
-    echo "$module_path"
+
+    printf '%s\n' "$module_path"
 }
 
 # Check if a kernel module is currently loaded
 is_module_loaded() {
     module_name="$1"
-    /sbin/lsmod | awk '{print $1}' | grep -q "^${module_name}$"
+
+    if [ -r /proc/modules ]; then
+        awk -v target="$module_name" '
+            $1 == target {
+                found = 1
+                exit
+            }
+            END {
+                exit !found
+            }
+        ' /proc/modules
+        return $?
+    fi
+
+    if command -v lsmod >/dev/null 2>&1; then
+        lsmod 2>/dev/null |
+        awk -v target="$module_name" '
+            $1 == target {
+                found = 1
+                exit
+            }
+            END {
+                exit !found
+            }
+        '
+        return $?
+    fi
+
+    return 1
 }
 
 # load_kernel_module <path-to-ko> [params...]
@@ -64,43 +112,53 @@ is_module_loaded() {
 # 2) Try insmod <ko> [params]
 # 3) If that fails, try modprobe <modname> [params]
 load_kernel_module() {
-    module_path="$1"; shift
+    module_path="$1"
+    shift
     params="$*"
-    module_name=$(basename "$module_path" .ko)
+    module_file=$(basename "$module_path")
+    module_name=${module_file%%.ko*}
+    insmod_bin=$(command -v insmod 2>/dev/null || true)
+    modprobe_bin=$(command -v modprobe 2>/dev/null || true)
 
     if is_module_loaded "$module_name"; then
         log_info "Module $module_name is already loaded"
         return 0
     fi
 
-    if [ ! -f "$module_path" ]; then
+    if [ -z "$module_path" ] || [ ! -f "$module_path" ]; then
         log_error "Module file not found: $module_path"
-        # still try modprobe if it exists in modules directory
-    else
-        log_info "Loading module via insmod: $module_path $params"
-        if /sbin/insmod "$module_path" "$params" 2>insmod_err.log; then
+    elif [ -n "$insmod_bin" ]; then
+        log_info "Loading module via insmod: $module_path${params:+ $params}"
+        if "$insmod_bin" "$module_path" "$@" 2>insmod_err.log; then
             log_info "Module $module_name loaded successfully via insmod"
             return 0
-        else
-            log_warn "insmod failed: $(cat insmod_err.log)"
         fi
+        log_warn "insmod failed: $(cat insmod_err.log)"
+    else
+        log_warn "insmod is not available, trying modprobe"
     fi
 
-    # fallback to modprobe
-    log_info "Falling back to modprobe $module_name $params"
-    if /sbin/modprobe "$module_name" "$params" 2>modprobe_err.log; then
-        log_info "Module $module_name loaded successfully via modprobe"
-        return 0
-    else
-        log_error "modprobe failed: $(cat modprobe_err.log)"
+    if [ -z "$modprobe_bin" ]; then
+        log_error "modprobe is not available for module $module_name"
         return 1
     fi
+
+    log_info "Loading module via modprobe: $module_name${params:+ $params}"
+    if "$modprobe_bin" "$module_name" "$@" 2>modprobe_err.log; then
+        log_info "Module $module_name loaded successfully via modprobe"
+        return 0
+    fi
+
+    log_error "modprobe failed: $(cat modprobe_err.log)"
+    return 1
 }
 
 # Remove a kernel module by name with optional forced removal
 unload_kernel_module() {
     module_name="$1"
     force="$2"
+    rmmod_bin=$(command -v rmmod 2>/dev/null || true)
+    modprobe_bin=$(command -v modprobe 2>/dev/null || true)
 
     if ! is_module_loaded "$module_name"; then
         log_info "Module $module_name is not loaded, skipping unload"
@@ -108,29 +166,35 @@ unload_kernel_module() {
     fi
 
     log_info "Attempting to remove module: $module_name"
-    if /sbin/rmmod "$module_name" 2>rmmod_err.log; then
-        log_info "Module $module_name removed via rmmod"
-        return 0
+    if [ -n "$rmmod_bin" ]; then
+        if "$rmmod_bin" "$module_name" 2>rmmod_err.log; then
+            log_info "Module $module_name removed via rmmod"
+            return 0
+        fi
+        log_warn "rmmod failed: $(cat rmmod_err.log)"
+    else
+        log_warn "rmmod is not available, trying modprobe -r"
     fi
 
-    log_warn "rmmod failed: $(cat rmmod_err.log)"
-    log_info "Trying modprobe -r as fallback"
-    if /sbin/modprobe -r "$module_name" 2>modprobe_err.log; then
-        log_info "Module $module_name removed via modprobe"
-        return 0
+    if [ -n "$modprobe_bin" ]; then
+        log_info "Trying modprobe -r for module $module_name"
+        if "$modprobe_bin" -r "$module_name" 2>modprobe_err.log; then
+            log_info "Module $module_name removed via modprobe"
+            return 0
+        fi
+        log_warn "modprobe -r failed: $(cat modprobe_err.log)"
+    else
+        log_warn "modprobe is not available for module removal"
     fi
 
-    log_warn "modprobe -r failed: $(cat modprobe_err.log)"
-
-    if [ "$force" = "true" ]; then
+    if [ "$force" = "true" ] && [ -n "$rmmod_bin" ]; then
         log_warn "Trying forced rmmod: $module_name"
-        if /sbin/rmmod -f "$module_name" 2>>rmmod_err.log; then
+        if "$rmmod_bin" -f "$module_name" 2>>rmmod_err.log; then
             log_info "Module $module_name force removed"
             return 0
-        else
-            log_error "Forced rmmod failed: $(cat rmmod_err.log)"
-            return 1
         fi
+        log_error "Forced rmmod failed: $(cat rmmod_err.log)"
+        return 1
     fi
 
     log_error "Unable to unload module: $module_name"
@@ -4098,7 +4162,7 @@ dt_confirm_node_or_compatible_all() {
         case "$pattern" in *,*)
             # label as chip (the part after the last comma) to avoid "swapped" look
             chip_label="${pattern##*,}"
-            comp_file="$(grep -r -s -i -F -l -m1 -- "$pattern" "$DT_ROOT" 2>/dev/null | grep '/compatible$' -m1 || true)"
+            comp_file="$(grep -r -s -i -a -F -l -m1 -- "$pattern" "$DT_ROOT" 2>/dev/null | grep '/compatible$' -m1 || true)"
             if [ -n "$comp_file" ]; then
                 comp_print="$(tr '\0' ' ' <"$comp_file" 2>/dev/null)"
                 comp_csv="$(tr '\0' ',' <"$comp_file" 2>/dev/null)"; comp_csv="${comp_csv%,}"
@@ -4111,7 +4175,7 @@ dt_confirm_node_or_compatible_all() {
             fi
             ;;
         *)
-            cand_list="$(grep -r -s -i -F -l -- "$pattern" "$DT_ROOT" 2>/dev/null | grep '/compatible$' | head -n 64 || true)"
+            cand_list="$(grep -r -s -i -a -F -l -- "$pattern" "$DT_ROOT" 2>/dev/null | grep '/compatible$' | head -n 64 || true)"
             if [ -n "$cand_list" ]; then
                 for comp_file in $cand_list; do
                     hit=0
@@ -4146,6 +4210,692 @@ EOF
 # Back-compat: single-pattern wrapper
 dt_confirm_node_or_compatible() {
     dt_confirm_node_or_compatible_all "$@"
+}
+
+###############################################################################
+# Qualcomm MinkIPC package preparation
+###############################################################################
+
+# Ensure the MinkIPC runtime and public test clients on Debian and Ubuntu.
+# Yocto, CentOS, and other images continue using image-provided components.
+#
+# qli-staging currently publishes the MinkIPC packages in its trixie suite.
+# The package-provider library performs all source setup, network handling,
+# package installation, and post-install verification.
+minkipc_prepare_test_packages() {
+    mptp_os_id="unknown"
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        mptp_os_id=$(pkg_detect_os_id 2>/dev/null || printf '%s\n' unknown)
+    elif [ -r /etc/os-release ]; then
+        mptp_os_id=$(
+            sed -n 's/^ID=//p' /etc/os-release 2>/dev/null |
+                sed -n '1p' |
+                sed 's/^"//; s/"$//' |
+                tr '[:upper:]' '[:lower:]'
+        )
+    fi
+
+    [ -n "$mptp_os_id" ] || mptp_os_id="unknown"
+
+    case "$mptp_os_id" in
+        debian|ubuntu)
+            ;;
+        qcom-distro|poky|openembedded|oe)
+            log_info "Native image detected, MinkIPC package preparation is not required"
+            return 0
+            ;;
+        centos|rhel|fedora)
+            log_info "RPM image detected, using image-provided MinkIPC components"
+            return 0
+            ;;
+        *)
+            log_info "MinkIPC package preparation is not enabled for os=$mptp_os_id"
+            return 0
+            ;;
+    esac
+
+    for mptp_helper in \
+        pkg_provider_init \
+        pkg_active_provider \
+        pkg_ensure_required_package_set_present; do
+        if ! command -v "$mptp_helper" >/dev/null 2>&1; then
+            log_fail "Required MinkIPC package helper is unavailable: $mptp_helper"
+            return 1
+        fi
+    done
+
+    pkg_provider_init || return 1
+
+    mptp_provider=$(pkg_active_provider 2>/dev/null || printf '%s\n' check)
+    if [ "$mptp_provider" != "apt" ]; then
+        log_fail "MinkIPC package preparation requires apt on os=$mptp_os_id, provider=$mptp_provider"
+        return 1
+    fi
+
+    mptp_old_source="${PKG_APT_DEBUSINE_SOURCE-__unset__}"
+    mptp_old_suite="${PKG_APT_DEBUSINE_SUITE-__unset__}"
+    mptp_old_upgrade="${PKG_PACKAGE_SET_UPGRADE-__unset__}"
+
+    PKG_APT_DEBUSINE_SOURCE="qli-staging"
+    PKG_APT_DEBUSINE_SUITE="trixie"
+    PKG_PACKAGE_SET_UPGRADE=0
+
+    if [ "$mptp_old_source" != "$PKG_APT_DEBUSINE_SOURCE" ] ||
+       [ "$mptp_old_suite" != "$PKG_APT_DEBUSINE_SUITE" ]; then
+        rm -f "${PKG_APT_UPDATED_MARK:-/tmp/qcom_testkit_apt_updated}" \
+            2>/dev/null || true
+    fi
+
+    log_info "Preparing MinkIPC packages, os=$mptp_os_id source=$PKG_APT_DEBUSINE_SOURCE suite=$PKG_APT_DEBUSINE_SUITE"
+
+    pkg_ensure_required_package_set_present minkipc
+    mptp_rc=$?
+
+    case "$mptp_old_source" in
+        __unset__)
+            unset PKG_APT_DEBUSINE_SOURCE
+            ;;
+        *)
+            PKG_APT_DEBUSINE_SOURCE="$mptp_old_source"
+            ;;
+    esac
+
+    case "$mptp_old_suite" in
+        __unset__)
+            unset PKG_APT_DEBUSINE_SUITE
+            ;;
+        *)
+            PKG_APT_DEBUSINE_SUITE="$mptp_old_suite"
+            ;;
+    esac
+
+    case "$mptp_old_upgrade" in
+        __unset__)
+            unset PKG_PACKAGE_SET_UPGRADE
+            ;;
+        *)
+            PKG_PACKAGE_SET_UPGRADE="$mptp_old_upgrade"
+            ;;
+    esac
+
+    if [ "$mptp_rc" -ne 0 ]; then
+        log_fail "Failed to prepare the MinkIPC package set on os=$mptp_os_id"
+        return 1
+    fi
+
+    log_pass "MinkIPC package set is ready on os=$mptp_os_id"
+    return 0
+}
+
+###############################################################################
+# Qualcomm RMTFS runtime helpers
+###############################################################################
+
+# Read CONFIG_QCOM_RMTFS_MEM from the running-kernel configuration.
+# Prints y, m, n, or unknown.
+rmtfs_kernel_config_value() {
+    rmtfs_config_line=""
+
+    if [ -r /proc/config.gz ]; then
+        if command -v zgrep >/dev/null 2>&1; then
+            rmtfs_config_line=$(
+                zgrep -E '^CONFIG_QCOM_RMTFS_MEM=(y|m)$|^# CONFIG_QCOM_RMTFS_MEM is not set$' /proc/config.gz \
+                    2>/dev/null |
+                head -n 1
+            )
+        elif command -v gzip >/dev/null 2>&1; then
+            rmtfs_config_line=$(
+                gzip -dc /proc/config.gz 2>/dev/null |
+                grep -E '^CONFIG_QCOM_RMTFS_MEM=(y|m)$|^# CONFIG_QCOM_RMTFS_MEM is not set$' |
+                head -n 1
+            )
+        fi
+    elif [ -r "/boot/config-$(uname -r)" ]; then
+        rmtfs_config_line=$(
+            grep -E '^CONFIG_QCOM_RMTFS_MEM=(y|m)$|^# CONFIG_QCOM_RMTFS_MEM is not set$' \
+                "/boot/config-$(uname -r)" 2>/dev/null |
+            head -n 1
+        )
+    fi
+
+    case "$rmtfs_config_line" in
+        *=y)
+            printf '%s\n' y
+            ;;
+        *=m)
+            printf '%s\n' m
+            ;;
+        '# CONFIG_QCOM_RMTFS_MEM is not set')
+            printf '%s\n' n
+            ;;
+        *)
+            printf '%s\n' unknown
+            ;;
+    esac
+}
+
+# Find an exact NUL-separated compatible token without relying on recursive
+# grep binary-file behavior, which varies between GNU and BusyBox grep.
+rmtfs_find_dt_compatible_file() {
+    rmtfs_search_root="$1"
+    rmtfs_compatible_token="$2"
+
+    find "$rmtfs_search_root" -type f -name compatible 2>/dev/null |
+    while IFS= read -r rmtfs_compatible_file; do
+        if tr '\000' '\n' < "$rmtfs_compatible_file" 2>/dev/null |
+           grep -F -x -q "$rmtfs_compatible_token"; then
+            printf '%s\n' "$rmtfs_compatible_file"
+            break
+        fi
+    done
+}
+
+# Check both Linux runtime device-tree locations for the RMTFS compatible.
+rmtfs_dt_present() {
+    rmtfs_dt_root_seen=0
+
+    for rmtfs_dt_root in \
+        /proc/device-tree \
+        /sys/firmware/devicetree/base
+    do
+        if [ ! -d "$rmtfs_dt_root" ]; then
+            continue
+        fi
+
+        rmtfs_dt_root_seen=1
+        rmtfs_compatible_file=$(
+            rmtfs_find_dt_compatible_file \
+                "$rmtfs_dt_root" \
+                "qcom,rmtfs-mem"
+        )
+        if [ -n "$rmtfs_compatible_file" ]; then
+            rmtfs_compatible_node=$(dirname "$rmtfs_compatible_file")
+            log_info "RMTFS device-tree compatible found: $rmtfs_compatible_node"
+            return 0
+        fi
+    done
+
+    if [ "$rmtfs_dt_root_seen" -eq 1 ]; then
+        log_info "RMTFS compatible qcom,rmtfs-mem was not found in the runtime device tree"
+    else
+        log_info "Runtime device-tree paths are not available"
+    fi
+
+    return 1
+}
+
+rmtfs_find_mainline_device() {
+    for rmtfs_device in /dev/qcom_rmtfs_mem*; do
+        if [ -e "$rmtfs_device" ]; then
+            printf '%s\n' "$rmtfs_device"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+rmtfs_find_uio_device() {
+    for rmtfs_device in /dev/qcom_rmtfs_uio*; do
+        if [ -e "$rmtfs_device" ]; then
+            printf '%s\n' "$rmtfs_device"
+            return 0
+        fi
+    done
+
+    for rmtfs_uio_name in /sys/class/uio/uio*/name; do
+        if [ ! -r "$rmtfs_uio_name" ]; then
+            continue
+        fi
+
+        if grep -qi '^rmtfs$' "$rmtfs_uio_name"; then
+            rmtfs_uio_dir=$(dirname "$rmtfs_uio_name")
+            printf '/dev/%s\n' "$(basename "$rmtfs_uio_dir")"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+rmtfs_process_running() {
+    get_pid "$1" >/dev/null 2>&1
+}
+
+rmtfs_wait_for_process() {
+    rmtfs_wait_name="$1"
+    rmtfs_wait_timeout="${2:-5}"
+    rmtfs_wait_count=0
+
+    while [ "$rmtfs_wait_count" -lt "$rmtfs_wait_timeout" ]; do
+        if rmtfs_process_running "$rmtfs_wait_name"; then
+            return 0
+        fi
+
+        sleep 1
+        rmtfs_wait_count=$((rmtfs_wait_count + 1))
+    done
+
+    return 1
+}
+
+rmtfs_wait_for_process_exit() {
+    rmtfs_wait_name="$1"
+    rmtfs_wait_timeout="${2:-5}"
+    rmtfs_wait_count=0
+
+    while [ "$rmtfs_wait_count" -lt "$rmtfs_wait_timeout" ]; do
+        if ! rmtfs_process_running "$rmtfs_wait_name"; then
+            return 0
+        fi
+
+        sleep 1
+        rmtfs_wait_count=$((rmtfs_wait_count + 1))
+    done
+
+    return 1
+}
+
+rmtfs_wait_for_mainline_device() {
+    rmtfs_wait_timeout="${1:-5}"
+    rmtfs_wait_count=0
+
+    while [ "$rmtfs_wait_count" -lt "$rmtfs_wait_timeout" ]; do
+        if rmtfs_find_mainline_device >/dev/null 2>&1; then
+            return 0
+        fi
+
+        sleep 1
+        rmtfs_wait_count=$((rmtfs_wait_count + 1))
+    done
+
+    return 1
+}
+
+rmtfs_service_was_active() {
+    rmtfs_service_query="$1"
+
+    case " $RMTFS_INITIAL_ACTIVE_UNITS " in
+        *" $rmtfs_service_query "*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+rmtfs_get_active_service_unit() {
+    for rmtfs_service_unit in rmtfs rmtfs-dir; do
+        if systemd_service_exists "$rmtfs_service_unit" && \
+           systemd_service_is_active "$rmtfs_service_unit"; then
+            printf '%s\n' "$rmtfs_service_unit"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Record a daemon or service that appeared after the initial snapshot.
+rmtfs_record_runtime_activation() {
+    if [ "${RMTFS_RUNTIME_ACTIVATION_EXPECTED:-0}" -ne 1 ] || \
+       [ "${RMTFS_DAEMON_WAS_RUNNING:-0}" -ne 0 ] || \
+       ! rmtfs_process_running rmtfs; then
+        return 0
+    fi
+
+    if [ "${RMTFS_DAEMON_STARTED_BY_TEST:-0}" -eq 0 ]; then
+        RMTFS_DAEMON_STARTED_BY_TEST=1
+        log_info "RMTFS runtime activation detected after the initial snapshot"
+    fi
+
+    rmtfs_started_unit=$(rmtfs_get_active_service_unit 2>/dev/null || true)
+    if [ -n "$rmtfs_started_unit" ] && \
+       ! rmtfs_service_was_active "$rmtfs_started_unit" && \
+       [ "${RMTFS_SYSTEMD_STARTED_BY_TEST:-}" != "$rmtfs_started_unit" ]; then
+        RMTFS_SYSTEMD_STARTED_BY_TEST="$rmtfs_started_unit"
+        log_info "RMTFS service activation recorded for cleanup: $rmtfs_started_unit"
+    fi
+}
+
+rmtfs_runtime_reset_state() {
+    RMTFS_MODULE_NAME="rmtfs_mem"
+    RMTFS_MODULE_PATH=""
+    RMTFS_MODULE_WAS_LOADED=0
+    RMTFS_MODULE_LOADED_BY_TEST=0
+    RMTFS_MODULE_LOAD_ATTEMPTED=0
+    RMTFS_MODULE_LOAD_FAILED=0
+    RMTFS_CONFIG_VALUE="unknown"
+    RMTFS_DT_PRESENT=0
+    RMTFS_MAINLINE_DEVICE=""
+    RMTFS_UIO_DEVICE=""
+    RMTFS_MAINLINE_APPLICABLE=0
+    RMTFS_LEGACY_APPLICABLE=0
+    RMTFS_DAEMON_WAS_RUNNING=0
+    RMTFS_DAEMON_STARTED_BY_TEST=0
+    RMTFS_RUNTIME_ACTIVATION_EXPECTED=0
+    RMTFS_INITIAL_ACTIVE_UNITS=""
+    RMTFS_SYSTEMD_STARTED_BY_TEST=""
+    RMTFS_SYSV_STARTED_BY_TEST=""
+    RMTFS_RUNTIME_PREPARED=0
+}
+
+# Snapshot RMTFS state and load rmtfs_mem only on applicable DT platforms.
+# Return values:
+# 0 - RMTFS is applicable and the runtime snapshot was prepared
+# 1 - preparation failed
+# 2 - RMTFS is not applicable on this runtime device tree
+# State variables assigned here are consumed by the sourced RMTFS suites.
+# shellcheck disable=SC2034
+rmtfs_runtime_prepare() {
+    rmtfs_output_dir="${1:-.}"
+    rmtfs_runtime_reset_state
+
+    mkdir -p "$rmtfs_output_dir" 2>/dev/null || return 1
+
+    RMTFS_CONFIG_VALUE=$(rmtfs_kernel_config_value)
+    if [ "$RMTFS_CONFIG_VALUE" = "unknown" ]; then
+        log_info "CONFIG_QCOM_RMTFS_MEM value is unavailable"
+    else
+        log_info "Kernel configuration reports CONFIG_QCOM_RMTFS_MEM=$RMTFS_CONFIG_VALUE"
+    fi
+
+    rmtfs_module_lookup=$(
+        find_kernel_module "$RMTFS_MODULE_NAME" 2>&1
+    )
+    printf '%s\n' "$rmtfs_module_lookup" > \
+        "$rmtfs_output_dir/rmtfs_module_lookup.log"
+    RMTFS_MODULE_PATH=$(
+        printf '%s\n' "$rmtfs_module_lookup" |
+        awk '/^\// { print; exit }'
+    )
+
+    if [ -n "$RMTFS_MODULE_PATH" ]; then
+        case "$RMTFS_MODULE_PATH" in
+            "/lib/modules/$(uname -r)/"*)
+                log_info "RMTFS module file found: $RMTFS_MODULE_PATH"
+                ;;
+            *)
+                log_warn "Ignoring RMTFS module from a different kernel tree: $RMTFS_MODULE_PATH"
+                RMTFS_MODULE_PATH=""
+                ;;
+        esac
+    else
+        log_info "RMTFS module file was not found for kernel $(uname -r)"
+    fi
+
+    if is_module_loaded "$RMTFS_MODULE_NAME"; then
+        RMTFS_MODULE_WAS_LOADED=1
+        log_info "RMTFS module snapshot: $RMTFS_MODULE_NAME was already loaded"
+    else
+        log_info "RMTFS module snapshot: $RMTFS_MODULE_NAME was not loaded"
+    fi
+
+    if rmtfs_process_running rmtfs; then
+        RMTFS_DAEMON_WAS_RUNNING=1
+        RMTFS_MAINLINE_APPLICABLE=1
+        log_info "RMTFS daemon snapshot: rmtfs was already running"
+    fi
+
+    for rmtfs_service_unit in rmtfs rmtfs-dir; do
+        if systemd_service_exists "$rmtfs_service_unit" && \
+           systemd_service_is_active "$rmtfs_service_unit"; then
+            RMTFS_INITIAL_ACTIVE_UNITS="${RMTFS_INITIAL_ACTIVE_UNITS} ${rmtfs_service_unit}"
+            RMTFS_DAEMON_WAS_RUNNING=1
+            RMTFS_MAINLINE_APPLICABLE=1
+            log_info "RMTFS service snapshot: $rmtfs_service_unit was already active"
+        fi
+    done
+
+    if rmtfs_dt_present; then
+        RMTFS_DT_PRESENT=1
+        RMTFS_MAINLINE_APPLICABLE=1
+    fi
+
+    RMTFS_MAINLINE_DEVICE=$(rmtfs_find_mainline_device 2>/dev/null || true)
+    if [ -n "$RMTFS_MAINLINE_DEVICE" ]; then
+        RMTFS_MAINLINE_APPLICABLE=1
+        log_info "RMTFS shared-memory device found: $RMTFS_MAINLINE_DEVICE"
+    fi
+
+    RMTFS_UIO_DEVICE=$(rmtfs_find_uio_device 2>/dev/null || true)
+    if [ -n "$RMTFS_UIO_DEVICE" ]; then
+        RMTFS_MAINLINE_APPLICABLE=1
+        log_info "RMTFS UIO shared-memory device found: $RMTFS_UIO_DEVICE"
+    fi
+
+    if is_module_loaded "$RMTFS_MODULE_NAME"; then
+        RMTFS_MAINLINE_APPLICABLE=1
+    fi
+
+    if is_module_loaded msm_sharedmem || rmtfs_process_running rmt_storage; then
+        RMTFS_LEGACY_APPLICABLE=1
+    fi
+
+    if [ "$RMTFS_MAINLINE_APPLICABLE" -eq 0 ] && \
+       [ "$RMTFS_LEGACY_APPLICABLE" -eq 0 ]; then
+        log_info "RMTFS kernel support alone is not an applicability signal without runtime DT or device evidence"
+        RMTFS_RUNTIME_PREPARED=0
+        return 2
+    fi
+
+    if [ "$RMTFS_DT_PRESENT" -eq 1 ] && \
+       [ "$RMTFS_MODULE_WAS_LOADED" -eq 0 ] && \
+       [ "$RMTFS_CONFIG_VALUE" != "y" ] && \
+       [ "$RMTFS_CONFIG_VALUE" != "n" ]; then
+        if [ -n "$RMTFS_MODULE_PATH" ]; then
+            RMTFS_MODULE_LOAD_ATTEMPTED=1
+            log_info "Loading $RMTFS_MODULE_NAME for applicable RMTFS device-tree hardware"
+
+            if is_module_loaded "$RMTFS_MODULE_NAME"; then
+                RMTFS_MODULE_WAS_LOADED=1
+                log_info "RMTFS module became loaded after the initial snapshot and will be preserved"
+            elif load_kernel_module "$RMTFS_MODULE_PATH"; then
+                if is_module_loaded "$RMTFS_MODULE_NAME"; then
+                    RMTFS_MODULE_LOADED_BY_TEST=1
+                    RMTFS_RUNTIME_ACTIVATION_EXPECTED=1
+                    log_pass "RMTFS module loaded by the test: $RMTFS_MODULE_NAME"
+                else
+                    RMTFS_MODULE_LOAD_FAILED=1
+                    log_fail "RMTFS module load returned success but $RMTFS_MODULE_NAME is not listed as loaded"
+                fi
+            else
+                RMTFS_MODULE_LOAD_FAILED=1
+                log_fail "Unable to load RMTFS module: $RMTFS_MODULE_PATH"
+            fi
+        elif [ "$RMTFS_CONFIG_VALUE" = "m" ]; then
+            RMTFS_MODULE_LOAD_ATTEMPTED=1
+            RMTFS_MODULE_LOAD_FAILED=1
+            log_fail "RMTFS DT hardware is present but the configured $RMTFS_MODULE_NAME module file was not found"
+        else
+            log_info "No loadable $RMTFS_MODULE_NAME module was found, checking the active shared-memory backend"
+        fi
+    fi
+
+    if [ "$RMTFS_MODULE_LOADED_BY_TEST" -eq 1 ]; then
+        rmtfs_wait_for_mainline_device 5 || true
+    fi
+
+    rmtfs_record_runtime_activation
+
+    RMTFS_MAINLINE_DEVICE=$(rmtfs_find_mainline_device 2>/dev/null || true)
+    RMTFS_UIO_DEVICE=$(rmtfs_find_uio_device 2>/dev/null || true)
+
+    if [ "$RMTFS_MODULE_LOADED_BY_TEST" -eq 1 ] && \
+       [ -z "$RMTFS_MAINLINE_DEVICE" ]; then
+        log_warn "The RMTFS module loaded, but no /dev/qcom_rmtfs_mem device appeared"
+    fi
+
+    RMTFS_RUNTIME_PREPARED=1
+    return 0
+}
+
+# Start the image-provided RMTFS service when it is not already running.
+# Cleanup restores the initial service state.
+rmtfs_start_service_if_available() {
+    if rmtfs_process_running rmtfs; then
+        rmtfs_record_runtime_activation
+        return 0
+    fi
+
+    rmtfs_wait_for_process rmtfs 3 || true
+    if rmtfs_process_running rmtfs; then
+        rmtfs_record_runtime_activation
+        return 0
+    fi
+
+    if [ -n "${RMTFS_MAINLINE_DEVICE:-}" ]; then
+        rmtfs_service_candidates="rmtfs rmtfs-dir"
+    else
+        rmtfs_service_candidates="rmtfs-dir rmtfs"
+    fi
+    rmtfs_systemd_service_found=0
+
+    for rmtfs_service_candidate in $rmtfs_service_candidates; do
+        if ! systemd_service_exists "$rmtfs_service_candidate"; then
+            continue
+        fi
+
+        rmtfs_systemd_service_found=1
+        log_info "Starting image-provided RMTFS service: $rmtfs_service_candidate"
+        RMTFS_RUNTIME_ACTIVATION_EXPECTED=1
+        if systemd_service_start_safe "$rmtfs_service_candidate"; then
+            if ! rmtfs_service_was_active "$rmtfs_service_candidate"; then
+                RMTFS_SYSTEMD_STARTED_BY_TEST="$rmtfs_service_candidate"
+            fi
+
+            if rmtfs_wait_for_process rmtfs 5; then
+                rmtfs_record_runtime_activation
+                log_pass "RMTFS service started for functional validation: $rmtfs_service_candidate"
+                return 0
+            fi
+        fi
+
+        if systemd_service_is_active "$rmtfs_service_candidate" && \
+           ! rmtfs_service_was_active "$rmtfs_service_candidate"; then
+            RMTFS_SYSTEMD_STARTED_BY_TEST="$rmtfs_service_candidate"
+        fi
+        log_warn "RMTFS service did not become active: $rmtfs_service_candidate"
+
+        if [ "${RMTFS_SYSTEMD_STARTED_BY_TEST:-}" = "$rmtfs_service_candidate" ]; then
+            log_info "Stopping unsuccessful RMTFS service attempt: $rmtfs_service_candidate"
+            if ! systemd_service_stop_safe "$rmtfs_service_candidate"; then
+                log_warn "Unable to stop unsuccessful RMTFS service attempt: $rmtfs_service_candidate"
+                return 1
+            fi
+            RMTFS_SYSTEMD_STARTED_BY_TEST=""
+        fi
+    done
+
+    rmtfs_init_script="/etc/init.d/rmtfs"
+    if [ -x "$rmtfs_init_script" ]; then
+        log_info "Starting image-provided RMTFS SysV service: $rmtfs_init_script"
+        RMTFS_RUNTIME_ACTIVATION_EXPECTED=1
+        if "$rmtfs_init_script" start >/dev/null 2>&1; then
+            RMTFS_SYSV_STARTED_BY_TEST="$rmtfs_init_script"
+
+            if rmtfs_wait_for_process rmtfs 5; then
+                rmtfs_record_runtime_activation
+                log_pass "RMTFS SysV service started for functional validation: $rmtfs_init_script"
+                return 0
+            fi
+        fi
+
+        log_warn "RMTFS SysV service did not become active: $rmtfs_init_script"
+        return 1
+    fi
+
+    if [ "$rmtfs_systemd_service_found" -eq 0 ]; then
+        log_info "No image-provided RMTFS service definition was found"
+    else
+        log_warn "No image-provided RMTFS service started successfully"
+    fi
+    return 1
+}
+
+rmtfs_daemon_cmdline_readable() {
+    rmtfs_daemon_pid=$(get_pid rmtfs 2>/dev/null || true)
+    if [ -z "$rmtfs_daemon_pid" ] || \
+       [ ! -r "/proc/$rmtfs_daemon_pid/cmdline" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+rmtfs_daemon_uses_partitions() {
+    rmtfs_daemon_pid=$(get_pid rmtfs 2>/dev/null || true)
+    if [ -z "$rmtfs_daemon_pid" ] || \
+       [ ! -r "/proc/$rmtfs_daemon_pid/cmdline" ]; then
+        return 1
+    fi
+
+    tr '\0' '\n' < "/proc/$rmtfs_daemon_pid/cmdline" 2>/dev/null |
+    grep -qE -- '^-[^-]*P'
+}
+
+# Restore service and module state captured by rmtfs_runtime_prepare().
+rmtfs_runtime_cleanup() {
+    rmtfs_cleanup_rc=0
+
+    if [ "${RMTFS_RUNTIME_PREPARED:-0}" -ne 1 ]; then
+        return 0
+    fi
+
+    if [ "${RMTFS_DAEMON_WAS_RUNNING:-0}" -eq 0 ]; then
+        rmtfs_record_runtime_activation
+
+        if [ -n "${RMTFS_SYSTEMD_STARTED_BY_TEST:-}" ] && \
+           systemd_service_is_active "$RMTFS_SYSTEMD_STARTED_BY_TEST"; then
+            log_info "Restoring RMTFS service snapshot by stopping $RMTFS_SYSTEMD_STARTED_BY_TEST"
+            if ! systemd_service_stop_safe "$RMTFS_SYSTEMD_STARTED_BY_TEST"; then
+                log_warn "Unable to stop RMTFS service activated during the test: $RMTFS_SYSTEMD_STARTED_BY_TEST"
+                rmtfs_cleanup_rc=1
+            fi
+        fi
+
+        if [ -n "${RMTFS_SYSV_STARTED_BY_TEST:-}" ]; then
+            log_info "Restoring RMTFS SysV service snapshot"
+            if ! "$RMTFS_SYSV_STARTED_BY_TEST" stop >/dev/null 2>&1; then
+                log_warn "Unable to stop RMTFS SysV service started during the test"
+                rmtfs_cleanup_rc=1
+            fi
+            RMTFS_SYSV_STARTED_BY_TEST=""
+        fi
+
+        if rmtfs_process_running rmtfs && \
+           [ "${RMTFS_DAEMON_STARTED_BY_TEST:-0}" -eq 1 ]; then
+            rmtfs_started_pid=$(get_pid rmtfs 2>/dev/null || true)
+            if [ -n "$rmtfs_started_pid" ]; then
+                log_info "Stopping the rmtfs process that appeared during the test: PID $rmtfs_started_pid"
+                if ! kill_process "$rmtfs_started_pid"; then
+                    rmtfs_cleanup_rc=1
+                fi
+            fi
+        fi
+
+        if ! rmtfs_wait_for_process_exit rmtfs 5; then
+            log_warn "The rmtfs daemon is still running after service cleanup"
+            rmtfs_cleanup_rc=1
+        fi
+    fi
+
+    if [ "${RMTFS_MODULE_LOADED_BY_TEST:-0}" -eq 1 ]; then
+        log_info "Removing RMTFS module loaded by this test: $RMTFS_MODULE_NAME"
+        if unload_kernel_module "$RMTFS_MODULE_NAME" false; then
+            RMTFS_MODULE_LOADED_BY_TEST=0
+            log_pass "RMTFS module state restored to initially unloaded"
+        else
+            log_fail "Unable to remove RMTFS module loaded by this test"
+            rmtfs_cleanup_rc=1
+        fi
+    else
+        log_info "RMTFS module cleanup: module was not loaded by this test"
+    fi
+
+    return "$rmtfs_cleanup_rc"
 }
 
 # Detects and returns the first available media node (e.g., /dev/media0).
