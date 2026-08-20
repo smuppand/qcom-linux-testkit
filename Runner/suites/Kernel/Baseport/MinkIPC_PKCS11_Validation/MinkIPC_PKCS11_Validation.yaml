@@ -1,0 +1,27 @@
+metadata:
+  name: MinkIPC_PKCS11_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate the Qualcomm QTEE PKCS#11 Trusted Application through MinkIPC using xtest_qtee"
+  maintainer:
+    - "Qualcomm Linux Testkit"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  CLIENT: ""
+  TEE_ID: ""
+  LEVEL: "0"
+  TIMEOUT: "1800"
+  ITERATIONS: "1"
+  CLEAR_STORAGE: "1"
+  TEST_IDS: ""
+  EXCLUDE_IDS: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_PKCS11_Validation
+    - XTEST_QTEE="${CLIENT}" XTEST_TEE_ID="${TEE_ID}" XTEST_LEVEL="${LEVEL}" XTEST_TIMEOUT="${TIMEOUT}" XTEST_ITERATIONS="${ITERATIONS}" XTEST_CLEAR_STORAGE="${CLEAR_STORAGE}" XTEST_INCLUDE="${TEST_IDS}" XTEST_EXCLUDE="${EXCLUDE_IDS}" ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_PKCS11_Validation.res

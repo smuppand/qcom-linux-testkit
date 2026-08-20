@@ -1,0 +1,24 @@
+metadata:
+  name: MinkIPC_PKCS11_Multi_Client_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate concurrent MinkIPC QTEE PKCS#11 clients and bounded recovery from serialized TA open contention"
+  maintainer:
+    - "Qualcomm Linux Testkit"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  CLIENT: ""
+  TEE_ID: ""
+  CLIENTS: "2"
+  TIMEOUT: "300"
+  BUSY_RETRIES: "5"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/MinkIPC_PKCS11_Multi_Client_Validation
+    - XTEST_QTEE="${CLIENT}" XTEST_TEE_ID="${TEE_ID}" XTEST_CLIENT_COUNT="${CLIENTS}" XTEST_TIMEOUT="${TIMEOUT}" XTEST_BUSY_RETRIES="${BUSY_RETRIES}" ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh MinkIPC_PKCS11_Multi_Client_Validation.res
