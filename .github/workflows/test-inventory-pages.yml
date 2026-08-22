@@ -59,6 +59,7 @@ jobs:
           path: _site
 
   deploy:
+    permissions:
       pages: write
       id-token: write
     environment:
