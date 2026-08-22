@@ -75,9 +75,9 @@ An explicit backend request is never replaced:
 
 ## Audio Remoteproc Preflight
 
-Before backend discovery, the suite enumerates runtime remoteprocs and checks the configured firmware and topology under `/lib/firmware` or `/usr/lib/firmware`. It recognizes audio DSP identities and modem-hosted audio paths, including platforms where the audio route is served by a remoteproc named `modem`.
+Before backend discovery, the suite enumerates runtime remoteprocs and checks the configured firmware and topology under `/lib/firmware` or `/usr/lib/firmware`. It recognizes audio DSP identities and the Shikra modem-hosted audio path. A remoteproc named `modem` is ignored on non-Shikra targets because it is not their audio preflight dependency.
 
-If the matching remoteproc is `running`, the suite records its name, firmware, and topology evidence. If it is `offline`, the suite starts it only after confirming the corresponding firmware and topology files are provisioned. An offline modem-hosted audio remoteproc without its topology is a test failure because audio routing cannot be initialized. The suite never stops a remoteproc. Platforms with no applicable audio remoteproc continue normally. Other provisioning or start issues produce a clean skip with the reason.
+If the matching remoteproc is `running`, the suite records its name and firmware evidence. If it is `offline`, the suite starts it only after confirming the corresponding firmware is provisioned. Generic audio DSP paths also require adjacent topology evidence. Shikra's modem-hosted path does not require an adjacent topology file because its public image packages `qdsp6sw` modem firmware and `lpaicp` audio firmware separately. The suite never stops a remoteproc. Platforms with no applicable audio remoteproc continue normally. Provisioning or start issues produce a clean skip with the reason.
 
 ## Overlay Build Support
 

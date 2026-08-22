@@ -2713,7 +2713,7 @@ audio_remoteproc_topology_path() {
 }
 
 # Return success for a remoteproc identity commonly used to host the audio
-# firmware. Modem is included because some platforms route audio through it.
+# firmware. The caller applies the Shikra platform gate to modem instances.
 audio_remoteproc_is_audio_candidate() {
   ariac_name="$1"
   ariac_firmware="$2"
@@ -2740,6 +2740,42 @@ audio_remoteproc_is_modem() {
 
   case "$arim_name_lower" in
     *modem*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Return success when runtime platform evidence identifies a Shikra target.
+# The preflight runs before the suites call detect_platform, so inspect both
+# any already-populated platform variables and the standard runtime DT paths.
+audio_platform_is_shikra() {
+  apis_identity="${PLATFORM_MACHINE:-} ${PLATFORM_TARGET:-}"
+  apis_identity="$apis_identity ${PLATFORM_SOC_MACHINE:-}"
+  apis_identity="$apis_identity ${PLATFORM_DT_MODEL:-}"
+  apis_identity="$apis_identity ${PLATFORM_DT_COMPAT:-}"
+
+  for apis_file in \
+    /proc/device-tree/model \
+    /proc/device-tree/compatible \
+    /sys/firmware/devicetree/base/model \
+    /sys/firmware/devicetree/base/compatible
+  do
+    if [ -r "$apis_file" ]; then
+      apis_value="$(tr '\000' ' ' <"$apis_file" 2>/dev/null || true)"
+      apis_identity="$apis_identity $apis_value"
+    fi
+  done
+
+  apis_identity="$(
+    printf '%s\n' "$apis_identity" |
+      tr '[:upper:]' '[:lower:]'
+  )"
+
+  case "$apis_identity" in
+    *shikra*)
       return 0
       ;;
     *)
@@ -2806,8 +2842,21 @@ audio_prepare_audio_remoteproc() {
   while IFS='|' read -r arpr_path arpr_name arpr_firmware arpr_state ||
         [ -n "$arpr_path" ]
   do
+    arpr_is_shikra_modem=0
+
     if ! audio_remoteproc_is_audio_candidate "$arpr_name" "$arpr_firmware"; then
       continue
+    fi
+
+    # The modem-hosted audio remoteproc is a Shikra-specific path. Other
+    # platforms can expose a modem remoteproc without provisioning Shikra
+    # audio firmware, which must not block their normal audio validation.
+    if audio_remoteproc_is_modem "$arpr_name" &&
+       ! audio_platform_is_shikra; then
+      continue
+    fi
+    if audio_remoteproc_is_modem "$arpr_name"; then
+      arpr_is_shikra_modem=1
     fi
 
     arpr_matched=1
@@ -2819,20 +2868,19 @@ audio_prepare_audio_remoteproc() {
       continue
     fi
 
-    arpr_topology_path="$(
-      audio_remoteproc_topology_path "$arpr_firmware_path" 2>/dev/null || true
-    )"
-    if [ -z "$arpr_topology_path" ]; then
-      AUDIO_REMOTE_PROC_REASON="audio topology is not provisioned for firmware '$arpr_firmware_path'"
-
-      if [ "$arpr_state" = "offline" ] &&
-         audio_remoteproc_is_modem "$arpr_name"; then
-        AUDIO_REMOTE_PROC_REASON="offline modem audio remoteproc requires a provisioned topology for $arpr_firmware_path"
-        export AUDIO_REMOTE_PROC_REASON
-        return 3
+    if [ "$arpr_is_shikra_modem" -eq 1 ]; then
+      # Public Shikra images package qdsp6sw as modem firmware and lpaicp as
+      # separate audio firmware. They do not provide an ALSA topology beside
+      # qdsp6sw, so firmware presence is the correct startup prerequisite.
+      arpr_topology_path="not-required"
+    else
+      arpr_topology_path="$(
+        audio_remoteproc_topology_path "$arpr_firmware_path" 2>/dev/null || true
+      )"
+      if [ -z "$arpr_topology_path" ]; then
+        AUDIO_REMOTE_PROC_REASON="audio topology is not provisioned for firmware '$arpr_firmware_path'"
+        continue
       fi
-
-      continue
     fi
 
     case "$arpr_state" in

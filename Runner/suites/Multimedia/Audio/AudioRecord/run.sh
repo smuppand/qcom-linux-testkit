@@ -475,11 +475,6 @@ case "$audio_remoteproc_rc" in
   2)
     log_info "Audio remoteproc preflight not applicable: ${AUDIO_REMOTE_PROC_REASON:-no matching remoteproc}"
     ;;
-  3)
-    log_fail "$TESTNAME FAIL - audio remoteproc preflight failed: ${AUDIO_REMOTE_PROC_REASON:-offline modem topology is missing}"
-    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
-    exit 1
-    ;;
   *)
     log_skip "$TESTNAME SKIP - audio remoteproc preflight failed: ${AUDIO_REMOTE_PROC_REASON:-unknown remoteproc error}"
     echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
