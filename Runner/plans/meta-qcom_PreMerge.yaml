@@ -14,8 +14,8 @@ metadata:
 run:
     steps:
         - cd Runner
-        - $PWD/suites/Connectivity/Ethernet/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
+        - $PWD/suites/Connectivity/Ethernet/Ethernet_Basic_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet_Basic_Validation/Ethernet_Basic_Validation.res || true
         - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
         - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
