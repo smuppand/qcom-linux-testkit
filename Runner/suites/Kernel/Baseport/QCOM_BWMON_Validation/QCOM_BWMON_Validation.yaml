@@ -1,0 +1,18 @@
+metadata:
+  name: QCOM_BWMON_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate Qualcomm interconnect bandwidth-monitor binding and bounded runtime activity"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  LOAD_SECONDS: "10"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/QCOM_BWMON_Validation
+    - ./run.sh --load-seconds "${LOAD_SECONDS:-10}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh QCOM_BWMON_Validation.res
