@@ -1,0 +1,32 @@
+metadata:
+  name: ethernet-dual-port-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate two Ethernet ports simultaneously using interface-bound concurrent ping traffic and RX/TX counter movement."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  LINK_TIMEOUT_S: "10"
+  IP_TIMEOUT_S: "15"
+  ETH_DUAL_INTERFACES: ""
+  ETH_DUAL_TARGET_A: ""
+  ETH_DUAL_TARGET_B: ""
+  PING_COUNT: "10"
+  PING_WAIT_S: "2"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Dual_Port_Validation
+    - |
+      ./run.sh \
+        --link-timeout "${LINK_TIMEOUT_S}" \
+        --ip-timeout "${IP_TIMEOUT_S}" \
+        --interfaces "${ETH_DUAL_INTERFACES}" \
+        --target-a "${ETH_DUAL_TARGET_A}" \
+        --target-b "${ETH_DUAL_TARGET_B}" \
+        --ping-count "${PING_COUNT}" \
+        --ping-wait "${PING_WAIT_S}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Dual_Port_Validation.res || true
