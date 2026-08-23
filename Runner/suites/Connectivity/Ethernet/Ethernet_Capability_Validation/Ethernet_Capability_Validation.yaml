@@ -1,0 +1,24 @@
+metadata:
+  name: ethernet-capability-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate Ethernet driver queries, link modes, offload features, statistics, pause parameters, hardware timestamping, queues, rings, coalescing, and negotiated link properties."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  ETH_INTERFACE: ""
+  REQUIRE_FULL_DUPLEX: "1"
+  MIN_LINK_SPEED_MBPS: "0"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Capability_Validation
+    - |
+      ./run.sh \
+        --interface "${ETH_INTERFACE}" \
+        --require-full-duplex "${REQUIRE_FULL_DUPLEX}" \
+        --min-link-speed "${MIN_LINK_SPEED_MBPS}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Capability_Validation.res || true
