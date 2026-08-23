@@ -1,0 +1,51 @@
+metadata:
+  name: ethernet-throughput-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate interface-bound TCP, reverse TCP, optional UDP, and optional bidirectional throughput using an external iperf3 peer or a local host-stack self-test."
+  os:
+    - linux
+  scope:
+    - performance
+    - functional
+
+params:
+  LINK_TIMEOUT_S: "10"
+  IP_TIMEOUT_S: "15"
+  ETH_IPERF_SERVER: ""
+  ETH_IPERF_MODE: "auto"
+  ETH_IPERF_PORT: "5201"
+  ETH_IPERF_INTERFACE: ""
+  ETH_IPERF_DURATION: "20"
+  ETH_IPERF_STREAMS: "1"
+  ETH_IPERF_MIN_TCP_MBPS: "0"
+  ETH_IPERF_MIN_REVERSE_MBPS: "0"
+  ETH_IPERF_REVERSE_ENABLE: "1"
+  ETH_IPERF_UDP_ENABLE: "0"
+  ETH_IPERF_UDP_BITRATE: "100M"
+  ETH_IPERF_MIN_UDP_MBPS: "0"
+  ETH_IPERF_BIDIR_ENABLE: "0"
+  ETH_IPERF_MIN_BIDIR_MBPS: "0"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Throughput_Validation
+    - |
+      ./run.sh \
+        --mode "${ETH_IPERF_MODE}" \
+        --iperf-server "${ETH_IPERF_SERVER}" \
+        --port "${ETH_IPERF_PORT}" \
+        --interface "${ETH_IPERF_INTERFACE}" \
+        --link-timeout "${LINK_TIMEOUT_S}" \
+        --ip-timeout "${IP_TIMEOUT_S}" \
+        --duration "${ETH_IPERF_DURATION}" \
+        --streams "${ETH_IPERF_STREAMS}" \
+        --min-tcp-mbps "${ETH_IPERF_MIN_TCP_MBPS}" \
+        --reverse-enable "${ETH_IPERF_REVERSE_ENABLE}" \
+        --min-reverse-mbps "${ETH_IPERF_MIN_REVERSE_MBPS}" \
+        --udp-enable "${ETH_IPERF_UDP_ENABLE}" \
+        --udp-bitrate "${ETH_IPERF_UDP_BITRATE}" \
+        --min-udp-mbps "${ETH_IPERF_MIN_UDP_MBPS}" \
+        --bidir-enable "${ETH_IPERF_BIDIR_ENABLE}" \
+        --min-bidir-mbps "${ETH_IPERF_MIN_BIDIR_MBPS}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Throughput_Validation.res || true
