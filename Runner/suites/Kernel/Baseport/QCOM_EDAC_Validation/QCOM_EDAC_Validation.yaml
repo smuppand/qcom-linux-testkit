@@ -1,0 +1,19 @@
+metadata:
+  name: QCOM_EDAC_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate Qualcomm LLCC EDAC registration and correctable and uncorrectable error counters"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  STRICT_CE: "0"
+  OBSERVE_SECONDS: "2"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/QCOM_EDAC_Validation
+    - ./run.sh --strict-ce "${STRICT_CE:-0}" --observe-seconds "${OBSERVE_SECONDS:-2}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh QCOM_EDAC_Validation.res

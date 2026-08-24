@@ -14,6 +14,95 @@ log_error() { log "ERROR" "$@"; }
 log_skip()  { log "SKIP"  "$@"; }
 log_warn()  { log "WARN"  "$@"; }
 
+# test_result_init <test-name> <result-file>
+# Initializes shared testcase result state and removes any stale result file.
+test_result_init() {
+    TEST_RESULT_NAME="$1"
+    TEST_RESULT_FILE="$2"
+    TEST_RESULT_PASS_COUNT=0
+    TEST_RESULT_FAIL_COUNT=0
+    TEST_RESULT_SKIP_COUNT=0
+
+    if [ -z "$TEST_RESULT_NAME" ] || [ -z "$TEST_RESULT_FILE" ]; then
+        log_error "test_result_init requires a test name and result file"
+        return 3
+    fi
+
+    rm -f "$TEST_RESULT_FILE"
+}
+
+# test_result_record <PASS|FAIL|SKIP> <message>
+# Logs one subcheck and updates the shared result counters.
+test_result_record() {
+    test_result_status="$1"
+    test_result_message="$2"
+
+    case "$test_result_status" in
+        PASS)
+            log_pass "$test_result_message"
+            TEST_RESULT_PASS_COUNT=$((TEST_RESULT_PASS_COUNT + 1))
+            ;;
+        FAIL)
+            log_fail "$test_result_message"
+            TEST_RESULT_FAIL_COUNT=$((TEST_RESULT_FAIL_COUNT + 1))
+            ;;
+        SKIP)
+            log_skip "$test_result_message"
+            TEST_RESULT_SKIP_COUNT=$((TEST_RESULT_SKIP_COUNT + 1))
+            ;;
+        *)
+            log_error "Unsupported testcase result status: $test_result_status"
+            return 3
+            ;;
+    esac
+}
+
+# test_result_finish [PASS|FAIL|SKIP] [message]
+# Writes the final result and exits successfully for LAVA result processing.
+# Without an explicit status, failures take precedence, then passes, then skip.
+test_result_finish() {
+    test_result_status="${1:-}"
+    test_result_message="${2:-}"
+
+    if [ -z "$test_result_status" ]; then
+        if [ "$TEST_RESULT_FAIL_COUNT" -gt 0 ]; then
+            test_result_status="FAIL"
+        elif [ "$TEST_RESULT_PASS_COUNT" -gt 0 ]; then
+            test_result_status="PASS"
+        else
+            test_result_status="SKIP"
+        fi
+    fi
+
+    case "$test_result_status" in
+        PASS|FAIL|SKIP)
+            ;;
+        *)
+            log_error "Unsupported final testcase result status: $test_result_status"
+            test_result_status="FAIL"
+            ;;
+    esac
+
+    if [ -z "$test_result_message" ]; then
+        test_result_message="$TEST_RESULT_NAME $test_result_status: passed=$TEST_RESULT_PASS_COUNT failed=$TEST_RESULT_FAIL_COUNT skipped=$TEST_RESULT_SKIP_COUNT"
+    fi
+
+    case "$test_result_status" in
+        PASS)
+            log_pass "$test_result_message"
+            ;;
+        FAIL)
+            log_fail "$test_result_message"
+            ;;
+        SKIP)
+            log_skip "$test_result_message"
+            ;;
+    esac
+
+    printf '%s %s\n' "$TEST_RESULT_NAME" "$test_result_status" >"$TEST_RESULT_FILE"
+    exit 0
+}
+
 # --- Kernel Log Collection ---
 get_kernel_log() {
     if command -v journalctl >/dev/null 2>&1; then
@@ -50,7 +139,7 @@ find_kernel_module() {
     fi
 
     if [ -z "$module_path" ] && [ -d /lib/modules ]; then
-        log_warn "Module $module_name not found under /lib/modules/$kver, searching all module trees"
+        log_warn "Module $module_name not found under /lib/modules/$kver, searching all module trees" >&2
         module_path=$(
             find /lib/modules -type f \
                 \( -name "${module_name}.ko" \
@@ -65,7 +154,7 @@ find_kernel_module() {
             found_version=${module_path#/lib/modules/}
             found_version=${found_version%%/*}
             if [ "$found_version" != "$kver" ]; then
-                log_warn "Found $module_name under kernel $found_version, running kernel is $kver"
+                log_warn "Found $module_name under kernel $found_version, running kernel is $kver" >&2
             fi
         fi
     fi
@@ -885,20 +974,47 @@ check_kernel_config() {
 
 ###############################################################################
 # kernel_config_value <CONFIG_NAME>
-# Prints the active CONFIG_NAME=value line from /proc/config.gz. Returns 0
-# when found, 1 when it is absent or the kernel config cannot be read, and 3
-# when the config name is omitted.
+# Prints CONFIG_NAME=value from the running kernel configuration, including
+# CONFIG_NAME=n for an explicitly disabled option. Returns 0 when found, 1
+# when unavailable or absent, and 3 when the name is omitted.
 ###############################################################################
 kernel_config_value() {
     config_name="$1"
     [ -n "$config_name" ] || return 3
-    [ -r /proc/config.gz ] || return 1
 
-    if command -v zgrep >/dev/null 2>&1; then
-        zgrep -m 1 -E "^${config_name}=" /proc/config.gz 2>/dev/null
-    else
-        gzip -dc /proc/config.gz 2>/dev/null | grep -m 1 -E "^${config_name}="
+    if [ -r /proc/config.gz ]; then
+        if command -v zgrep >/dev/null 2>&1; then
+            config_line=$(zgrep -m 1 -E "^${config_name}=" /proc/config.gz 2>/dev/null || true)
+            config_disabled=$(zgrep -m 1 -E "^# ${config_name} is not set$" /proc/config.gz 2>/dev/null || true)
+        else
+            config_line=$(gzip -dc /proc/config.gz 2>/dev/null | grep -m 1 -E "^${config_name}=" || true)
+            config_disabled=$(gzip -dc /proc/config.gz 2>/dev/null | grep -m 1 -E "^# ${config_name} is not set$" || true)
+        fi
+
+        if [ -n "$config_line" ]; then
+            printf '%s\n' "$config_line"
+            return 0
+        fi
+        if [ -n "$config_disabled" ]; then
+            printf '%s=n\n' "$config_name"
+            return 0
+        fi
     fi
+
+    boot_config="/boot/config-$(uname -r 2>/dev/null)"
+    if [ -r "$boot_config" ]; then
+        config_line=$(grep -m 1 -E "^${config_name}=" "$boot_config" 2>/dev/null || true)
+        if [ -n "$config_line" ]; then
+            printf '%s\n' "$config_line"
+            return 0
+        fi
+        if grep -q -E "^# ${config_name} is not set$" "$boot_config" 2>/dev/null; then
+            printf '%s=n\n' "$config_name"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 check_dt_nodes() {
@@ -3223,41 +3339,164 @@ dt_has_remoteproc_fw() {
 }
 
 ###############################################################################
-# dt_list_compatible_nodes <compatible-substring>
+# dt_list_compatible_nodes <compatible-pattern> [fixed|regex]
 # Prints one enabled device-tree node directory per line from both standard DT
-# roots.  Returns 0 when at least one node is found, 1 when none are found,
-# and 3 when the compatible substring is omitted.
+# roots. The default mode performs a fixed substring match. Returns 0 when at
+# least one node is found, 1 when none are found, and 3 for invalid arguments.
 ###############################################################################
 dt_list_compatible_nodes() {
-    compatible="$1"
-    [ -n "$compatible" ] || return 3
+    dtlc_pattern="$1"
+    dtlc_mode="${2:-fixed}"
+    [ -n "$dtlc_pattern" ] || return 3
+    case "$dtlc_mode" in
+        fixed|regex)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
 
-    found=0
-    previous_root=""
-    for dt_root in /proc/device-tree /sys/firmware/devicetree/base; do
-        [ -d "$dt_root" ] || continue
-        resolved_root=$(readlink -f "$dt_root" 2>/dev/null)
-        [ -n "$resolved_root" ] || resolved_root="$dt_root"
-        [ "$resolved_root" = "$previous_root" ] && continue
-        previous_root="$resolved_root"
+    dtlc_found=0
+    dtlc_previous_root=""
+    for dtlc_root in /proc/device-tree /sys/firmware/devicetree/base; do
+        [ -d "$dtlc_root" ] || continue
+        dtlc_resolved_root=$(readlink -f "$dtlc_root" 2>/dev/null || true)
+        [ -n "$dtlc_resolved_root" ] || dtlc_resolved_root="$dtlc_root"
+        [ "$dtlc_resolved_root" = "$dtlc_previous_root" ] && continue
+        dtlc_previous_root="$dtlc_resolved_root"
 
-        matches_file=$(mktemp "${TMPDIR:-/tmp}/dt-compatible.XXXXXX") || return 1
-        grep -r -l -a -F "$compatible" "$dt_root" 2>/dev/null >"$matches_file" || true
-        while IFS= read -r compatible_file || [ -n "$compatible_file" ]; do
-            [ -n "$compatible_file" ] || continue
-            node_dir=$(dirname "$compatible_file")
-            [ -r "$node_dir/status" ] && IFS= read -r node_status <"$node_dir/status"
-            case "${node_status:-okay}" in
+        dtlc_matches_file=$(mktemp "${TMPDIR:-/tmp}/dt-compatible.XXXXXX") || return 1
+        if [ "$dtlc_mode" = "regex" ]; then
+            find "$dtlc_resolved_root" -type f -name compatible 2>/dev/null >"$dtlc_matches_file"
+        else
+            grep -r -l -a -F "$dtlc_pattern" "$dtlc_resolved_root" 2>/dev/null >"$dtlc_matches_file" || true
+        fi
+
+        while IFS= read -r dtlc_compatible_file; do
+            [ "$(basename "$dtlc_compatible_file")" = "compatible" ] || continue
+            dtlc_node_dir=$(dirname "$dtlc_compatible_file")
+            dtlc_status=$(dt_property_text "$dtlc_node_dir" status 2>/dev/null || true)
+            case "$dtlc_status" in
                 disabled|fail|failed)
                     continue
                     ;;
             esac
-            printf '%s\n' "$node_dir"
-            found=1
-        done <"$matches_file"
-        rm -f "$matches_file"
+            if [ "$dtlc_mode" = "regex" ]; then
+                dtlc_text=$(dt_property_text "$dtlc_node_dir" compatible 2>/dev/null || true)
+                printf '%s\n' "$dtlc_text" | grep -Eq "$dtlc_pattern" || continue
+            fi
+            readlink -f "$dtlc_node_dir" 2>/dev/null || printf '%s\n' "$dtlc_node_dir"
+            dtlc_found=1
+        done <"$dtlc_matches_file"
+        rm -f "$dtlc_matches_file"
     done
-    [ "$found" -eq 1 ]
+
+    [ "$dtlc_found" -eq 1 ]
+}
+
+# dt_list_qcom_icc_provider_nodes
+# Prints enabled Qualcomm DT nodes exposing #interconnect-cells, excluding the
+# virtual IPA providers intentionally ignored by the ICC core. Returns 0 when
+# found, otherwise 1.
+dt_list_qcom_icc_provider_nodes() {
+    qiccp_providers_file=$(mktemp "${TMPDIR:-/tmp}/qcom-icc-providers.XXXXXX") || {
+        return 1
+    }
+    : >"$qiccp_providers_file"
+
+    qiccp_previous_root=""
+    for qiccp_root in /proc/device-tree /sys/firmware/devicetree/base; do
+        [ -d "$qiccp_root" ] || continue
+        qiccp_resolved_root=$(readlink -f "$qiccp_root" 2>/dev/null || true)
+        [ -n "$qiccp_resolved_root" ] || qiccp_resolved_root="$qiccp_root"
+        [ "$qiccp_resolved_root" = "$qiccp_previous_root" ] && continue
+        qiccp_previous_root="$qiccp_resolved_root"
+
+        find "$qiccp_resolved_root" -type f -name '#interconnect-cells' 2>/dev/null |
+        while IFS= read -r qiccp_cells_file; do
+            qiccp_node_dir=$(dirname "$qiccp_cells_file")
+            qiccp_status=$(dt_property_text "$qiccp_node_dir" status 2>/dev/null || true)
+            case "$qiccp_status" in
+                disabled|fail|failed)
+                    continue
+                    ;;
+            esac
+            qiccp_compatible=$(dt_property_text "$qiccp_node_dir" compatible 2>/dev/null || true)
+            case " $qiccp_compatible " in
+                *" qcom,sc7180-ipa-virt "*|\
+                *" qcom,sc8180x-ipa-virt "*|\
+                *" qcom,sdx55-ipa-virt "*|\
+                *" qcom,sm8150-ipa-virt "*|\
+                *" qcom,sm8250-ipa-virt "*)
+                    continue
+                    ;;
+            esac
+            if printf '%s\n' "$qiccp_compatible" | grep -Eq '(^|[[:space:]])qcom,'; then
+                readlink -f "$qiccp_node_dir" 2>/dev/null || printf '%s\n' "$qiccp_node_dir"
+            fi
+        done >>"$qiccp_providers_file"
+    done
+
+    sort -u "$qiccp_providers_file"
+    if [ -s "$qiccp_providers_file" ]; then
+        qiccp_result=0
+    else
+        qiccp_result=1
+    fi
+
+    rm -f "$qiccp_providers_file"
+    return "$qiccp_result"
+}
+
+# find_platform_device_for_dt_node <node-dir>
+# Prints the platform-device directory whose of_node link resolves to the DT
+# node. Returns 0 when matched, 1 when unmatched, and 3 when omitted.
+find_platform_device_for_dt_node() {
+    fpdd_node_dir="$1"
+    [ -n "$fpdd_node_dir" ] || return 3
+
+    fpdd_target_node=$(readlink -f "$fpdd_node_dir" 2>/dev/null || true)
+    [ -n "$fpdd_target_node" ] || fpdd_target_node="$fpdd_node_dir"
+
+    for fpdd_of_node_link in /sys/bus/platform/devices/*/of_node; do
+        [ -e "$fpdd_of_node_link" ] || continue
+        fpdd_device_node=$(readlink -f "$fpdd_of_node_link" 2>/dev/null || true)
+        if [ "$fpdd_device_node" = "$fpdd_target_node" ]; then
+            dirname "$fpdd_of_node_link"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# platform_device_driver_name <platform-device-dir>
+# Prints the bound platform-driver name. Returns 0 when bound, 1 when unbound,
+# and 3 when the device directory is omitted.
+platform_device_driver_name() {
+    pddn_device_dir="$1"
+    [ -n "$pddn_device_dir" ] || return 3
+    [ -L "$pddn_device_dir/driver" ] || return 1
+
+    pddn_driver_path=$(readlink -f "$pddn_device_dir/driver" 2>/dev/null || true)
+    [ -n "$pddn_driver_path" ] || return 1
+    basename "$pddn_driver_path"
+}
+
+# interconnect_debugfs_dir
+# Prints the ICC debugfs directory when its graph and summary are readable.
+# Returns 0 when available, otherwise 1.
+interconnect_debugfs_dir() {
+    for iccd_debug_root in /sys/kernel/debug /debug; do
+        iccd_candidate="$iccd_debug_root/interconnect"
+        if [ -r "$iccd_candidate/interconnect_summary" ] &&
+           [ -r "$iccd_candidate/interconnect_graph" ]; then
+            printf '%s\n' "$iccd_candidate"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 ###############################################################################
@@ -4334,7 +4573,7 @@ scan_dmesg_errors() {
     # 1. Match lines with correct module and error pattern
     # 2. Exclude lines with harmless patterns (using dummy regulator etc)
     grep -iE "^\[[^]]+\][[:space:]]+($module_regex):.*($err_patterns)" "$DMESG_SNAPSHOT" \
-        | grep -vEi "$exclude_regex" > "$DMESG_ERRORS" || true
+        | grep -vEi -- "$exclude_regex" > "$DMESG_ERRORS" || true
 
     cp "$DMESG_ERRORS" "$DMESG_HISTORY"
 

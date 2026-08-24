@@ -1,0 +1,21 @@
+metadata:
+  name: DMAEngine_Data_Integrity_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Run bounded DMAEngine memcpy operations with source and destination data verification"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  DMA_CHANNEL: "auto"
+  ITERATIONS: "20"
+  TIMEOUT_MS: "3000"
+  RUN_TIMEOUT_SECONDS: "90"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/DMAEngine_Data_Integrity_Validation
+    - ./run.sh --channel "${DMA_CHANNEL:-auto}" --iterations "${ITERATIONS:-20}" --timeout-ms "${TIMEOUT_MS:-3000}" --run-timeout "${RUN_TIMEOUT_SECONDS:-90}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh DMAEngine_Data_Integrity_Validation.res
