@@ -16,6 +16,24 @@ GSTINSPECT="${GSTINSPECT:-gst-inspect-1.0}"
 GSTDISCOVER="${GSTDISCOVER:-gst-discoverer-1.0}"
 GSTLAUNCHFLAGS="${GSTLAUNCHFLAGS:--e -v -m}"
 
+# Time bounds for anything that touches the hardware codecs.
+# GST_PROBE_TIMEOUT bounds introspection (gst-inspect-1.0, gst-discoverer-1.0);
+# GST_KILL_GRACE is how long a process gets to react to the first signal before
+# it is SIGKILLed.
+#
+# The probe bound is deliberately generous: gst-inspect-1.0 legitimately takes
+# tens of seconds when it builds a cold plugin registry, or when a codec driver
+# retries a failing firmware load before giving up (~17s observed on
+# x1e80100). It only has to be short enough that a run against wedged hardware
+# still fits in the CI budget, which has_element's cache below takes care of.
+GST_PROBE_TIMEOUT="${GST_PROBE_TIMEOUT:-60}"
+GST_KILL_GRACE="${GST_KILL_GRACE:-10}"
+
+# Canonical gstreamer_run_bounded return codes, normalised across timeout(1)
+# implementations (GNU coreutils and BusyBox report differently).
+GST_RC_TIMEDOUT=124   # the command was stopped by the time bound
+GST_RC_NO_TIMEOUT=125 # no usable timeout(1); the command was NOT run
+
 # Optional env overrides (set by run.sh)
 # GST_ALSA_PLAYBACK_DEVICE=hw:0,0
 # GST_ALSA_CAPTURE_DEVICE=hw:0,1
@@ -91,12 +109,152 @@ gstreamer_shared_recorded_dir() {
     
     gstreamer_shared_artifact_dir "AUDIO_SHARED_RECORDED_DIR" "audio-record-playback" "recorded" "$script_dir" "$outdir"
 }
+# -------------------- Bounded command execution --------------------
+# gstreamer_signum <name|number>
+# Maps a signal name to its number. timeout(1) implementations differ in which
+# signal names they accept, but every one of them accepts a number.
+gstreamer_signum() {
+  case "$1" in
+    INT|SIGINT|2)    printf '%s\n' 2 ;;
+    KILL|SIGKILL|9)  printf '%s\n' 9 ;;
+    TERM|SIGTERM|15) printf '%s\n' 15 ;;
+    *)               printf '%s\n' 15 ;;
+  esac
+}
+
+# gstreamer_timeout_supported
+# True when timeout(1) exists and understands the options this library needs.
+#
+# Only the short options -s and -k are used: GNU coreutils accepts both short
+# and long forms, BusyBox (as shipped in most Yocto images) accepts only the
+# short ones and fails outright on --signal=/--kill-after=.
+#
+# -k is required, not a nicety. Without the SIGKILL escalation a process that
+# ignores the first signal is never stopped, which is exactly the hang this
+# library exists to bound, so a timeout(1) lacking -k counts as unusable.
+gstreamer_timeout_supported() {
+  if [ -z "${GST_TIMEOUT_OK:-}" ]; then
+    if command -v timeout >/dev/null 2>&1 && timeout -s 15 -k 1 1 true >/dev/null 2>&1; then
+      GST_TIMEOUT_OK=1
+    else
+      GST_TIMEOUT_OK=0
+    fi
+  fi
+  [ "$GST_TIMEOUT_OK" = "1" ]
+}
+
+# gstreamer_run_bounded <secs> <signal> <cmd> [args...]
+# Runs <cmd> under timeout(1), escalating to SIGKILL after GST_KILL_GRACE
+# seconds if it does not react to <signal>.
+#
+# A process blocked in a V4L2 ioctl on a wedged hardware codec never reacts to
+# the first signal. Without the escalation timeout(1) then waits for it forever,
+# so the caller hangs until the CI harness times out the whole job instead of
+# reporting a single failed test case.
+#
+# Returns the command's own exit status, GST_RC_TIMEDOUT if the bound stopped
+# it, or GST_RC_NO_TIMEOUT if there is no usable timeout(1) - in which case the
+# command is deliberately NOT run. Falling back to an unbounded run would
+# reinstate the very hang this is here to prevent, so callers are expected to
+# fail or skip instead.
+#
+# GST_BOUNDED_RAW_RC keeps the pre-normalisation status for diagnostics.
+gstreamer_run_bounded() {
+  bounded_secs="$1"
+  bounded_sig="$2"
+  shift 2
+
+  if ! gstreamer_timeout_supported; then
+    log_error "No timeout(1) supporting -s/-k; refusing to run '$1' unbounded"
+    GST_BOUNDED_RAW_RC="$GST_RC_NO_TIMEOUT"
+    return "$GST_RC_NO_TIMEOUT"
+  fi
+
+  bounded_signum=$(gstreamer_signum "$bounded_sig")
+
+  timeout -s "$bounded_signum" -k "$GST_KILL_GRACE" "$bounded_secs" "$@"
+  bounded_rc=$?
+  GST_BOUNDED_RAW_RC="$bounded_rc"
+
+  # Normalise "the bound stopped it" across implementations:
+  #   GNU     reports 124 when its signal ended the command,
+  #   BusyBox reports 128+signal for the signal it delivered,
+  #   both    report 137 (128+SIGKILL) when the grace period had to escalate.
+  bounded_killed=$((128 + bounded_signum))
+  if [ "$bounded_rc" = "124" ] || [ "$bounded_rc" = "137" ] ||
+     [ "$bounded_rc" = "$bounded_killed" ]; then
+    bounded_rc="$GST_RC_TIMEDOUT"
+  fi
+
+  return "$bounded_rc"
+}
+
+# gstreamer_bounded_timed_out <rc>
+# True when gstreamer_run_bounded had to stop the command.
+gstreamer_bounded_timed_out() {
+  [ "$1" = "$GST_RC_TIMEDOUT" ]
+}
+
+# gstreamer_bounded_no_timeout <rc>
+# True when gstreamer_run_bounded refused to run the command because this
+# system has no usable timeout(1).
+gstreamer_bounded_no_timeout() {
+  [ "$1" = "$GST_RC_NO_TIMEOUT" ]
+}
+
 # -------------------- Element check --------------------
+# has_element <element>
+# True when the GStreamer element is registered and can be introspected.
+#
+# gst-inspect-1.0 opens every /dev/video* node while building or validating the
+# plugin registry. If a hardware codec has wedged, that open blocks in the
+# kernel and gst-inspect never returns. Bound it so a dead codec surfaces as
+# "element not available" (SKIP/FAIL) rather than a hung test run.
+#
+# The answer is cached per element. Callers probe the same element repeatedly
+# (run_encode_test asks once itself and once more via
+# gstreamer_build_v4l2_encode_pipeline), and against wedged hardware every one
+# of those probes would otherwise cost a full GST_PROBE_TIMEOUT. Caching keeps
+# the worst case proportional to the number of distinct elements.
+#
+# Call gstreamer_reset_element_cache after anything that changes which elements
+# exist, e.g. a video_ensure_stack hot switch that reloads the codec modules.
 has_element() {
   elem="$1"
   [ -n "$elem" ] || return 1
   command -v "$GSTINSPECT" >/dev/null 2>&1 || return 1
-  "$GSTINSPECT" "$elem" >/dev/null 2>&1
+
+  # Element names map to shell variable names, so reduce them to a safe charset.
+  has_element_key=$(printf '%s' "$elem" | tr -c 'A-Za-z0-9_' '_')
+  has_element_cached=$(eval "printf '%s' \"\${HAS_ELEMENT_CACHE_${has_element_key}:-}\"")
+  if [ -n "$has_element_cached" ]; then
+    return "$has_element_cached"
+  fi
+
+  gstreamer_run_bounded "$GST_PROBE_TIMEOUT" TERM "$GSTINSPECT" "$elem" >/dev/null 2>&1
+  has_element_rc=$?
+
+  if gstreamer_bounded_no_timeout "$has_element_rc"; then
+    log_error "Cannot probe '$elem' without a usable timeout(1); treating it as unavailable"
+    has_element_rc=1
+  elif gstreamer_bounded_timed_out "$has_element_rc"; then
+    log_warn "$GSTINSPECT timed out after ${GST_PROBE_TIMEOUT}s inspecting '$elem' (wedged codec device?)"
+    has_element_rc=1
+  elif [ "$has_element_rc" -ne 0 ]; then
+    has_element_rc=1
+  fi
+
+  eval "HAS_ELEMENT_CACHE_${has_element_key}=\$has_element_rc"
+  return "$has_element_rc"
+}
+
+# gstreamer_reset_element_cache
+# Drops every cached has_element answer. Use after reloading codec modules or
+# otherwise changing which GStreamer elements are registered.
+gstreamer_reset_element_cache() {
+  for has_element_var in $(set | sed -n 's/^\(HAS_ELEMENT_CACHE_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$has_element_var"
+  done
 }
 
 # -------------------- Pretty printing (multi-line) --------------------
@@ -390,7 +548,15 @@ gstreamer_log_clip_metadata() {
 
   : >"$metaLog" 2>/dev/null || true
 
-  "$GSTDISCOVER" "$clip" >"$metaLog" 2>&1 || true
+  gstreamer_run_bounded "$GST_PROBE_TIMEOUT" TERM "$GSTDISCOVER" "$clip" >"$metaLog" 2>&1
+  clipmeta_rc=$?
+  if gstreamer_bounded_no_timeout "$clipmeta_rc"; then
+    log_warn "Skipping $GSTDISCOVER: no timeout(1) supporting -s/-k"
+    return 1
+  fi
+  if gstreamer_bounded_timed_out "$clipmeta_rc"; then
+    log_warn "$GSTDISCOVER timed out after ${GST_PROBE_TIMEOUT}s on '$clip'"
+  fi
 
   log_info "Clip metadata ($GSTDISCOVER):"
   while IFS= read -r line; do
@@ -522,25 +688,31 @@ gstreamer_run_gstlaunch_timeout() {
   secs="$1"
   pipe="$2"
 
+  # A non-numeric or non-positive bound is treated as invalid input and
+  # replaced with the default. There is deliberately no unbounded path here.
   case "$secs" in ''|*[!0-9]*) secs=10 ;; esac
+  [ "$secs" -gt 0 ] 2>/dev/null || secs=10
+
   command -v "$GSTBIN" >/dev/null 2>&1 || return 127
 
   gstreamer_print_cmd_multiline "$pipe"
 
-  if [ "$secs" -gt 0 ] 2>/dev/null; then
-    if command -v timeout >/dev/null 2>&1; then
-      # shellcheck disable=SC2086
-      # Send SIGINT instead of SIGTERM to trigger EOS via -e flag
-      timeout --signal=INT "$secs" "$GSTBIN" $GSTLAUNCHFLAGS $pipe
-      return $?
+  # shellcheck disable=SC2086
+  # Send SIGINT instead of SIGTERM to trigger EOS via -e flag
+  gstreamer_run_bounded "$secs" INT "$GSTBIN" $GSTLAUNCHFLAGS $pipe
+  gstlaunch_rc=$?
+
+  if gstreamer_bounded_no_timeout "$gstlaunch_rc"; then
+    log_error "Refusing to run $GSTBIN unbounded: no timeout(1) supporting -s/-k"
+  elif gstreamer_bounded_timed_out "$gstlaunch_rc"; then
+    if [ "$GST_BOUNDED_RAW_RC" = "137" ]; then
+      log_warn "$GSTBIN ignored SIGINT and was killed after ${secs}s + ${GST_KILL_GRACE}s (wedged codec device?)"
     else
-      log_warn "No timeout command available, running without timeout"
+      log_warn "$GSTBIN did not finish within ${secs}s"
     fi
   fi
 
-  # shellcheck disable=SC2086
-  "$GSTBIN" $GSTLAUNCHFLAGS $pipe
-  return $?
+  return "$gstlaunch_rc"
 }
 
 # -------------------- Audio Record/Playback pipeline builders --------------------
