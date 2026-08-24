@@ -1,0 +1,38 @@
+metadata:
+  name: ethernet-statistics-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Generate bounded interface-specific traffic and verify RX/TX packet and byte counter increments while checking error and drop deltas."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  LINK_TIMEOUT_S: "10"
+  IP_TIMEOUT_S: "15"
+  ETH_INTERFACE: ""
+  PING_TARGET: ""
+  PING_COUNT: "10"
+  PING_WAIT_S: "2"
+  MAX_RX_ERROR_DELTA: "0"
+  MAX_TX_ERROR_DELTA: "0"
+  MAX_RX_DROP_DELTA: ""
+  MAX_TX_DROP_DELTA: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Statistics_Validation
+    - |
+      ./run.sh \
+        --link-timeout "${LINK_TIMEOUT_S}" \
+        --ip-timeout "${IP_TIMEOUT_S}" \
+        --interface "${ETH_INTERFACE}" \
+        --ping-target "${PING_TARGET}" \
+        --ping-count "${PING_COUNT}" \
+        --ping-wait "${PING_WAIT_S}" \
+        --max-rx-error-delta "${MAX_RX_ERROR_DELTA}" \
+        --max-tx-error-delta "${MAX_TX_ERROR_DELTA}" \
+        --max-rx-drop-delta "${MAX_RX_DROP_DELTA}" \
+        --max-tx-drop-delta "${MAX_TX_DROP_DELTA}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Statistics_Validation.res || true

@@ -1,0 +1,41 @@
+metadata:
+  name: ethernet-suspend-resume-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Opt-in validation of Ethernet driver binding, carrier, IPv4, statistics, and connectivity recovery across an rtcwake suspend/resume cycle."
+  os:
+    - linux
+  scope:
+    - functional
+    - power-management
+
+params:
+  ETH_SUSPEND_ENABLE: "0"
+  ETH_SUSPEND_INTERFACE: ""
+  ETH_SUSPEND_SECONDS: "30"
+  ETH_SUSPEND_MODE: "mem"
+  ETH_RTC_DEVICE: "/dev/rtc0"
+  ETH_RESUME_TIMEOUT_S: "30"
+  LINK_TIMEOUT_S: "10"
+  IP_TIMEOUT_S: "20"
+  PING_TARGET: ""
+  PING_COUNT: "5"
+  PING_WAIT_S: "2"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Suspend_Resume_Validation
+    - |
+      ./run.sh \
+        --enable "${ETH_SUSPEND_ENABLE}" \
+        --interface "${ETH_SUSPEND_INTERFACE}" \
+        --suspend-seconds "${ETH_SUSPEND_SECONDS}" \
+        --suspend-mode "${ETH_SUSPEND_MODE}" \
+        --rtc-device "${ETH_RTC_DEVICE}" \
+        --resume-timeout "${ETH_RESUME_TIMEOUT_S}" \
+        --link-timeout "${LINK_TIMEOUT_S}" \
+        --ip-timeout "${IP_TIMEOUT_S}" \
+        --ping-target "${PING_TARGET}" \
+        --ping-count "${PING_COUNT}" \
+        --ping-wait "${PING_WAIT_S}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Suspend_Resume_Validation.res || true

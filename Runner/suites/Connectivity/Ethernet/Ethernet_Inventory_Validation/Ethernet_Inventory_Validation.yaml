@@ -1,0 +1,18 @@
+metadata:
+  name: ethernet-inventory-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Inventory physical Ethernet interfaces, MAC drivers, PHY identity, device-tree identity, queue topology, and platform bindings without changing network configuration."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  ETH_INTERFACE: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Inventory_Validation
+    - ./run.sh --interface "${ETH_INTERFACE}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Inventory_Validation.res || true

@@ -30,8 +30,8 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_ON_OFF/BT_ON_OFF.res || true
         - $PWD/suites/Connectivity/Bluetooth/BT_SCAN/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_SCAN/BT_SCAN.res || true
-        - $PWD/suites/Connectivity/Ethernet/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
+        - $PWD/suites/Connectivity/Ethernet/Ethernet_Basic_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet_Basic_Validation/Ethernet_Basic_Validation.res || true
         - $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/WiFi_Firmware_Driver.res || true
         - $PWD/suites/Connectivity/WiFi/WiFi_OnOff/run.sh || true
@@ -185,4 +185,3 @@ run:
         - $PWD/suites/System/Logging/Logging_Journalctl_Validation/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/System/Logging/Logging_Journalctl_Validation/Logging_Journalctl_Validation.res || true
         - $PWD/utils/result_parse.sh
-

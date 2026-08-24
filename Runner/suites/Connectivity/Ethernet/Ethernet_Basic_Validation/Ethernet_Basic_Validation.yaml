@@ -1,0 +1,32 @@
+metadata:
+  name: ethernet-basic-validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate Ethernet interface presence, carrier, IPv4 assignment, and basic connectivity on all detected physical Ethernet interfaces."
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  LINK_TIMEOUT_S: "10"
+  IP_TIMEOUT_S: "15"
+  ETH_INTERFACE: ""
+  PING_TARGET: ""
+  PING_COUNT: "4"
+  PING_WAIT_S: "2"
+  PING_RETRIES: "3"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Connectivity/Ethernet/Ethernet_Basic_Validation
+    - |
+      ./run.sh \
+        --link-timeout "${LINK_TIMEOUT_S}" \
+        --ip-timeout "${IP_TIMEOUT_S}" \
+        --interface "${ETH_INTERFACE}" \
+        --ping-target "${PING_TARGET}" \
+        --ping-count "${PING_COUNT}" \
+        --ping-wait "${PING_WAIT_S}" \
+        --ping-retries "${PING_RETRIES}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Ethernet_Basic_Validation.res || true
