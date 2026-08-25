@@ -1,0 +1,17 @@
+metadata:
+  name: DeviceTree_HW_Capability_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate runtime device-tree identity, enabled hardware controllers, driver binding, and kernel health"
+  os:
+    - linux
+  scope:
+    - functional
+params:
+  area: all
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/DeviceTree_HW_Capability_Validation
+    - ./run.sh --area "${area:-all}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh DeviceTree_HW_Capability_Validation.res
