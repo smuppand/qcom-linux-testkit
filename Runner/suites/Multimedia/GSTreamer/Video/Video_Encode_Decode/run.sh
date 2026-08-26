@@ -124,6 +124,10 @@ cleanup() {
   if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
     pkill -x gst-launch-1.0 >/dev/null 2>&1 || true
   fi
+  # The element-probe cache is backed by files under TMPDIR; do not leave them.
+  if command -v gstreamer_reset_element_cache >/dev/null 2>&1; then
+    gstreamer_reset_element_cache
+  fi
 }
 trap cleanup INT TERM EXIT
 
@@ -455,7 +459,15 @@ run_encode_test() {
   
   # Check if encoder is available
   encoder=$(gstreamer_v4l2_encoder_for_codec "$codec")
+  probe_rc=$?
   if [ -z "$encoder" ]; then
+    # A probe that timed out, or could not be bounded, means the codec is
+    # broken - not absent. Reporting SKIP there hides a hardware failure.
+    if gstreamer_probe_unhealthy "$probe_rc"; then
+      log_fail "$testname: FAIL (encoder probe failed for $codec, rc=$probe_rc)"
+      fail_count=$((fail_count + 1))
+      return 1
+    fi
     log_warn "Encoder not available for $codec"
     skip_count=$((skip_count + 1))
     return 1
@@ -480,7 +492,12 @@ run_encode_test() {
   fi
   
   log_info "Pipeline: $pipeline"
-  
+
+  # Never judge this run on a file left behind by an earlier one: the encoded
+  # directory is shared between the test definitions in a job, so a stale or
+  # partially written artifact would otherwise satisfy the size check below.
+  rm -f "$output_file" 2>/dev/null || true
+
   # Run encoding
   if gstreamer_run_gstlaunch_timeout "$((duration + 10))" "$pipeline" >>"$test_log" 2>&1; then
     gstRc=0
@@ -489,7 +506,17 @@ run_encode_test() {
   fi
   
   log_info "Encode exit code: $gstRc"
-  
+
+  # An encode that did not exit cleanly is a failure. videotestsrc delivers a
+  # fixed number of buffers and the pipeline EOSes well inside the bound, so a
+  # timeout or a signal here means the encoder never completed - unlike the
+  # playback cases, where running until the bound is the intended behaviour.
+  if [ "$gstRc" -ne 0 ]; then
+    log_fail "$testname: FAIL (rc=$gstRc)"
+    fail_count=$((fail_count + 1))
+    return 1
+  fi
+
   # Check for GStreamer errors in log
   if ! gstreamer_validate_log "$test_log" "$testname"; then
     log_fail "$testname: FAIL (GStreamer errors detected)"
@@ -530,7 +557,13 @@ run_decode_test() {
   
   # Check if decoder is available
   decoder=$(gstreamer_v4l2_decoder_for_codec "$codec")
+  probe_rc=$?
   if [ -z "$decoder" ]; then
+    if gstreamer_probe_unhealthy "$probe_rc"; then
+      log_fail "$testname: FAIL (decoder probe failed for $codec, rc=$probe_rc)"
+      fail_count=$((fail_count + 1))
+      return 1
+    fi
     log_warn "Decoder not available for $codec"
     skip_count=$((skip_count + 1))
     return 1

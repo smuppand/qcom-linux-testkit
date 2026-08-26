@@ -34,6 +34,24 @@ GST_KILL_GRACE="${GST_KILL_GRACE:-10}"
 GST_RC_TIMEDOUT=124   # the command was stopped by the time bound
 GST_RC_NO_TIMEOUT=125 # no usable timeout(1); the command was NOT run
 
+# Element-probe outcomes returned by has_element(). Every non-zero value still
+# means "not usable", so boolean callers keep working, but the value says WHY:
+# a genuinely absent element is a legitimate SKIP, whereas a probe that had to
+# be stopped, or could not be bounded at all, points at broken hardware or a
+# broken environment and must not be reported as "not applicable".
+GST_ELEM_OK=0
+GST_ELEM_MISSING=1
+GST_ELEM_TIMEOUT=2
+GST_ELEM_NO_TIMEOUT=3
+
+# Where has_element() remembers probe outcomes. This has to be a file, not a
+# shell variable: the callers resolve elements inside command substitution
+# (encoder=$(gstreamer_v4l2_encoder_for_codec ...)), which runs in a subshell,
+# so any variable the probe set would be discarded on return and every
+# resolution would pay the full GST_PROBE_TIMEOUT again. $$ is the invoking
+# shell's PID and is stable across subshells, so one run shares one directory.
+GST_ELEM_CACHE_DIR="${GST_ELEM_CACHE_DIR:-${TMPDIR:-/tmp}/gst-elem-cache-$$}"
+
 # Optional env overrides (set by run.sh)
 # GST_ALSA_PLAYBACK_DEVICE=hw:0,0
 # GST_ALSA_CAPTURE_DEVICE=hw:0,1
@@ -219,42 +237,63 @@ gstreamer_bounded_no_timeout() {
 #
 # Call gstreamer_reset_element_cache after anything that changes which elements
 # exist, e.g. a video_ensure_stack hot switch that reloads the codec modules.
+#
+# Returns GST_ELEM_OK, GST_ELEM_MISSING, GST_ELEM_TIMEOUT or GST_ELEM_NO_TIMEOUT;
+# the classification is what gets cached, so a repeat probe keeps the reason.
 has_element() {
   elem="$1"
   [ -n "$elem" ] || return 1
   command -v "$GSTINSPECT" >/dev/null 2>&1 || return 1
 
-  # Element names map to shell variable names, so reduce them to a safe charset.
+  # Element names become file names, so reduce them to a safe charset.
   has_element_key=$(printf '%s' "$elem" | tr -c 'A-Za-z0-9_' '_')
-  has_element_cached=$(eval "printf '%s' \"\${HAS_ELEMENT_CACHE_${has_element_key}:-}\"")
-  if [ -n "$has_element_cached" ]; then
-    return "$has_element_cached"
+  has_element_cf="${GST_ELEM_CACHE_DIR}/${has_element_key}"
+  if [ -f "$has_element_cf" ]; then
+    has_element_cached=$(cat "$has_element_cf" 2>/dev/null)
+    case "$has_element_cached" in
+      ''|*[!0-9]*) : ;;   # unreadable or corrupt: fall through and re-probe
+      *) return "$has_element_cached" ;;
+    esac
   fi
 
   gstreamer_run_bounded "$GST_PROBE_TIMEOUT" TERM "$GSTINSPECT" "$elem" >/dev/null 2>&1
   has_element_rc=$?
 
+  # Diagnostics go to stderr: has_element runs inside command substitution
+  # (gstreamer_v4l2_encoder_for_codec and the pipeline builders capture its
+  # caller's stdout), so anything written to stdout here ends up spliced into
+  # the element name and, from there, into the pipeline string.
   if gstreamer_bounded_no_timeout "$has_element_rc"; then
-    log_error "Cannot probe '$elem' without a usable timeout(1); treating it as unavailable"
-    has_element_rc=1
+    log_error "Cannot probe '$elem' without a usable timeout(1)" >&2
+    has_element_rc="$GST_ELEM_NO_TIMEOUT"
   elif gstreamer_bounded_timed_out "$has_element_rc"; then
-    log_warn "$GSTINSPECT timed out after ${GST_PROBE_TIMEOUT}s inspecting '$elem' (wedged codec device?)"
-    has_element_rc=1
+    log_warn "$GSTINSPECT timed out after ${GST_PROBE_TIMEOUT}s inspecting '$elem' (wedged codec device?)" >&2
+    has_element_rc="$GST_ELEM_TIMEOUT"
   elif [ "$has_element_rc" -ne 0 ]; then
-    has_element_rc=1
+    has_element_rc="$GST_ELEM_MISSING"
   fi
 
-  eval "HAS_ELEMENT_CACHE_${has_element_key}=\$has_element_rc"
+  # Best effort: if the cache cannot be written the probe still works, it just
+  # is not remembered.
+  mkdir -p "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$has_element_rc" > "$has_element_cf" 2>/dev/null || true
+
   return "$has_element_rc"
+}
+
+# gstreamer_probe_unhealthy <rc>
+# True when an element probe failed for a reason that indicates broken hardware
+# or a broken environment rather than a genuinely absent element. Callers should
+# report FAIL for these, not SKIP.
+gstreamer_probe_unhealthy() {
+  [ "$1" = "$GST_ELEM_TIMEOUT" ] || [ "$1" = "$GST_ELEM_NO_TIMEOUT" ]
 }
 
 # gstreamer_reset_element_cache
 # Drops every cached has_element answer. Use after reloading codec modules or
 # otherwise changing which GStreamer elements are registered.
 gstreamer_reset_element_cache() {
-  for has_element_var in $(set | sed -n 's/^\(HAS_ELEMENT_CACHE_[A-Za-z0-9_]*\)=.*/\1/p'); do
-    unset "$has_element_var"
-  done
+  rm -rf "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
 }
 
 # -------------------- Pretty printing (multi-line) --------------------
@@ -1050,25 +1089,33 @@ gstreamer_v4l2_encoder_for_codec() {
   codec="$1"
   case "$codec" in
     h264)
-      if has_element v4l2h264enc; then
+      has_element v4l2h264enc
+      probe_rc=$?
+      if [ "$probe_rc" -eq 0 ]; then
         printf '%s\n' "v4l2h264enc"
-        return 0
+        return "$GST_ELEM_OK"
       fi
+      printf '%s\n' ""
+      return "$probe_rc"
       ;;
     h265|hevc)
-      if has_element v4l2h265enc; then
+      has_element v4l2h265enc
+      probe_rc=$?
+      if [ "$probe_rc" -eq 0 ]; then
         printf '%s\n' "v4l2h265enc"
-        return 0
+        return "$GST_ELEM_OK"
       fi
+      printf '%s\n' ""
+      return "$probe_rc"
       ;;
     vp9)
-      # VP9 is decode-only, no encoder support
+      # VP9 is decode-only, no encoder support: genuinely absent, not broken.
       printf '%s\n' ""
-      return 1
+      return "$GST_ELEM_MISSING"
       ;;
   esac
   printf '%s\n' ""
-  return 1
+  return "$GST_ELEM_MISSING"
 }
 
 # gstreamer_v4l2_decoder_for_codec <codec>
@@ -1078,26 +1125,38 @@ gstreamer_v4l2_decoder_for_codec() {
   codec="$1"
   case "$codec" in
     h264)
-      if has_element v4l2h264dec; then
+      has_element v4l2h264dec
+      probe_rc=$?
+      if [ "$probe_rc" -eq 0 ]; then
         printf '%s\n' "v4l2h264dec"
-        return 0
+        return "$GST_ELEM_OK"
       fi
+      printf '%s\n' ""
+      return "$probe_rc"
       ;;
     h265|hevc)
-      if has_element v4l2h265dec; then
+      has_element v4l2h265dec
+      probe_rc=$?
+      if [ "$probe_rc" -eq 0 ]; then
         printf '%s\n' "v4l2h265dec"
-        return 0
+        return "$GST_ELEM_OK"
       fi
+      printf '%s\n' ""
+      return "$probe_rc"
       ;;
     vp9)
-      if has_element v4l2vp9dec; then
+      has_element v4l2vp9dec
+      probe_rc=$?
+      if [ "$probe_rc" -eq 0 ]; then
         printf '%s\n' "v4l2vp9dec"
-        return 0
+        return "$GST_ELEM_OK"
       fi
+      printf '%s\n' ""
+      return "$probe_rc"
       ;;
   esac
   printf '%s\n' ""
-  return 1
+  return "$GST_ELEM_MISSING"
 }
 
 # gstreamer_container_ext_for_codec <codec>
