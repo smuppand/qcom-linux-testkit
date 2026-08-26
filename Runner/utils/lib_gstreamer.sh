@@ -46,12 +46,20 @@ GST_ELEM_NO_TIMEOUT=3
 GST_ELEM_HW_FAULT=4
 
 # Kernel signatures of a video codec driver that failed to come up. A driver
-# whose firmware will not load never registers its V4L2 element, so gst-inspect
-# reports the element as simply absent - indistinguishable from a platform that
+# that does not come up never registers its V4L2 element, so gst-inspect reports
+# the element as simply absent - indistinguishable from a platform that
 # genuinely has no such codec. Only the kernel log separates the two, and only
-# the first is a failure. Kept deliberately narrow: hard init/firmware faults on
-# a codec device, not transient session errors the driver recovers from.
-GST_CODEC_FAULT_RE="${GST_CODEC_FAULT_RE:-(qcom-iris|qcom-venus|venus_core|video-codec).*(firmware download failed|core init failed|initializing firmware)}"
+# the first is a failure. Kept deliberately narrow: hard faults that leave the
+# codec unusable, not transient session errors the driver recovers from.
+#
+# Two distinct shapes have to be covered, because they fail at different stages:
+#   - the driver binds, then cannot load or start its firmware
+#     ("firmware download failed", "core init failed", "initializing firmware")
+#   - the driver never binds at all ("probe with driver qcom-iris failed with
+#     error -5"), so it never reaches the point of mentioning firmware
+# The second shape prints no firmware wording whatsoever, so matching only the
+# first silently reports a dead codec as an unsupported one.
+GST_CODEC_FAULT_RE="${GST_CODEC_FAULT_RE:-(qcom-iris|qcom-venus|venus_core|video-codec).*(firmware download failed|core init failed|initializing firmware|probe with driver [^ ]+ failed|probe of [^ ]+ failed)}"
 
 # Where has_element() remembers probe outcomes. This has to be a file, not a
 # shell variable: the callers resolve elements inside command substitution
@@ -308,13 +316,14 @@ gstreamer_probe_reason() {
     "$GST_ELEM_MISSING")    printf '%s\n' "element not registered" ;;
     "$GST_ELEM_TIMEOUT")    printf '%s\n' "probe timed out, codec appears wedged" ;;
     "$GST_ELEM_NO_TIMEOUT") printf '%s\n' "no usable timeout(1), probe refused" ;;
-    "$GST_ELEM_HW_FAULT")   printf '%s\n' "codec driver reported a firmware or init failure" ;;
+    "$GST_ELEM_HW_FAULT")   printf '%s\n' "codec driver failed to come up (firmware, core init or probe)" ;;
     *)                      printf '%s\n' "unknown probe status $1" ;;
   esac
 }
 
 # gstreamer_codec_hw_faulted
-# True when the kernel log shows a video codec driver failing to initialise.
+# True when the kernel log shows a video codec driver failing to come up,
+# either by failing to load its firmware or by failing to probe at all.
 gstreamer_codec_hw_faulted() {
   command -v dmesg >/dev/null 2>&1 || return 1
   dmesg 2>/dev/null | grep -Eqi "$GST_CODEC_FAULT_RE"
