@@ -43,6 +43,15 @@ GST_ELEM_OK=0
 GST_ELEM_MISSING=1
 GST_ELEM_TIMEOUT=2
 GST_ELEM_NO_TIMEOUT=3
+GST_ELEM_HW_FAULT=4
+
+# Kernel signatures of a video codec driver that failed to come up. A driver
+# whose firmware will not load never registers its V4L2 element, so gst-inspect
+# reports the element as simply absent - indistinguishable from a platform that
+# genuinely has no such codec. Only the kernel log separates the two, and only
+# the first is a failure. Kept deliberately narrow: hard init/firmware faults on
+# a codec device, not transient session errors the driver recovers from.
+GST_CODEC_FAULT_RE="${GST_CODEC_FAULT_RE:-(qcom-iris|qcom-venus|venus_core|video-codec).*(firmware download failed|core init failed|initializing firmware)}"
 
 # Where has_element() remembers probe outcomes. This has to be a file, not a
 # shell variable: the callers resolve elements inside command substitution
@@ -286,7 +295,44 @@ has_element() {
 # or a broken environment rather than a genuinely absent element. Callers should
 # report FAIL for these, not SKIP.
 gstreamer_probe_unhealthy() {
-  [ "$1" = "$GST_ELEM_TIMEOUT" ] || [ "$1" = "$GST_ELEM_NO_TIMEOUT" ]
+  [ "$1" = "$GST_ELEM_TIMEOUT" ] ||
+  [ "$1" = "$GST_ELEM_NO_TIMEOUT" ] ||
+  [ "$1" = "$GST_ELEM_HW_FAULT" ]
+}
+
+# gstreamer_probe_reason <rc>
+# Human-readable explanation of a probe outcome, for test log messages.
+gstreamer_probe_reason() {
+  case "$1" in
+    "$GST_ELEM_OK")         printf '%s\n' "available" ;;
+    "$GST_ELEM_MISSING")    printf '%s\n' "element not registered" ;;
+    "$GST_ELEM_TIMEOUT")    printf '%s\n' "probe timed out, codec appears wedged" ;;
+    "$GST_ELEM_NO_TIMEOUT") printf '%s\n' "no usable timeout(1), probe refused" ;;
+    "$GST_ELEM_HW_FAULT")   printf '%s\n' "codec driver reported a firmware or init failure" ;;
+    *)                      printf '%s\n' "unknown probe status $1" ;;
+  esac
+}
+
+# gstreamer_codec_hw_faulted
+# True when the kernel log shows a video codec driver failing to initialise.
+gstreamer_codec_hw_faulted() {
+  command -v dmesg >/dev/null 2>&1 || return 1
+  dmesg 2>/dev/null | grep -Eqi "$GST_CODEC_FAULT_RE"
+}
+
+# gstreamer_refine_codec_probe <rc>
+# Prints <rc>, upgraded from GST_ELEM_MISSING to GST_ELEM_HW_FAULT when the
+# kernel log shows the codec driver failed to come up. Used only by the V4L2
+# hardware codec lookups: for those an absent element accompanied by a driver
+# fault is a broken device, not an unsupported feature, and reporting SKIP
+# there hides exactly the failure the test exists to catch.
+gstreamer_refine_codec_probe() {
+  refine_rc="$1"
+  if [ "$refine_rc" = "$GST_ELEM_MISSING" ] && gstreamer_codec_hw_faulted; then
+    printf '%s\n' "$GST_ELEM_HW_FAULT"
+    return 0
+  fi
+  printf '%s\n' "$refine_rc"
 }
 
 # gstreamer_reset_element_cache
@@ -1095,6 +1141,7 @@ gstreamer_v4l2_encoder_for_codec() {
         printf '%s\n' "v4l2h264enc"
         return "$GST_ELEM_OK"
       fi
+      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
       printf '%s\n' ""
       return "$probe_rc"
       ;;
@@ -1105,6 +1152,7 @@ gstreamer_v4l2_encoder_for_codec() {
         printf '%s\n' "v4l2h265enc"
         return "$GST_ELEM_OK"
       fi
+      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
       printf '%s\n' ""
       return "$probe_rc"
       ;;
@@ -1131,6 +1179,7 @@ gstreamer_v4l2_decoder_for_codec() {
         printf '%s\n' "v4l2h264dec"
         return "$GST_ELEM_OK"
       fi
+      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
       printf '%s\n' ""
       return "$probe_rc"
       ;;
@@ -1141,6 +1190,7 @@ gstreamer_v4l2_decoder_for_codec() {
         printf '%s\n' "v4l2h265dec"
         return "$GST_ELEM_OK"
       fi
+      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
       printf '%s\n' ""
       return "$probe_rc"
       ;;
@@ -1151,6 +1201,7 @@ gstreamer_v4l2_decoder_for_codec() {
         printf '%s\n' "v4l2vp9dec"
         return "$GST_ELEM_OK"
       fi
+      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
       printf '%s\n' ""
       return "$probe_rc"
       ;;

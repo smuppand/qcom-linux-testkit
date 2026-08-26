@@ -464,7 +464,7 @@ run_encode_test() {
     # A probe that timed out, or could not be bounded, means the codec is
     # broken - not absent. Reporting SKIP there hides a hardware failure.
     if gstreamer_probe_unhealthy "$probe_rc"; then
-      log_fail "$testname: FAIL (encoder probe failed for $codec, rc=$probe_rc)"
+      log_fail "$testname: FAIL (encoder for $codec unusable: $(gstreamer_probe_reason "$probe_rc"))"
       fail_count=$((fail_count + 1))
       return 1
     fi
@@ -560,7 +560,7 @@ run_decode_test() {
   probe_rc=$?
   if [ -z "$decoder" ]; then
     if gstreamer_probe_unhealthy "$probe_rc"; then
-      log_fail "$testname: FAIL (decoder probe failed for $codec, rc=$probe_rc)"
+      log_fail "$testname: FAIL (decoder for $codec unusable: $(gstreamer_probe_reason "$probe_rc"))"
       fail_count=$((fail_count + 1))
       return 1
     fi
