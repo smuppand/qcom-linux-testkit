@@ -74,6 +74,7 @@ FPS_TOL_PCT="${FPS_TOL_PCT:-10}"
 MIN_FPS_PCT="${MIN_FPS_PCT:-85}"
 REQUIRE_FPS="${REQUIRE_FPS:-1}"
 DESKTOP_FUNCTIONAL_FPS_CAP="${DESKTOP_FUNCTIONAL_FPS_CAP:-60}"
+CLOCK_STEP_TOLERANCE="${CLOCK_STEP_TOLERANCE:-2}"
 
 REQUESTED_GRAPHICS_MODE="default"
 ALLOW_RELAUNCH="${ALLOW_RELAUNCH:-0}"
@@ -166,6 +167,8 @@ Environment:
   FPS_TOL_PCT                 Fixed-mode tolerance, default: 10
   MIN_FPS_PCT                 Minimum percentage, default: 85
   DESKTOP_FUNCTIONAL_FPS_CAP  Desktop auto-mode FPS cap, default: 60
+  TIME_SYNC_WAIT              Clock sync wait bound in seconds, 0 disables, default: 20
+  CLOCK_STEP_TOLERANCE        Wall-clock step tolerance in seconds, default: 2
 EOF_USAGE
             exit 0
             ;;
@@ -223,6 +226,11 @@ esac
 
 if [ "$DESKTOP_FUNCTIONAL_FPS_CAP" -le 0 ]; then
     echo "[ERROR] DESKTOP_FUNCTIONAL_FPS_CAP must be greater than zero" >&2
+    exit 1
+fi
+
+if ! is_unsigned_number "$CLOCK_STEP_TOLERANCE"; then
+    echo "[ERROR] CLOCK_STEP_TOLERANCE must be a non-negative integer: $CLOCK_STEP_TOLERANCE" >&2
     exit 1
 fi
 
@@ -570,9 +578,15 @@ WESTON_SIMPLE_EGL_FPS=1
 export SIMPLE_EGL_FPS
 export WESTON_SIMPLE_EGL_FPS
 
+# A clock step inside the window corrupts both the interval and the client's
+# frame accounting. Settle the clock first, measure monotonically, then check
+# whether a step slipped in anyway.
+wait_for_time_sync || true
+
 log_info "Launching $TESTNAME for $DURATION"
 
 start_ts="$(date +%s)"
+start_mono="$(get_monotonic_seconds)"
 rc=0
 
 if command -v run_with_timeout >/dev/null 2>&1; then
@@ -651,10 +665,28 @@ else
 fi
 
 end_ts="$(date +%s)"
-elapsed=$((end_ts - start_ts))
+end_mono="$(get_monotonic_seconds)"
+elapsed=$((end_mono - start_mono))
+
+clock_step="$(
+    clock_step_seconds \
+        "$start_mono" \
+        "$start_ts" \
+        "$end_mono" \
+        "$end_ts"
+)"
+
+clock_stepped=0
+
+if [ "$clock_step" -gt "$CLOCK_STEP_TOLERANCE" ]; then
+    clock_stepped=1
+fi
 
 log_info "Client finished, rc=${rc} elapsed=${elapsed}s"
 
+if [ "$clock_stepped" -eq 1 ]; then
+    log_warn "System clock stepped by ${clock_step}s during the run; FPS samples from the client are not trustworthy"
+fi
 
 fps_count=0
 fps_avg="-"
@@ -668,7 +700,7 @@ if command -v display_parse_fps_log >/dev/null 2>&1 &&
     fps_min="$DISPLAY_FPS_MIN"
     fps_max="$DISPLAY_FPS_MAX"
 
-    log_info "FPS stats, samples=${fps_count} avg=${fps_avg} min=${fps_min} max=${fps_max}"
+    log_info "FPS stats, samples=${fps_count} avg=${fps_avg} min=${fps_min} max=${fps_max} single_frame=${DISPLAY_FPS_SINGLE_FRAME:-0}"
 else
     log_warn "No FPS samples were detected in $RUN_LOG"
 fi
@@ -704,14 +736,21 @@ if [ "$elapsed" -le 1 ]; then
 fi
 
 
-if ! display_apply_test_fps_gate_policy \
+if [ "$clock_stepped" -eq 1 ]; then
+    # Averaging across a step measures the step, not the GPU.
+    log_skip "$TESTNAME SKIP - system clock stepped by ${clock_step}s during the ${elapsed}s run, FPS gate skipped (samples=${fps_count} avg=${fps_avg} max=${fps_max} single_frame=${DISPLAY_FPS_SINGLE_FRAME:-0})"
+
+    if [ "$final" = "PASS" ]; then
+        final="SKIP"
+    fi
+elif ! display_apply_test_fps_gate_policy \
     "$fps_avg" \
     "$fps_count" \
     "$REQUIRE_FPS"; then
     final="FAIL"
 fi
 
-if [ "$final" = "FAIL" ]; then
+if [ "$final" != "PASS" ]; then
     log_info "----- Last 200 client log lines -----"
 
     tail -n 200 "$RUN_LOG" 2>/dev/null |
@@ -737,7 +776,9 @@ fi
     printf '%s\n' "fps_gate_minimum=${DISPLAY_TEST_FPS_MIN_OK:-unknown}"
     printf '%s\n' "client_rc=$rc"
     printf '%s\n' "elapsed_seconds=$elapsed"
+    printf '%s\n' "clock_step_seconds=$clock_step"
     printf '%s\n' "fps_samples=$fps_count"
+    printf '%s\n' "fps_single_frame_samples=${DISPLAY_FPS_SINGLE_FRAME:-0}"
     printf '%s\n' "fps_average=$fps_avg"
     printf '%s\n' "fps_minimum=$fps_min"
     printf '%s\n' "fps_maximum=$fps_max"
@@ -749,11 +790,17 @@ echo "$TESTNAME $final" >"$RES_FILE"
 trap - EXIT HUP INT TERM
 cleanup_client
 
-if [ "$final" = "PASS" ]; then
-    log_pass "$TESTNAME : PASS"
-else
-    log_fail "$TESTNAME : FAIL"
-fi
+case "$final" in
+    PASS)
+        log_pass "$TESTNAME : PASS"
+        ;;
+    SKIP)
+        log_skip "$TESTNAME : SKIP"
+        ;;
+    *)
+        log_fail "$TESTNAME : FAIL"
+        ;;
+esac
 
 log_info "------------------- Completed ${TESTNAME} Testcase -------------------------"
 exit 0
