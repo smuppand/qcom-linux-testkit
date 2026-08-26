@@ -2304,6 +2304,9 @@ display_fps_gate_avg() {
 #   DISPLAY_FPS_AVG
 #   DISPLAY_FPS_MIN
 #   DISPLAY_FPS_MAX
+#   DISPLAY_FPS_SINGLE_FRAME - single-frame samples. A clock step turns every
+#       reporting window into one, so a high count next to a healthy
+#       DISPLAY_FPS_MAX means untrustworthy samples, not slow rendering.
 #
 # Return:
 #   0 - one or more usable FPS samples remain after warm-up handling
@@ -2316,6 +2319,7 @@ display_parse_fps_log() {
     DISPLAY_FPS_AVG="-"
     DISPLAY_FPS_MIN="-"
     DISPLAY_FPS_MAX="-"
+    DISPLAY_FPS_SINGLE_FRAME=0
  
     [ -n "$dpfl_log_file" ] || return 1
     [ -r "$dpfl_log_file" ] || return 1
@@ -2329,6 +2333,7 @@ display_parse_fps_log() {
                     if ($i == "frames" &&
                         i > 1 &&
                         $(i + 1) == "in") {
+                        frames = $(i - 1)
                         for (j = i + 2; j <= NF; j++) {
                             # Weston 14:
                             # 601 frames in 5 seconds: 120.199997 fps
@@ -2353,6 +2358,7 @@ display_parse_fps_log() {
                 if (value ~ /^[0-9]+([.][0-9]+)?$/) {
                     all_n++
                     all_values[all_n] = value + 0.0
+                    all_frames[all_n] = (frames ~ /^[0-9]+$/) ? frames + 0 : -1
                 }
             }
  
@@ -2366,11 +2372,16 @@ display_parse_fps_log() {
                 first = (all_n > 1) ? 2 : 1
                 count = 0
                 sum = 0.0
+                single = 0
  
                 for (i = first; i <= all_n; i++) {
                     value = all_values[i]
                     count++
                     sum += value
+
+                    if (all_frames[i] >= 0 && all_frames[i] <= 1) {
+                        single++
+                    }
  
                     if (count == 1 || value < min) {
                         min = value
@@ -2382,11 +2393,12 @@ display_parse_fps_log() {
                 }
  
                 if (count > 0) {
-                    printf "n=%d avg=%.6f min=%.6f max=%.6f\n",
+                    printf "n=%d avg=%.6f min=%.6f max=%.6f single=%d\n",
                         count,
                         sum / count,
                         min,
-                        max
+                        max,
+                        single
                 }
             }
         ' "$dpfl_log_file" 2>/dev/null
@@ -2417,6 +2429,18 @@ display_parse_fps_log() {
             awk '{ print $4 }' |
             sed 's/^max=//'
     )"
+
+    DISPLAY_FPS_SINGLE_FRAME="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $5 }' |
+            sed 's/^single=//'
+    )"
+
+    case "$DISPLAY_FPS_SINGLE_FRAME" in
+        ''|*[!0-9]*)
+            DISPLAY_FPS_SINGLE_FRAME=0
+            ;;
+    esac
  
     case "$DISPLAY_FPS_COUNT" in
         ''|*[!0-9]*)
@@ -2424,6 +2448,7 @@ display_parse_fps_log() {
             DISPLAY_FPS_AVG="-"
             DISPLAY_FPS_MIN="-"
             DISPLAY_FPS_MAX="-"
+            DISPLAY_FPS_SINGLE_FRAME=0
             return 1
             ;;
     esac

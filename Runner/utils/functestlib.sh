@@ -1294,6 +1294,193 @@ ensure_reasonable_clock() {
     return 1
 }
 
+###############################################################################
+# Monotonic time and wall-clock step helpers
+#
+# Boards without a valid RTC boot at the epoch and get stepped to real time
+# once NTP reaches them. A step landing inside a measurement invalidates
+# every wall-clock interval taken across it.
+###############################################################################
+
+# Print whole seconds from a monotonic source, falling back to the wall clock.
+get_monotonic_seconds() {
+    gms_value=""
+
+    if [ -r /proc/uptime ]; then
+        gms_value="$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null)"
+    fi
+
+    if ! is_unsigned_number "$gms_value"; then
+        gms_value="$(date +%s 2>/dev/null)"
+    fi
+
+    if ! is_unsigned_number "$gms_value"; then
+        gms_value=0
+    fi
+
+    printf '%s\n' "$gms_value"
+}
+
+# Print how far the wall clock moved beyond the monotonic duration of an
+# interval, in either direction. Malformed input reports 0, no step detected.
+#
+# Usage:
+#   clock_step_seconds MONO_START REAL_START MONO_END REAL_END
+clock_step_seconds() {
+    css_mono_start="$1"
+    css_real_start="$2"
+    css_mono_end="$3"
+    css_real_end="$4"
+    css_step=0
+
+    for css_value in \
+        "$css_mono_start" \
+        "$css_real_start" \
+        "$css_mono_end" \
+        "$css_real_end"; do
+        if ! is_unsigned_number "$css_value"; then
+            printf '%s\n' 0
+            return 0
+        fi
+    done
+
+    css_step=$(((css_real_end - css_real_start) - (css_mono_end - css_mono_start)))
+
+    if [ "$css_step" -lt 0 ]; then
+        css_step=$((0 - css_step))
+    fi
+
+    printf '%s\n' "$css_step"
+}
+
+# Report whether the system clock is synchronized to a time source.
+#
+# Return:
+#   0 - synchronized
+#   1 - not synchronized, or no way to tell
+clock_is_synchronized() {
+    cis_value=""
+
+    if command -v timedatectl >/dev/null 2>&1; then
+        cis_value="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+
+        if [ -z "$cis_value" ]; then
+            cis_value="$(
+                timedatectl status 2>/dev/null |
+                    sed -n 's/^[[:space:]]*System clock synchronized:[[:space:]]*//p' |
+                    head -n 1
+            )"
+        fi
+
+        case "$cis_value" in
+            yes|true|1)
+                return 0
+                ;;
+            no|false|0)
+                return 1
+                ;;
+        esac
+    fi
+
+    # Covers images without timedatectl.
+    [ -e /run/systemd/timesync/synchronized ] && return 0
+
+    return 1
+}
+
+# Report whether a time synchronization service is enabled or running.
+# timedatectl alone is not enough: it exists on every systemd image, even
+# ones with no synchronization service configured.
+#
+# Return:
+#   0 - a time synchronization service is enabled or running
+#   1 - none detected
+time_sync_service_active() {
+    # NTP enabled per timedated; covers systemd-timesyncd and daemons such
+    # as chronyd that register through ntp-units.d.
+    if command -v timedatectl >/dev/null 2>&1; then
+        tssa_value="$(timedatectl show -p NTP --value 2>/dev/null)"
+
+        if [ -z "$tssa_value" ]; then
+            tssa_value="$(
+                timedatectl status 2>/dev/null |
+                    sed -n 's/^[[:space:]]*NTP service:[[:space:]]*//p' |
+                    head -n 1
+            )"
+        fi
+
+        case "$tssa_value" in
+            yes|true|1|active)
+                return 0
+                ;;
+        esac
+    fi
+
+    # Runtime directory created by a running systemd-timesyncd.
+    [ -d /run/systemd/timesync ] && return 0
+
+    # Daemons running without timedated integration.
+    if command -v pidof >/dev/null 2>&1; then
+        for tssa_daemon in systemd-timesyncd chronyd ntpd; do
+            if pidof "$tssa_daemon" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+# Wait, bounded, for the system clock to synchronize, so a correction cannot
+# land mid-measurement. Skipped when no time source exists, so boards without
+# one do not stall on every run.
+#
+# Usage:
+#   wait_for_time_sync [TIMEOUT_SECONDS]
+#
+# TIMEOUT_SECONDS defaults to TIME_SYNC_WAIT, then 20. 0 disables the wait.
+#
+# Return:
+#   0 - clock is synchronized
+#   1 - still unsynchronized at the timeout, or no time source exists
+wait_for_time_sync() {
+    wfts_timeout="${1:-${TIME_SYNC_WAIT:-20}}"
+    wfts_waited=0
+
+    if ! is_unsigned_number "$wfts_timeout"; then
+        wfts_timeout=20
+    fi
+
+    if clock_is_synchronized; then
+        log_info "System clock is already synchronized"
+        return 0
+    fi
+
+    if ! time_sync_service_active; then
+        log_info "No active time synchronization service detected, not waiting"
+        return 1
+    fi
+
+    if [ "$wfts_timeout" -le 0 ]; then
+        return 1
+    fi
+
+    log_info "Waiting up to ${wfts_timeout}s for the system clock to synchronize"
+
+    while [ "$wfts_waited" -lt "$wfts_timeout" ]; do
+        sleep 1
+        wfts_waited=$((wfts_waited + 1))
+
+        if clock_is_synchronized; then
+            log_info "System clock synchronized after ${wfts_waited}s"
+            return 0
+        fi
+    done
+
+    log_warn "System clock did not synchronize within ${wfts_timeout}s; a later correction may disturb timing-sensitive measurements"
+    return 1
+}
+
 # If the tar file already exists,then function exit. Otherwise function to check the network connectivity and it will download tar from internet.
 extract_tar_from_url() {
     url="$1"
