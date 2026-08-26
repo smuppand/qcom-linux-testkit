@@ -4,10 +4,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # BT_ON_OFF - Basic Bluetooth power toggle validation (non-expect version)
 
-# Robustly find and source init_env
+# ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
-    cd "$(dirname "$0")" || exit 1
-    pwd
+  cd "$(dirname "$0")" || exit 1
+  pwd
 )"
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
@@ -26,12 +26,15 @@ if [ -z "$INIT_ENV" ]; then
 fi
 
 # Only source once (idempotent)
+# NOTE: We intentionally **do not export** any new vars. They stay local to this shell.
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
     __INIT_ENV_LOADED=1
 fi
 
+# shellcheck disable=SC1090
+. "$INIT_ENV"
 # shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1091
@@ -47,90 +50,126 @@ BT_POWER_CYCLE_DELAY="${BT_POWER_CYCLE_DELAY:-10}"
 BT_POWER_ON_ATTEMPTS="${BT_POWER_ON_ATTEMPTS:-2}"
 BT_POWER_ON_RETRY_DELAY="${BT_POWER_ON_RETRY_DELAY:-10}"
 BT_RESTART_SERVICE_ON_RETRY="${BT_RESTART_SERVICE_ON_RETRY:-1}"
+BT_RUNTIME_READY_WAIT="${BT_RUNTIME_READY_WAIT:-20}"
+BT_RUNTIME_RECOVERY_WAIT="${BT_RUNTIME_RECOVERY_WAIT:-40}"
+BT_RUNTIME_RECOVERY_ATTEMPTS="${BT_RUNTIME_RECOVERY_ATTEMPTS:-2}"
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --adapter)
-            BT_ADAPTER="$2"
-            shift 2
-            ;;
-        --power-cycle-delay)
-            BT_POWER_CYCLE_DELAY="$2"
-            shift 2
-            ;;
-        --power-on-attempts)
-            BT_POWER_ON_ATTEMPTS="$2"
-            shift 2
-            ;;
-        --power-on-retry-delay)
-            BT_POWER_ON_RETRY_DELAY="$2"
-            shift 2
-            ;;
-        --restart-service-on-retry)
-            BT_RESTART_SERVICE_ON_RETRY="$2"
-            shift 2
-            ;;
-        *)
-            log_warn "Unknown argument ignored: $1"
-            shift 1
-            ;;
-    esac
+usage() {
+    cat <<EOF_USAGE
+Usage: $0 [options]
+
+Options:
+  --adapter HCI_ADAPTER
+  --power-cycle-delay SECONDS
+  --power-on-attempts COUNT
+  --power-on-retry-delay SECONDS
+  --restart-service-on-retry 0|1
+EOF_USAGE
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --adapter|--power-cycle-delay|--power-on-attempts|--power-on-retry-delay|--restart-service-on-retry)
+                if [ "$#" -lt 2 ]; then
+                    log_error "$1 requires a value"
+                    usage >&2
+                    return 2
+                fi
+
+                case "$1" in
+                    --adapter)
+                        BT_ADAPTER="$2"
+                        ;;
+                    --power-cycle-delay)
+                        BT_POWER_CYCLE_DELAY="$2"
+                        ;;
+                    --power-on-attempts)
+                        BT_POWER_ON_ATTEMPTS="$2"
+                        ;;
+                    --power-on-retry-delay)
+                        BT_POWER_ON_RETRY_DELAY="$2"
+                        ;;
+                    --restart-service-on-retry)
+                        BT_RESTART_SERVICE_ON_RETRY="$2"
+                        ;;
+                esac
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                usage >&2
+                return 2
+                ;;
+        esac
+    done
+}
+
+parse_args "$@" || exit $?
+
+for positive_value in \
+    "$BT_POWER_CYCLE_DELAY" \
+    "$BT_POWER_ON_ATTEMPTS" \
+    "$BT_POWER_ON_RETRY_DELAY" \
+    "$BT_RUNTIME_READY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_ATTEMPTS"
+do
+    if ! is_unsigned_number "$positive_value" || [ "$positive_value" -eq 0 ]; then
+        log_error "Bluetooth retry counts and wait values must be positive integers"
+        exit 2
+    fi
 done
-
-case "$BT_POWER_CYCLE_DELAY" in
-    ''|*[!0-9]*)
-        BT_POWER_CYCLE_DELAY=10
-        ;;
-esac
-
-case "$BT_POWER_ON_ATTEMPTS" in
-    ''|*[!0-9]*)
-        BT_POWER_ON_ATTEMPTS=2
-        ;;
-esac
-
-case "$BT_POWER_ON_RETRY_DELAY" in
-    ''|*[!0-9]*)
-        BT_POWER_ON_RETRY_DELAY=10
-        ;;
-esac
 
 case "$BT_RESTART_SERVICE_ON_RETRY" in
     0|1)
         ;;
     *)
-        BT_RESTART_SERVICE_ON_RETRY=1
+        log_error "--restart-service-on-retry must be 0 or 1"
+        exit 2
         ;;
 esac
 
-if [ "$BT_POWER_ON_ATTEMPTS" -lt 1 ] 2>/dev/null; then
-    BT_POWER_ON_ATTEMPTS=1
-fi
-
-TESTNAME="BT_ON_OFF"
-testpath="$(find_test_case_by_name "$TESTNAME")" || {
-    log_fail "$TESTNAME : Test directory not found."
-    echo "$TESTNAME FAIL" > "./$TESTNAME.res"
+testpath="$(find_test_case_by_name "BT_ON_OFF")" || {
+    log_fail "BT_ON_OFF FAIL - test directory not found"
+    printf '%s\n' "BT_ON_OFF FAIL" >./BT_ON_OFF.res
     exit 1
 }
 
 cd "$testpath" || exit 1
-res_file="./$TESTNAME.res"
-rm -f "$res_file"
+TESTNAME="BT_ON_OFF"
+RES_FILE="./$TESTNAME.res"
+test_result_init "$TESTNAME" "$RES_FILE" || exit 1
 
 log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME Testcase"
 log_info "Config: BT_POWER_CYCLE_DELAY=${BT_POWER_CYCLE_DELAY}s BT_POWER_ON_ATTEMPTS=$BT_POWER_ON_ATTEMPTS BT_POWER_ON_RETRY_DELAY=${BT_POWER_ON_RETRY_DELAY}s BT_RESTART_SERVICE_ON_RETRY=$BT_RESTART_SERVICE_ON_RETRY"
 if ! bt_prepare_ubuntu_stack; then
-    log_fail "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
-    echo "$TESTNAME FAIL" > "$res_file"
-    exit 0
+    test_result_finish "FAIL" "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
 fi
 
 log_info "Checking dependency: bluetoothctl"
 
 # Verify that all necessary dependencies are available.
-check_dependencies bluetoothctl pgrep
+if ! check_dependencies bluetoothctl pgrep; then
+    test_result_finish "SKIP" "$TESTNAME SKIP - required Bluetooth tools are unavailable"
+fi
+
+log_info "Ensuring Bluetooth runtime readiness before power-cycle validation"
+if ! bt_ensure_runtime_ready \
+    "$BT_ADAPTER" \
+    "$BT_RUNTIME_READY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_ATTEMPTS"; then
+    test_result_finish "FAIL" "Bluetooth runtime remained unusable after bounded recovery attempts"
+fi
+
+ADAPTER="$BT_RUNTIME_READY_ADAPTER"
+test_result_record "PASS" "Bluetooth runtime is ready with usable adapter $ADAPTER"
 
 log_info "Checking if bluetoothd is running..."
 MAX_RETRIES=3
@@ -149,16 +188,15 @@ while [ "$retry" -lt "$MAX_RETRIES" ]; do
 done
 
 if [ "$retry" -eq "$MAX_RETRIES" ]; then
-    log_fail "Bluetooth daemon not detected after ${MAX_RETRIES} attempts."
-    echo "$TESTNAME FAIL" > "$res_file"
-    exit 0
+    test_result_finish "FAIL" "Bluetooth daemon was not detected after ${MAX_RETRIES} attempts"
 fi
+
+test_result_record "PASS" "Bluetooth daemon is running"
 
 # -----------------------------
 # Detect adapter with precedence: CLI/ENV > auto-detect
 # -----------------------------
 if [ -n "$BT_ADAPTER" ]; then
-    ADAPTER="$BT_ADAPTER"
     log_info "Using adapter from BT_ADAPTER/CLI: $ADAPTER"
 
     if command -v bt_adapter_is_usable >/dev/null 2>&1; then
@@ -169,14 +207,6 @@ if [ -n "$BT_ADAPTER" ]; then
     fi
 else
     bt_log_hci_candidates || true
- 
-    if command -v bt_select_usable_adapter >/dev/null 2>&1; then
-        ADAPTER="$(bt_select_usable_adapter 2>/dev/null || true)"
-    elif findhcisysfs >/dev/null 2>&1; then
-        ADAPTER="$(findhcisysfs 2>/dev/null || true)"
-    else
-        ADAPTER=""
-    fi
 fi
  
 if [ -n "$ADAPTER" ]; then
@@ -187,16 +217,20 @@ if [ -n "$ADAPTER" ]; then
     fi
 fi
 
+if [ -z "$ADAPTER" ]; then
+    test_result_finish "FAIL" "No usable Bluetooth HCI adapter was found after runtime recovery"
+fi
+
 # Warn/diag if non-interactive "bluetoothctl list" is empty. This is non-fatal.
 btwarniflistempty "$ADAPTER" || true
 
 # Ensure controller is visible to bluetoothctl, trying public-addr if needed.
 if ! bt_ensure_controller_visible "$ADAPTER"; then
     btloghcidiag "$ADAPTER" failure "$testpath" || true
-    log_warn "SKIP — no controller visible to bluetoothctl (HCI RAW/DOWN or attach incomplete)."
-    echo "$TESTNAME SKIP" > "$res_file"
-    exit 0
+    test_result_finish "FAIL" "No controller is visible to bluetoothctl after runtime recovery"
 fi
+
+test_result_record "PASS" "Bluetooth controller is visible to bluetoothctl"
 
 # Read initial power state.
 initial_power="$(btgetpower "$ADAPTER" 2>/dev/null || true)"
@@ -206,22 +240,18 @@ log_info "Initial Powered = $initial_power"
 # ---- Power OFF test ----
 log_info "Powering OFF..."
 if ! btpower "$ADAPTER" off; then
-    log_fail "btpower($ADAPTER, off) failed (command-level error)."
     btloghcidiag "$ADAPTER" failure "$testpath" || true
-    echo "$TESTNAME FAIL" > "$res_file"
-    exit 0
+    test_result_finish "FAIL" "btpower($ADAPTER, off) failed at command level"
 fi
 
 after_off="$(btgetpower "$ADAPTER" 2>/dev/null || true)"
 [ -z "$after_off" ] && after_off="unknown"
 
 if [ "$after_off" = "no" ]; then
-    log_pass "Post-OFF verification: Powered=no (as expected)."
+    test_result_record "PASS" "Post-OFF verification reported Powered=no"
 else
-    log_fail "Post-OFF verification failed (Powered=$after_off)."
     btloghcidiag "$ADAPTER" failure "$testpath" || true
-    echo "$TESTNAME FAIL" > "$res_file"
-    exit 0
+    test_result_finish "FAIL" "Post-OFF verification failed with Powered=$after_off"
 fi
 
 # ---- Power ON test ----
@@ -256,20 +286,12 @@ while [ "$on_attempt" -le "$BT_POWER_ON_ATTEMPTS" ]; do
         log_warn "Preparing controlled Power ON retry after ${BT_POWER_ON_RETRY_DELAY}s"
         sleep "$BT_POWER_ON_RETRY_DELAY"
 
-        if command -v rfkill >/dev/null 2>&1; then
+        if [ "$BT_RESTART_SERVICE_ON_RETRY" -eq 1 ] 2>/dev/null; then
+            bt_recover_runtime "$ADAPTER" || \
+                log_warn "Controlled Bluetooth recovery did not complete before retry"
+        elif command -v rfkill >/dev/null 2>&1; then
             log_info "Running rfkill unblock bluetooth before retry"
             rfkill unblock bluetooth >/dev/null 2>&1 || true
-        elif command -v rfkillunblocksysfs >/dev/null 2>&1; then
-            log_info "Running rfkillunblocksysfs before retry"
-            rfkillunblocksysfs >/dev/null 2>&1 || true
-        else
-            log_warn "No rfkill unblock helper available before retry"
-        fi
-
-        if [ "$BT_RESTART_SERVICE_ON_RETRY" -eq 1 ] 2>/dev/null && command -v systemctl >/dev/null 2>&1; then
-            log_info "Restarting bluetooth.service before retry"
-            systemctl restart bluetooth >/dev/null 2>&1 || log_warn "systemctl restart bluetooth failed"
-            sleep 3
         fi
 
         if command -v bt_ensure_controller_visible >/dev/null 2>&1; then
@@ -287,15 +309,12 @@ if [ "$on_success" -eq 1 ]; then
 
     btwarniflistempty "$ADAPTER" || true
 
-    log_pass "Post-ON verification: Powered=yes (as expected)."
-    echo "$TESTNAME PASS" > "$res_file"
-    exit 0
+    test_result_record "PASS" "Post-ON verification reported Powered=yes"
+    test_result_finish
 fi
 
 after_on="$(btgetpower "$ADAPTER" 2>/dev/null || true)"
 [ -z "$after_on" ] && after_on="unknown"
 
-log_fail "Post-ON verification failed after $BT_POWER_ON_ATTEMPTS attempt(s) (Powered=$after_on)."
 btloghcidiag "$ADAPTER" failure "$testpath" || true
-echo "$TESTNAME FAIL" > "$res_file"
-exit 0
+test_result_finish "FAIL" "Post-ON verification failed after $BT_POWER_ON_ATTEMPTS attempts with Powered=$after_on"

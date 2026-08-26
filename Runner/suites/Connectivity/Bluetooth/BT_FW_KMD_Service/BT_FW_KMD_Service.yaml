@@ -7,10 +7,15 @@ metadata:
   scope:
     - functional
 
+params:
+  BT_ADAPTER: ""
+  BT_RUNTIME_READY_WAIT: "20"
+  BT_RUNTIME_RECOVERY_WAIT: "40"
+  BT_RUNTIME_RECOVERY_ATTEMPTS: "2"
+
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Connectivity/Bluetooth/BT_FW_KMD_Service/
     - ./run.sh || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh BT_FW_KMD_Service.res
-
