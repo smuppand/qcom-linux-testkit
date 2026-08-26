@@ -8,16 +8,15 @@ metadata:
     - functional
 
 params:
-  # Max pairing attempts per device
-  - PAIR_RETRIES: 3
-  # Max scan retries per device before pairing
-  - SCAN_ATTEMPTS: 2
-  # Overrides direct MAC (same format as CLI argument)
-  - BT_MAC_ENV: ""
-  # Overrides device name
-  - BT_NAME_ENV: ""
-  # Comma-separated MACs or names allowed for pairing
-  - BT_WHITELIST_ENV: ""
+  PAIR_RETRIES: "3"
+  SCAN_ATTEMPTS: "2"
+  BT_MAC_ENV: ""
+  BT_NAME_ENV: ""
+  BT_WHITELIST_ENV: ""
+  BT_ADAPTER: ""
+  BT_RUNTIME_READY_WAIT: "20"
+  BT_RUNTIME_RECOVERY_WAIT: "40"
+  BT_RUNTIME_RECOVERY_ATTEMPTS: "2"
 
 run:
   steps:

@@ -1799,6 +1799,7 @@ bt_set_scan() {
 
         off)
             timeout="${BT_SCAN_OFF_TIMEOUT:-5}"
+            discovering_state=""
 
             if command -v log_info >/dev/null 2>&1; then
                 log_info "bt_set_scan(off): running 'bluetoothctl --timeout $timeout scan off'"
@@ -1813,22 +1814,31 @@ bt_set_scan() {
                 done
             fi
 
-            # Treat "already stopped" as success too
+            # Treat an explicitly confirmed stop as success.
             if printf '%s\n' "$out" | grep -q "Discovery stopped"; then
                 sleep 1
                 return 0
             fi
             if printf '%s\n' "$out" | grep -qi "Failed to stop discovery"; then
-                if command -v log_info >/dev/null 2>&1; then
-		    log_info "bt_set_scan(off): BlueZ reported stop failure. Discovering may already be stopped, treating as non-fatal"
+                discovering_state="$(bt_is_discovering 2>/dev/null || true)"
+                [ -n "$discovering_state" ] || discovering_state="unknown"
+
+                if [ "$discovering_state" = "no" ]; then
+                    if command -v log_info >/dev/null 2>&1; then
+                        log_info "bt_set_scan(off): discovery is already stopped, treating scan off as success"
+                    fi
+                    sleep 1
+                    return 0
                 fi
-                sleep 1
-                return 0
             fi
 
             # Fallback: interactive bluetoothctl (needed on minimal/ramdisk)
             if command -v log_warn >/dev/null 2>&1; then
-                log_warn "bt_set_scan(off): non-interactive scan off did not confirm stop; falling back to interactive bluetoothctl."
+                if [ -n "$discovering_state" ]; then
+                    log_warn "bt_set_scan(off): BlueZ failed to stop discovery and state is $discovering_state, falling back to interactive bluetoothctl"
+                else
+                    log_warn "bt_set_scan(off): non-interactive scan off did not confirm stop, falling back to interactive bluetoothctl"
+                fi
             fi
 
             out2="$(btctl_script "scan off" "quit" 2>/dev/null | sanitize_bt_output || true)"
@@ -1837,11 +1847,20 @@ bt_set_scan() {
                 return 0
             fi
             if printf '%s\n' "$out2" | grep -qi "Failed to stop discovery"; then
-                if command -v log_info >/dev/null 2>&1; then
-                    log_info "bt_set_scan(off): discovery already stopped, treating as success"
+                discovering_state="$(bt_is_discovering 2>/dev/null || true)"
+                [ -n "$discovering_state" ] || discovering_state="unknown"
+
+                if [ "$discovering_state" = "no" ]; then
+                    if command -v log_info >/dev/null 2>&1; then
+                        log_info "bt_set_scan(off): discovery is already stopped, treating scan off as success"
+                    fi
+                    sleep 1
+                    return 0
                 fi
-                sleep 1
-                return 0
+
+                if command -v log_warn >/dev/null 2>&1; then
+                    log_warn "bt_set_scan(off): interactive scan off failed and discovery state is $discovering_state"
+                fi
             fi
 
             sleep 1
