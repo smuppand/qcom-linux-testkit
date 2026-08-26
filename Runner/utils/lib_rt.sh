@@ -1947,14 +1947,11 @@ rt_evaluate_baseline_gate() {
 # rt_now_seconds
 # Return monotonic uptime seconds when available.
 # This avoids elapsed-time jumps when wall clock is corrected by NTP/RTC.
+# Delegates to get_monotonic_seconds() from functestlib.sh, which every
+# consumer sources first.
 # ---------------------------------------------------------------------------
 rt_now_seconds() {
-  if [ -r /proc/uptime ]; then
-    awk '{ printf "%d\n", $1 }' /proc/uptime 2>/dev/null
-    return 0
-  fi
-
-  date +%s 2>/dev/null || echo 0
+  get_monotonic_seconds
 }
 
 # ---------------------------------------------------------------------------
