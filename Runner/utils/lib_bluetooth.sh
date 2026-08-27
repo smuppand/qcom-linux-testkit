@@ -638,7 +638,7 @@ bt_scan_devices_interactive_fallback() {
  
     log_warn "bt_scan_devices: trying interactive bluetoothctl fallback on $adapter for ${scan_window}s"
  
-    if command -v timeout >/dev/null 2>&1; then
+    if command -v run_with_timeout >/dev/null 2>&1; then
         fallback_out="$(
             {
                 printf 'select %s\n' "$adapter"
@@ -652,7 +652,7 @@ bt_scan_devices_interactive_fallback() {
                 printf 'devices\n'
                 sleep 1
                 printf 'quit\n'
-            } | timeout "$total_timeout" bluetoothctl 2>&1 | sanitize_bt_output || true
+            } | run_with_timeout "$total_timeout" bluetoothctl 2>&1 | sanitize_bt_output || true
         )"
     else
         fallback_out="$(
@@ -921,10 +921,10 @@ bt_scan_devices() {
             log_warn "bt_scan_devices: btpower($adapter on) did not report success; continuing"
         fi
     else
-        bluetoothctl power on >/dev/null 2>&1 || true
+        run_with_timeout 3 bluetoothctl power on >/dev/null 2>&1 || true
     fi
 
-    bluetoothctl select "$adapter" >/dev/null 2>&1 || true
+    run_with_timeout 3 bluetoothctl select "$adapter" >/dev/null 2>&1 || true
 
     attempt=1
     found_lines=""
@@ -934,9 +934,10 @@ bt_scan_devices() {
 
         live_out="$(
             {
-                bluetoothctl select "$adapter" 2>/dev/null || true
-                bluetoothctl power on 2>/dev/null || true
-                bluetoothctl --timeout "$scan_window" scan on 2>&1 || true
+                run_with_timeout 3 bluetoothctl select "$adapter" 2>/dev/null || true
+                run_with_timeout 3 bluetoothctl power on 2>/dev/null || true
+                run_with_timeout "$((scan_window + 5))" \
+                    bluetoothctl --timeout "$scan_window" scan on 2>&1 || true
             } | sanitize_bt_output
         )"
 
@@ -945,7 +946,7 @@ bt_scan_devices() {
                 log_warn "bt_scan_devices: bt_set_scan(off) reported failure after attempt $attempt"
             fi
         else
-            bluetoothctl scan off >/dev/null 2>&1 || true
+            run_with_timeout 5 bluetoothctl scan off >/dev/null 2>&1 || true
         fi
 
         if command -v bt_list_devices_raw >/dev/null 2>&1; then
@@ -1728,7 +1729,7 @@ btctl_script() {
         BTINTERACTIVEMODELOGGED=1
     fi
 
-    if command -v timeout >/dev/null 2>&1; then
+    if command -v run_with_timeout >/dev/null 2>&1; then
         {
             for line in "$@"; do
                 [ -n "$line" ] || continue
@@ -1736,7 +1737,7 @@ btctl_script() {
                 sleep 0.2
             done
             sleep 1
-        } | timeout 6 bluetoothctl 2>/dev/null
+        } | run_with_timeout 6 bluetoothctl 2>/dev/null
         return $?
     fi
 
@@ -1798,6 +1799,7 @@ bt_set_scan() {
 
         off)
             timeout="${BT_SCAN_OFF_TIMEOUT:-5}"
+            discovering_state=""
 
             if command -v log_info >/dev/null 2>&1; then
                 log_info "bt_set_scan(off): running 'bluetoothctl --timeout $timeout scan off'"
@@ -1812,22 +1814,31 @@ bt_set_scan() {
                 done
             fi
 
-            # Treat "already stopped" as success too
+            # Treat an explicitly confirmed stop as success.
             if printf '%s\n' "$out" | grep -q "Discovery stopped"; then
                 sleep 1
                 return 0
             fi
             if printf '%s\n' "$out" | grep -qi "Failed to stop discovery"; then
-                if command -v log_info >/dev/null 2>&1; then
-		    log_info "bt_set_scan(off): BlueZ reported stop failure. Discovering may already be stopped, treating as non-fatal"
+                discovering_state="$(bt_is_discovering 2>/dev/null || true)"
+                [ -n "$discovering_state" ] || discovering_state="unknown"
+
+                if [ "$discovering_state" = "no" ]; then
+                    if command -v log_info >/dev/null 2>&1; then
+                        log_info "bt_set_scan(off): discovery is already stopped, treating scan off as success"
+                    fi
+                    sleep 1
+                    return 0
                 fi
-                sleep 1
-                return 0
             fi
 
             # Fallback: interactive bluetoothctl (needed on minimal/ramdisk)
             if command -v log_warn >/dev/null 2>&1; then
-                log_warn "bt_set_scan(off): non-interactive scan off did not confirm stop; falling back to interactive bluetoothctl."
+                if [ -n "$discovering_state" ]; then
+                    log_warn "bt_set_scan(off): BlueZ failed to stop discovery and state is $discovering_state, falling back to interactive bluetoothctl"
+                else
+                    log_warn "bt_set_scan(off): non-interactive scan off did not confirm stop, falling back to interactive bluetoothctl"
+                fi
             fi
 
             out2="$(btctl_script "scan off" "quit" 2>/dev/null | sanitize_bt_output || true)"
@@ -1836,11 +1847,20 @@ bt_set_scan() {
                 return 0
             fi
             if printf '%s\n' "$out2" | grep -qi "Failed to stop discovery"; then
-                if command -v log_info >/dev/null 2>&1; then
-                    log_info "bt_set_scan(off): discovery already stopped, treating as success"
+                discovering_state="$(bt_is_discovering 2>/dev/null || true)"
+                [ -n "$discovering_state" ] || discovering_state="unknown"
+
+                if [ "$discovering_state" = "no" ]; then
+                    if command -v log_info >/dev/null 2>&1; then
+                        log_info "bt_set_scan(off): discovery is already stopped, treating scan off as success"
+                    fi
+                    sleep 1
+                    return 0
                 fi
-                sleep 1
-                return 0
+
+                if command -v log_warn >/dev/null 2>&1; then
+                    log_warn "bt_set_scan(off): interactive scan off failed and discovery state is $discovering_state"
+                fi
             fi
 
             sleep 1
@@ -2074,7 +2094,7 @@ btcontrollerpresent() {
 # ret: 0=controller visible, 1=not visible
 # This is just a clearer alias/wrapper if you prefer the name.
 bt_controller_visible() {
-    btcontrollerpresent
+    btcontrollervisible "${1:-}"
 }
 
 # Usage: btensurepublicaddr hci0
@@ -2089,9 +2109,14 @@ btensurepublicaddr() {
     dev="${1:-}"
  
     # Already visible: nothing to do.
-    if btcontrollerpresent || bt_controller_visible "$dev"; then
+    if btcontrollervisible "$dev"; then
         log_info "controller already visible via bluetoothctl, skip public-addr"
         return 0
+    fi
+
+    if ! btbdok "$dev"; then
+        log_warn "Bluetooth adapter ${dev:-<unknown>} has no valid BD address, public-addr cannot be applied"
+        return 2
     fi
  
     mac="$(
@@ -2114,10 +2139,20 @@ quit" >/dev/null 2>&1 || true
  
     # Poll for controller visibility (BlueZ can be async)
     i=0
-    max_wait=15   # was 5; 15 is still small but avoids flakiness
-    while [ "$i" -lt "$max_wait" ]; do
-        if btcontrollerpresent || bt_controller_visible "$dev"; then
-            log_info "controller visible after public-addr $mac (waited ${i}s)"
+    max_wait="${BT_CONTROLLER_VISIBLE_WAIT:-15}"
+
+    case "$max_wait" in
+        ''|*[!0-9]*)
+            max_wait=15
+            ;;
+    esac
+
+    max_attempts=$(((max_wait + 4) / 5))
+    [ "$max_attempts" -gt 0 ] || max_attempts=1
+
+    while [ "$i" -lt "$max_attempts" ]; do
+        if btcontrollervisible "$dev"; then
+            log_info "controller visible after public-addr $mac"
             return 0
         fi
         sleep 1
@@ -2157,7 +2192,9 @@ btcontrollervisible() {
     esac
  
     btctlrun() {
-        if command -v timeout >/dev/null 2>&1; then
+        if command -v run_with_timeout >/dev/null 2>&1; then
+            run_with_timeout 2 bluetoothctl "$@" 2>/dev/null || true
+        elif command -v timeout >/dev/null 2>&1; then
             timeout 2 bluetoothctl "$@" 2>/dev/null || true
         else
             bluetoothctl "$@" 2>/dev/null || true
@@ -2197,7 +2234,7 @@ bt_ensure_controller_visible() {
     adapter="${1:-}"
  
     # Fast path: already visible
-    if btcontrollerpresent || bt_controller_visible "$adapter"; then
+    if btcontrollervisible "$adapter"; then
         return 0
     fi
  
@@ -2217,7 +2254,7 @@ bt_ensure_controller_visible() {
     fi
  
     # Final controller visibility check
-    if btcontrollerpresent || bt_controller_visible "$adapter"; then
+    if btcontrollervisible "$adapter"; then
         return 0
     fi
  
@@ -2495,7 +2532,11 @@ bt_pair_once() {
 # Get current Discovering state from bluetoothctl show.
 # Prints one of: yes | no | unknown
 bt_get_discovering() {
-    out="$(bluetoothctl show 2>/dev/null | sanitize_bt_output | tr -d '\r')"
+    out="$(
+        run_with_timeout 3 bluetoothctl show 2>/dev/null \
+            | sanitize_bt_output \
+            | tr -d '\r'
+    )"
  
     case "$out" in
         *"Discovering: yes"*)
@@ -2535,7 +2576,10 @@ bt_wait_discovering() {
 
 # Raw devices output from bluetoothctl
 bt_list_devices_raw() {
-    out="$(bluetoothctl devices 2>/dev/null | sanitize_bt_output || true)"
+    out="$(
+        run_with_timeout 3 bluetoothctl devices 2>/dev/null \
+            | sanitize_bt_output || true
+    )"
 
     if [ -z "$out" ]; then
         # If controller list is already known-flaky, mark fallback so btctl_script logs once.
@@ -2731,19 +2775,13 @@ btgetpower() {
  
     if [ -n "$mac" ]; then
         out="$(
-            {
-                printf 'show %s\n' "$mac"
-                sleep 1
-                printf 'quit\n'
-            } | bluetoothctl 2>/dev/null | sanitize_bt_output || true
+            btctl_script "show $mac" "quit" 2>/dev/null \
+                | sanitize_bt_output || true
         )"
     else
         out="$(
-            {
-                printf 'show\n'
-                sleep 1
-                printf 'quit\n'
-            } | bluetoothctl 2>/dev/null | sanitize_bt_output || true
+            btctl_script "show" "quit" 2>/dev/null \
+                | sanitize_bt_output || true
         )"
     fi
  
@@ -2761,11 +2799,8 @@ btgetpower() {
     # Fallback: try default controller if adapter-specific attempt didn’t yield Powered:
     if [ -z "$state" ]; then
         out="$(
-            {
-                printf 'show\n'
-                sleep 1
-                printf 'quit\n'
-            } | bluetoothctl 2>/dev/null | sanitize_bt_output || true
+            btctl_script "show" "quit" 2>/dev/null \
+                | sanitize_bt_output || true
         )"
         state="$(printf '%s\n' "$out" \
             | awk -F':[[:space:]]*' '
@@ -2847,11 +2882,8 @@ btpower() {
         # If Powered line is not available yet, try to parse PowerState as an informational fallback
         # (Some stacks lag on Powered; PowerState can show transitions like off-enabling/on-disabling.)
         out="$(
-            {
-                printf 'show\n'
-                sleep 1
-                printf 'quit\n'
-            } | bluetoothctl 2>/dev/null | sanitize_bt_output || true
+            btctl_script "show" "quit" 2>/dev/null \
+                | sanitize_bt_output || true
         )"
  
         pstate="$(printf '%s\n' "$out" \
@@ -2914,57 +2946,215 @@ btfwpresent() {
 }
 
 bt_wait_ready() {
-    max_wait="${1:-60}"
-    sleep_step="${2:-2}"
-    waited=0
-    started_service=0
- 
-    if [ -z "$max_wait" ]; then
-        max_wait=60
+    bt_wr_max_wait="${1:-60}"
+    bt_wr_sleep_step="${2:-2}"
+    bt_wr_requested_adapter="${3:-${BT_ADAPTER:-}}"
+    bt_wr_waited=0
+    bt_wr_started_service=0
+    bt_wr_adapter=""
+
+    BT_RUNTIME_READY_ADAPTER=""
+
+    if [ -z "$bt_wr_max_wait" ]; then
+        bt_wr_max_wait=60
     fi
-    if [ -z "$sleep_step" ]; then
-        sleep_step=2
+    if [ -z "$bt_wr_sleep_step" ]; then
+        bt_wr_sleep_step=2
     fi
- 
-    case "$max_wait" in
+
+    case "$bt_wr_max_wait" in
         ''|*[!0-9]*)
-            max_wait=60
+            bt_wr_max_wait=60
             ;;
     esac
-    case "$sleep_step" in
+    case "$bt_wr_sleep_step" in
         ''|*[!0-9]*)
-            sleep_step=2
+            bt_wr_sleep_step=2
             ;;
     esac
- 
-    if [ "$max_wait" -le 0 ] 2>/dev/null; then
-        max_wait=60
+
+    if [ "$bt_wr_max_wait" -le 0 ] 2>/dev/null; then
+        bt_wr_max_wait=60
     fi
-    if [ "$sleep_step" -le 0 ] 2>/dev/null; then
-        sleep_step=2
+    if [ "$bt_wr_sleep_step" -le 0 ] 2>/dev/null; then
+        bt_wr_sleep_step=2
     fi
- 
-    while [ "$waited" -lt "$max_wait" ]; do
-        if btsvcactive && bthcipresent; then
-            log_info "Bluetooth runtime became ready after ${waited}s."
+
+    while [ "$bt_wr_waited" -le "$bt_wr_max_wait" ]; do
+        if [ -n "$bt_wr_requested_adapter" ]; then
+            bt_wr_adapter="$bt_wr_requested_adapter"
+        else
+            bt_wr_fallback_adapter="$(listhcis 2>/dev/null | sed -n '1p')"
+            bt_wr_adapter="$(
+                listhcis 2>/dev/null |
+                    while IFS= read -r bt_wr_candidate; do
+                        if btbdok "$bt_wr_candidate"; then
+                            printf '%s\n' "$bt_wr_candidate"
+                            break
+                        fi
+                    done
+            )"
+
+            if [ -z "$bt_wr_adapter" ]; then
+                bt_wr_adapter="$bt_wr_fallback_adapter"
+            fi
+        fi
+
+        if btsvcactive &&
+           [ -n "$bt_wr_adapter" ] &&
+           btbdok "$bt_wr_adapter"; then
+            BT_RUNTIME_READY_ADAPTER="$bt_wr_adapter"
+            log_info "Bluetooth runtime became ready after ${bt_wr_waited}s with usable adapter $bt_wr_adapter."
             return 0
         fi
- 
-        if [ "$started_service" -eq 0 ]; then
+
+        if [ "$bt_wr_started_service" -eq 0 ]; then
             if command -v systemctl >/dev/null 2>&1; then
                 if ! btsvcactive; then
                     log_info "Bluetooth service not active yet, attempting start."
                     systemctl start bluetooth.service >/dev/null 2>&1 || true
                 fi
             fi
-            started_service=1
+            bt_wr_started_service=1
         fi
- 
-        sleep "$sleep_step"
-        waited=$((waited + sleep_step))
+
+        if [ "$bt_wr_waited" -eq "$bt_wr_max_wait" ]; then
+            break
+        fi
+
+        bt_wr_delay="$bt_wr_sleep_step"
+        bt_wr_remaining=$((bt_wr_max_wait - bt_wr_waited))
+        if [ "$bt_wr_delay" -gt "$bt_wr_remaining" ]; then
+            bt_wr_delay="$bt_wr_remaining"
+        fi
+
+        sleep "$bt_wr_delay"
+        bt_wr_waited=$((bt_wr_waited + bt_wr_delay))
     done
- 
-    log_warn "Bluetooth runtime did not become ready within ${max_wait}s."
+
+    if [ -n "$bt_wr_adapter" ]; then
+        log_warn "Bluetooth runtime did not become ready within ${bt_wr_max_wait}s, adapter $bt_wr_adapter has no valid BD address"
+    else
+        log_warn "Bluetooth runtime did not become ready within ${bt_wr_max_wait}s, no HCI adapter appeared"
+    fi
+
+    return 1
+}
+
+# Perform one controlled recovery attempt for an incompletely initialized
+# Bluetooth runtime. The controller is left unblocked and bluetooth.service is
+# left running for subsequent tests.
+#
+# Usage:
+#   bt_recover_runtime [ADAPTER]
+bt_recover_runtime() {
+    bt_rr_adapter="${1:-}"
+    bt_rr_action=0
+
+    log_warn "Attempting one controlled Bluetooth runtime recovery"
+
+    if command -v rfkill >/dev/null 2>&1; then
+        log_info "Cycling the Bluetooth software rfkill state"
+        rfkill block bluetooth >/dev/null 2>&1 || true
+        sleep 2
+        rfkill unblock bluetooth >/dev/null 2>&1 || true
+        sleep 2
+        bt_rr_action=1
+    elif command -v rfkillunblocksysfs >/dev/null 2>&1; then
+        log_info "Unblocking Bluetooth through sysfs"
+        rfkillunblocksysfs >/dev/null 2>&1 || true
+        bt_rr_action=1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        log_info "Restarting bluetooth.service after the recovery attempt"
+        if command -v run_with_timeout >/dev/null 2>&1; then
+            run_with_timeout 15 \
+                systemctl restart bluetooth.service >/dev/null 2>&1 || true
+        else
+            systemctl restart bluetooth.service >/dev/null 2>&1 || true
+        fi
+        bt_rr_action=1
+    fi
+
+    if [ -n "$bt_rr_adapter" ] && command -v hciconfig >/dev/null 2>&1; then
+        hciconfig "$bt_rr_adapter" up >/dev/null 2>&1 || true
+        bt_rr_action=1
+    fi
+
+    if [ "$bt_rr_action" -eq 0 ]; then
+        log_warn "No supported Bluetooth recovery mechanism is available"
+        return 1
+    fi
+
+    return 0
+}
+
+# Ensure Bluetooth reaches a usable state, including bounded recovery retries.
+# A usable runtime has an active service and an HCI adapter with a valid,
+# non-zero BD address. BT_RUNTIME_RECOVERED and BT_RUNTIME_READY_ADAPTER are
+# updated for callers that want to report whether recovery was required.
+#
+# Usage:
+#   bt_ensure_runtime_ready [ADAPTER] [INITIAL_WAIT] [RECOVERY_WAIT] [ATTEMPTS]
+bt_ensure_runtime_ready() {
+    bt_err_adapter="${1:-${BT_ADAPTER:-}}"
+    bt_err_initial_wait="${2:-${BT_RUNTIME_READY_WAIT:-20}}"
+    bt_err_recovery_wait="${3:-${BT_RUNTIME_RECOVERY_WAIT:-40}}"
+    bt_err_attempts="${4:-${BT_RUNTIME_RECOVERY_ATTEMPTS:-2}}"
+    bt_err_attempt=1
+
+    # Exported result state for suite callers.
+    # shellcheck disable=SC2034
+    BT_RUNTIME_RECOVERED=0
+    # shellcheck disable=SC2034
+    BT_RUNTIME_READY_ADAPTER=""
+
+    for bt_err_value in \
+        "$bt_err_initial_wait" \
+        "$bt_err_recovery_wait" \
+        "$bt_err_attempts"
+    do
+        case "$bt_err_value" in
+            ''|*[!0-9]*|0)
+                log_error "Bluetooth readiness waits and attempts must be positive integers"
+                return 2
+                ;;
+        esac
+    done
+
+    if bt_wait_ready "$bt_err_initial_wait" 2 "$bt_err_adapter"; then
+        return 0
+    fi
+
+    while [ "$bt_err_attempt" -le "$bt_err_attempts" ]; do
+        log_warn "Bluetooth recovery attempt $bt_err_attempt/$bt_err_attempts"
+
+        bt_err_recovery_adapter="$bt_err_adapter"
+        if [ -z "$bt_err_recovery_adapter" ]; then
+            bt_err_recovery_adapter="$(listhcis 2>/dev/null | sed -n '1p')"
+        fi
+
+        if bt_recover_runtime "$bt_err_recovery_adapter"; then
+            log_info "Waiting up to ${bt_err_recovery_wait}s after Bluetooth recovery"
+
+            if bt_wait_ready \
+                "$bt_err_recovery_wait" \
+                2 \
+                "$bt_err_adapter"; then
+                # shellcheck disable=SC2034
+                BT_RUNTIME_RECOVERED=1
+                log_warn "Bluetooth runtime recovered on attempt $bt_err_attempt"
+                return 0
+            fi
+        else
+            log_warn "Bluetooth recovery attempt $bt_err_attempt could not perform a recovery action"
+        fi
+
+        bt_err_attempt=$((bt_err_attempt + 1))
+    done
+
+    log_error "Bluetooth runtime remained unusable after $bt_err_attempts controlled recovery attempts"
     return 1
 }
 

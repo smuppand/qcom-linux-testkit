@@ -7,10 +7,19 @@ metadata:
   scope:
     - functional
 
+params:
+  BT_ADAPTER: ""
+  BT_TARGET_MAC: ""
+  BT_SCAN_SECONDS: "15"
+  BT_SCAN_RETRIES: "3"
+  BT_SCAN_RETRY_DELAY: "2"
+  BT_RUNTIME_READY_WAIT: "20"
+  BT_RUNTIME_RECOVERY_WAIT: "40"
+  BT_RUNTIME_RECOVERY_ATTEMPTS: "2"
+
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Connectivity/Bluetooth/BT_SCAN/
-    - ./run.sh || true
+    - ./run.sh --target-mac "${BT_TARGET_MAC}" --scan-seconds "${BT_SCAN_SECONDS}" --scan-retries "${BT_SCAN_RETRIES}" --scan-retry-delay "${BT_SCAN_RETRY_DELAY}" || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh BT_SCAN.res
-

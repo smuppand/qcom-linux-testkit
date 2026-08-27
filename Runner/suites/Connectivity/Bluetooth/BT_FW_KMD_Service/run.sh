@@ -4,7 +4,7 @@
 # BT_FW_KMD_Service - Bluetooth FW + KMD + service + controller infra validation
 # Non-expect version, using lib_bluetooth.sh helpers.
 
-# ---------- init_env + tools ----------
+# ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
   cd "$(dirname "$0")" || exit 1
   pwd
@@ -25,12 +25,16 @@ if [ -z "$INIT_ENV" ]; then
     exit 1
 fi
 
+# Only source once (idempotent)
+# NOTE: We intentionally **do not export** any new vars. They stay local to this shell.
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
     __INIT_ENV_LOADED=1
 fi
 
+# shellcheck disable=SC1090
+. "$INIT_ENV"
 # shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1091
@@ -38,63 +42,111 @@ fi
 
 # ---------- CLI / env parameters ----------
 BT_ADAPTER="${BT_ADAPTER-}"
+BT_RUNTIME_READY_WAIT="${BT_RUNTIME_READY_WAIT:-20}"
+BT_RUNTIME_RECOVERY_WAIT="${BT_RUNTIME_RECOVERY_WAIT:-40}"
+BT_RUNTIME_RECOVERY_ATTEMPTS="${BT_RUNTIME_RECOVERY_ATTEMPTS:-2}"
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --adapter)
-            BT_ADAPTER="$2"
-            shift 2
-            ;;
-        *)
-            log_warn "Unknown argument ignored: $1"
-            shift 1
-            ;;
-    esac
+usage() {
+    cat <<EOF_USAGE
+Usage: $0 [--adapter HCI_ADAPTER]
+
+Environment:
+  BT_RUNTIME_READY_WAIT     Initial usable-controller wait, default: 20
+  BT_RUNTIME_RECOVERY_WAIT  Wait after one recovery attempt, default: 40
+  BT_RUNTIME_RECOVERY_ATTEMPTS Recovery attempts after initial wait, default: 2
+  BT_CONTROLLER_VISIBLE_WAIT Controller visibility wait budget, default: 15
+EOF_USAGE
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --adapter)
+                if [ "$#" -lt 2 ]; then
+                    log_error "--adapter requires an HCI adapter"
+                    usage >&2
+                    return 2
+                fi
+
+                BT_ADAPTER="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                usage >&2
+                return 2
+                ;;
+        esac
+    done
+}
+
+parse_args "$@" || exit $?
+
+for wait_value in \
+    "$BT_RUNTIME_READY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_ATTEMPTS"
+do
+    if ! is_unsigned_number "$wait_value" || [ "$wait_value" -eq 0 ]; then
+        log_error "Bluetooth runtime wait values must be positive integers"
+        exit 2
+    fi
 done
 
-TESTNAME="BT_FW_KMD_Service"
-testpath="$(find_test_case_by_name "$TESTNAME")" || {
-    log_fail "$TESTNAME : Test directory not found."
-    echo "$TESTNAME FAIL" > "./$TESTNAME.res"
+testpath="$(find_test_case_by_name "BT_FW_KMD_Service")" || {
+    log_fail "BT_FW_KMD_Service FAIL - test directory not found"
+    printf '%s\n' "BT_FW_KMD_Service FAIL" >"./BT_FW_KMD_Service.res"
     exit 1
 }
 
 cd "$testpath" || exit 1
+TESTNAME="BT_FW_KMD_Service"
 RES_FILE="./${TESTNAME}.res"
-rm -f "$RES_FILE"
+test_result_init "$TESTNAME" "$RES_FILE" || exit 1
 
-FAIL_COUNT=0
 WARN_COUNT=0
-
-inc_fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); }
-inc_warn() { WARN_COUNT=$((WARN_COUNT + 1)); }
 
 log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME"
 
 if ! bt_prepare_ubuntu_stack; then
-    log_fail "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
-    echo "$TESTNAME FAIL" > "$RES_FILE"
-    exit 0
+    test_result_finish "FAIL" "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
 fi
 
 log_info "Checking dependencies: bluetoothctl hciconfig lsmod"
 if ! check_dependencies bluetoothctl hciconfig lsmod; then
-    echo "$TESTNAME SKIP" > "$RES_FILE"
-    exit 0
+    test_result_finish "SKIP" "$TESTNAME SKIP - required Bluetooth tools are unavailable"
 fi
 
 # ---------- Bluetooth runtime check/ readiness ----------
-log_info "Waiting for Bluetooth runtime readiness..."
-bt_wait_ready 60 2 || true
+log_info "Waiting up to ${BT_RUNTIME_READY_WAIT}s for a usable Bluetooth runtime"
+if bt_ensure_runtime_ready \
+    "$BT_ADAPTER" \
+    "$BT_RUNTIME_READY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_WAIT" \
+    "$BT_RUNTIME_RECOVERY_ATTEMPTS"; then
+    if [ "$BT_RUNTIME_RECOVERED" -eq 1 ]; then
+        WARN_COUNT=$((WARN_COUNT + 1))
+        test_result_record "PASS" "Bluetooth runtime recovered with a valid HCI adapter"
+    else
+        test_result_record "PASS" "Bluetooth runtime exposed an HCI adapter with a valid BD address"
+    fi
+else
+    test_result_record "FAIL" "Bluetooth runtime remained unusable after bounded recovery attempts"
+fi
+
+ADAPTER="$BT_RUNTIME_READY_ADAPTER"
 
 # ---------- Bluetooth service / daemon ----------
 log_info "Checking if bluetoothd (or bluetooth.service) is running..."
 if btsvcactive; then
-    log_pass "Bluetooth service/daemon active."
+    test_result_record "PASS" "Bluetooth service/daemon active"
 else
-    log_fail "Bluetooth service/daemon NOT active."
-    inc_fail
+    test_result_record "FAIL" "Bluetooth service/daemon is not active"
 fi
 
 # ---------- DT node / compatible ----------
@@ -109,10 +161,11 @@ if dt_confirm_node_or_compatible_all \
     "qcom,bluetooth" \
     "pcie-m2-e-connector"
 then
-    log_pass "DT node/compatible for BT or an M.2 E-key connector is present."
+    test_result_record "PASS" "DT node/compatible for BT or an M.2 E-key connector is present"
 else
-    dt_runtime_adapter=""
-    if command -v bt_select_usable_adapter >/dev/null 2>&1; then
+    dt_runtime_adapter="$ADAPTER"
+    if [ -z "$dt_runtime_adapter" ] && \
+       command -v bt_select_usable_adapter >/dev/null 2>&1; then
         dt_runtime_adapter="$(bt_select_usable_adapter 2>/dev/null || true)"
     fi
 
@@ -121,15 +174,15 @@ else
     else
         log_warn "No static BT DT node or M.2 E-key connector found, deferring the verdict to the authoritative KMD, HCI, service, firmware, and controller checks below (GH#533)."
     fi
-    inc_warn
+    WARN_COUNT=$((WARN_COUNT + 1))
 fi
 
 # ---------- Firmware presence ----------
 if fw_dir="$(btfwpresent 2>/dev/null)"; then
-    log_pass "Firmware present in: $fw_dir"
+    test_result_record "PASS" "Firmware present in: $fw_dir"
 else
     log_warn "No BT firmware matching msbtfw*/msnv* or cmbtfw*/cmnv* found under standard firmware paths."
-    inc_warn
+    WARN_COUNT=$((WARN_COUNT + 1))
 fi
 
 # -----------------------------
@@ -161,15 +214,16 @@ if command -v btfwloaded >/dev/null 2>&1; then
     rc=$?
     case "$rc" in
         0)
-            log_pass "Firmware load/setup appears completed (kernel log)."
+            test_result_record "PASS" "Firmware load/setup appears completed in the kernel log"
             ;;
         2)
             log_warn "Firmware load/setup completed after retry, transient errors seen earlier (kernel log)."
-            inc_warn
+            WARN_COUNT=$((WARN_COUNT + 1))
+            test_result_record "PASS" "Firmware load/setup completed after a transient retry"
             ;;
         *)
             runtime_bt_ok=1
-            fallback_adapter="$BT_ADAPTER"
+            fallback_adapter="$ADAPTER"
 
             if [ -z "$fallback_adapter" ] && findhcisysfs >/dev/null 2>&1; then
                 fallback_adapter="$(findhcisysfs 2>/dev/null || true)"
@@ -192,53 +246,52 @@ if command -v btfwloaded >/dev/null 2>&1; then
 
             if [ "$runtime_bt_ok" -eq 1 ]; then
                 log_warn "No retained BT firmware-load signature found, but BT runtime state is healthy."
-                inc_warn
+                WARN_COUNT=$((WARN_COUNT + 1))
             else
-                log_fail "Firmware load/setup does NOT look clean and BT runtime state is also unhealthy."
-                inc_fail
+                test_result_record "FAIL" "Firmware load/setup is incomplete and Bluetooth runtime state is unhealthy"
             fi
             ;;
     esac
 else
     # No SKIP: continue test, just warn.
     log_warn "btfwloaded() helper not available, firmware-load kernel-log validation not performed."
-    inc_warn
+    WARN_COUNT=$((WARN_COUNT + 1))
 fi
 
 # ---------- Kernel modules / KMD ----------
 if btkmdpresent; then
-    log_pass "Kernel BT driver stack present (bluetooth/hci_uart/btqca or built-in)."
+    test_result_record "PASS" "Kernel BT driver stack is present"
 else
-    log_fail "Kernel BT driver stack not detected (no bluetooth/hci_uart/btqca in sysfs/dmesg)."
-    inc_fail
+    test_result_record "FAIL" "Kernel BT driver stack was not detected"
 fi
 
 # ---------- HCI presence ----------
 if bthcipresent; then
-    log_pass "HCI present in /sys/class/bluetooth."
+    test_result_record "PASS" "HCI is present in /sys/class/bluetooth"
 else
-    log_fail "No /sys/class/bluetooth/hci* found (HCI not up)."
-    inc_fail
+    test_result_record "FAIL" "No HCI adapter was found in /sys/class/bluetooth"
 fi
 
 # --- Bluetooth service / daemon check via btsvcactive() ---
 if btsvcactive; then
-    log_pass "Bluetooth service active (systemd bluetooth.service or bluetoothd)."
+    test_result_record "PASS" "Bluetooth service remains active"
 else
     log_warn "Bluetooth service is not active (bluetooth.service inactive and bluetoothd not running)."
-    inc_warn
+    WARN_COUNT=$((WARN_COUNT + 1))
 fi
 
 # -----------------------------
 # Detect adapter (CLI/ENV > auto-detect)
 # -----------------------------
-if [ -n "$BT_ADAPTER" ]; then
-    ADAPTER="$BT_ADAPTER"
-    log_info "Using adapter from BT_ADAPTER/CLI: $ADAPTER"
-elif findhcisysfs >/dev/null 2>&1; then
-    ADAPTER="$(findhcisysfs 2>/dev/null || true)"
-else
-    ADAPTER=""
+if [ -z "$ADAPTER" ]; then
+    if [ -n "$BT_ADAPTER" ]; then
+        ADAPTER="$BT_ADAPTER"
+        log_info "Using adapter from BT_ADAPTER/CLI: $ADAPTER"
+    elif findhcisysfs >/dev/null 2>&1; then
+        ADAPTER="$(findhcisysfs 2>/dev/null || true)"
+    else
+        ADAPTER=""
+    fi
 fi
 
 if [ -n "$ADAPTER" ]; then
@@ -251,21 +304,19 @@ fi
 
 if [ -z "$ADAPTER" ]; then
     log_warn "No HCI adapter found."
- 
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-        echo "$TESTNAME FAIL" > "$RES_FILE"
+
+    if [ "$TEST_RESULT_FAIL_COUNT" -gt 0 ]; then
+        test_result_finish
     else
-        echo "$TESTNAME SKIP" > "$RES_FILE"
+        test_result_finish "SKIP" "$TESTNAME SKIP - no HCI adapter was found"
     fi
-    exit 0
 fi
 # ---------- BD address sanity check ----------
 if [ -n "$ADAPTER" ]; then
     if btbdok "$ADAPTER"; then
-        log_pass "BD address sane for $ADAPTER (not all zeros)."
+        test_result_record "PASS" "BD address is valid for $ADAPTER"
     else
-        log_fail "BD address invalid or all zeros for $ADAPTER."
-        inc_fail
+        test_result_record "FAIL" "BD address is invalid or all zeros for $ADAPTER"
     fi
 fi
 
@@ -278,11 +329,11 @@ if [ -n "$ADAPTER" ]; then
         # For this infra test we treat this as WARN, not FAIL:
         # stack is otherwise OK (firmware, KMD, HCI, BD).
         log_warn "No controller in 'bluetoothctl list' (controller not fully instantiated)."
-        inc_warn
+        WARN_COUNT=$((WARN_COUNT + 1))
     fi
 else
     log_warn "Controller visibility not checked (no adapter determined)."
-    inc_warn
+    WARN_COUNT=$((WARN_COUNT + 1))
 fi
 
 # ---------- Optional: dump some useful diagnostics ----------
@@ -291,12 +342,15 @@ if command -v hciconfig >/dev/null 2>&1; then
     hciconfig -a || true
 else
     log_warn "hciconfig command not available."
-    inc_warn
+    WARN_COUNT=$((WARN_COUNT + 1))
 fi
 
 log_info "=== bluetoothctl list (controllers) ==="
 
-out="$(bluetoothctl list 2>/dev/null | sanitize_bt_output || true)"
+out="$(
+    run_with_timeout 3 bluetoothctl list 2>/dev/null \
+        | sanitize_bt_output || true
+)"
 if printf '%s\n' "$out" | grep -qi '^[[:space:]]*Controller[[:space:]]'; then
     # Non-interactive worked print what we got
     printf '%s\n' "$out"
@@ -312,12 +366,5 @@ log_info "=== lsmod (subset: BT stack) ==="
 lsmod 2>/dev/null | grep -E '^(bluetooth|hci_uart|btqca|btbcm|rfkill|cfg80211)\b' || true
 
 # ---------- Final result ----------
-log_info "Completed with WARN=${WARN_COUNT}, FAIL=${FAIL_COUNT}"
-
-if [ "$FAIL_COUNT" -gt 0 ]; then
-    echo "$TESTNAME FAIL" > "$RES_FILE"
-else
-    echo "$TESTNAME PASS" > "$RES_FILE"
-fi
-
-exit 0
+log_info "Completed with WARN=${WARN_COUNT}, FAIL=${TEST_RESULT_FAIL_COUNT}"
+test_result_finish

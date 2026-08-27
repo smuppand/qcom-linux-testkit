@@ -13,10 +13,13 @@ params:
   BT_POWER_ON_ATTEMPTS: "2"
   BT_POWER_ON_RETRY_DELAY: "10"
   BT_RESTART_SERVICE_ON_RETRY: "1"
+  BT_RUNTIME_READY_WAIT: "20"
+  BT_RUNTIME_RECOVERY_WAIT: "40"
+  BT_RUNTIME_RECOVERY_ATTEMPTS: "2"
 
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Connectivity/Bluetooth/BT_ON_OFF
-    - ./run.sh --adapter "${BT_ADAPTER}" --power-cycle-delay "${BT_POWER_CYCLE_DELAY}" --power-on-attempts "${BT_POWER_ON_ATTEMPTS}" --power-on-retry-delay "${BT_POWER_ON_RETRY_DELAY}" --restart-service-on-retry "${BT_RESTART_SERVICE_ON_RETRY}" || true
+    - ./run.sh --power-cycle-delay "${BT_POWER_CYCLE_DELAY}" --power-on-attempts "${BT_POWER_ON_ATTEMPTS}" --power-on-retry-delay "${BT_POWER_ON_RETRY_DELAY}" --restart-service-on-retry "${BT_RESTART_SERVICE_ON_RETRY}" || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh BT_ON_OFF.res
