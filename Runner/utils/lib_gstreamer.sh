@@ -73,6 +73,22 @@ GST_CODEC_FAULT_RE="${GST_CODEC_FAULT_RE:-(qcom-iris|qcom-venus|venus_core|video
 # elsewhere. Callers that want a different location get a different TMPDIR.
 GST_ELEM_CACHE_DIR="${TMPDIR:-/tmp}/gst-elem-cache-$$"
 
+# Where the codec-fault evidence is kept, and what scan_dmesg_errors() is asked
+# to look at when producing it. The module pattern has to tolerate the driver
+# name and the device node sharing one field ("qcom-iris aa00000.video-codec:"),
+# which is why each alternative reaches up to the colon.
+#
+# Declared after GST_ELEM_CACHE_DIR because the default derives from it: read
+# any earlier it would expand to the empty string, putting the snapshot at
+# /dmesg_snapshot.log and quietly disabling fault classification.
+#
+# Defaults to the probe cache dir so the library is usable on its own; the suite
+# points GST_CODEC_DMESG_DIR at its own dmesg directory so the snapshot and the
+# filtered error log are kept with the rest of the run's artifacts.
+GST_CODEC_DMESG_DIR="${GST_CODEC_DMESG_DIR:-$GST_ELEM_CACHE_DIR}"
+GST_CODEC_MODULE_RE="${GST_CODEC_MODULE_RE:-qcom-iris[^:]*|qcom-venus[^:]*|venus_core[^:]*|[^ ]*video-codec}"
+GST_CODEC_DMESG_EXCLUDE="${GST_CODEC_DMESG_EXCLUDE:-dummy regulator|supply [^ ]+ not found|using dummy regulator}"
+
 # Optional env overrides (set by run.sh)
 # GST_ALSA_PLAYBACK_DEVICE=hw:0,0
 # GST_ALSA_CAPTURE_DEVICE=hw:0,1
@@ -325,12 +341,49 @@ gstreamer_probe_reason() {
   esac
 }
 
+# gstreamer_codec_dmesg_snapshot
+# Prints the path of the run's dmesg snapshot, capturing it once and reusing it
+# thereafter. This is the single authoritative capture for the run: the codec
+# probes classify against it and the suite's end-of-run check reports from the
+# error log taken alongside it, so the live ring buffer is read exactly once no
+# matter how many elements are probed.
+#
+# Goes through scan_dmesg_errors() so the snapshot and the filtered error log
+# are the suite's standard artifacts rather than a private copy, which keeps the
+# evidence for a classification on disk next to the run's other logs. Falls back
+# to a plain capture only where that helper is unavailable.
+#
+# scan_dmesg_errors() logs on stdout, and the codec lookups run inside command
+# substitution, so its output is sent to stderr here; letting it reach stdout
+# would splice log text into the element name the caller is resolving.
+gstreamer_codec_dmesg_snapshot() {
+  [ -n "$GST_CODEC_DMESG_DIR" ] || return 1
+  snap_file="$GST_CODEC_DMESG_DIR/dmesg_snapshot.log"
+  if [ -s "$snap_file" ]; then
+    printf '%s\n' "$snap_file"
+    return 0
+  fi
+  command -v dmesg >/dev/null 2>&1 || return 1
+  mkdir -p "$GST_CODEC_DMESG_DIR" 2>/dev/null || return 1
+  if command -v scan_dmesg_errors >/dev/null 2>&1; then
+    scan_dmesg_errors "$GST_CODEC_DMESG_DIR" "$GST_CODEC_MODULE_RE" \
+      "$GST_CODEC_DMESG_EXCLUDE" >&2 2>&2 || true
+  fi
+  if [ ! -s "$snap_file" ]; then
+    dmesg > "$snap_file" 2>/dev/null || true
+  fi
+  [ -s "$snap_file" ] || return 1
+  printf '%s\n' "$snap_file"
+}
+
 # gstreamer_codec_hw_faulted
 # True when the kernel log shows a video codec driver failing to come up,
 # either by failing to load its firmware or by failing to probe at all.
+# Reads the run's snapshot, so every probe classifies against the same evidence
+# and that evidence outlives the run.
 gstreamer_codec_hw_faulted() {
-  command -v dmesg >/dev/null 2>&1 || return 1
-  dmesg 2>/dev/null | grep -Eqi "$GST_CODEC_FAULT_RE"
+  hwf_snap=$(gstreamer_codec_dmesg_snapshot) || return 1
+  grep -Eqi "$GST_CODEC_FAULT_RE" "$hwf_snap"
 }
 
 # gstreamer_refine_codec_probe <rc>

@@ -67,6 +67,13 @@ if ! mkdir -p "$OUTDIR" "$DMESG_DIR" "$ENCODED_DIR"; then
   exit 0
 fi
 
+# Keep the codec-fault evidence with the run's artifacts, and widen the module
+# filter to the set this suite cares about so the single capture below serves
+# both the codec classification and the end-of-run check.
+GST_CODEC_DMESG_DIR="$DMESG_DIR"
+GST_CODEC_MODULE_RE="qcom-iris[^:]*|qcom-venus[^:]*|venus_core[^:]*|[^ ]*video-codec|venus[^:]*|vcodec[^:]*|v4l2[^:]*|video[^:]*|gstreamer[^:]*"
+export GST_CODEC_DMESG_DIR GST_CODEC_MODULE_RE
+
 : >"$RES_FILE"
 : >"$GST_LOG"
 
@@ -741,20 +748,19 @@ log_info "=========================================="
 log_info "DMESG ERROR SCAN"
 log_info "=========================================="
 
-# Scan for video-related errors in dmesg
-module_regex="venus|vcodec|v4l2|video|gstreamer"
-exclude_regex="dummy regulator|supply [^ ]+ not found|using dummy regulator"
-
-if command -v scan_dmesg_errors >/dev/null 2>&1; then
-  scan_dmesg_errors "$DMESG_DIR" "$module_regex" "$exclude_regex" || true
-  
+# Report from the run's single dmesg capture rather than re-reading the live
+# buffer. gstreamer_codec_dmesg_snapshot() takes it the first time a codec is
+# classified and is a no-op afterwards, so the errors reported here are the same
+# evidence the codec verdicts were based on.
+if gstreamer_codec_dmesg_snapshot >/dev/null 2>&1; then
+  log_info "dmesg snapshot: $DMESG_DIR/dmesg_snapshot.log"
   if [ -s "$DMESG_DIR/dmesg_errors.log" ]; then
     log_warn "dmesg scan found video-related warnings or errors in $DMESG_DIR/dmesg_errors.log"
   else
     log_info "No relevant video-related errors found in dmesg"
   fi
 else
-  log_info "scan_dmesg_errors not available, skipping dmesg scan"
+  log_info "dmesg snapshot unavailable, skipping dmesg scan"
 fi
 
 # -------------------- Summary --------------------
