@@ -897,8 +897,9 @@ pw_sink_is_real_audio() {
   return 0
 }
 
-# Prefer speaker or headphone sinks, then any physical audio sink. Do not use a
-# PipeWire dummy sink as a successful speakers route.
+# Prefer speaker sinks before other physical outputs. Headphones are only a
+# fallback for speakers, so a listed headphone does not override a speaker.
+# Do not use a PipeWire dummy sink as a successful speakers route.
 pw_default_speakers() {
   st="$(pwctl_status_safe 2>/dev/null)" || {
     printf '%s\n' ""
@@ -906,9 +907,19 @@ pw_default_speakers() {
   }
 
   block="$(printf '%s\n' "$st" | sed -n '/Sinks:/,/Sources:/p')"
-  preferred_ids="$(
+  speaker_ids="$(
     printf '%s\n' "$block" |
-      grep -Ei 'speaker|headphone|line[._ -]*out|analog|hdmi' |
+      grep -Ei 'speaker' |
+      sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p'
+  )"
+  output_ids="$(
+    printf '%s\n' "$block" |
+      grep -Ei 'line[._ -]*out|analog|hdmi' |
+      sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p'
+  )"
+  headphone_ids="$(
+    printf '%s\n' "$block" |
+      grep -Ei 'headphone' |
       sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p'
   )"
   all_ids="$(
@@ -917,7 +928,7 @@ pw_default_speakers() {
   )"
   checked_ids=""
 
-  for id in $preferred_ids $all_ids; do
+  for id in $speaker_ids $output_ids $headphone_ids $all_ids; do
     case " $checked_ids " in
       *" $id "*)
         continue
@@ -1084,10 +1095,12 @@ pw_source_label_safe() {
 }
 # ---------- PulseAudio: sinks (playback) ----------
 pa_default_speakers() {
-  def="$(pactl info 2>/dev/null | sed -n 's/^Default Sink:[[:space:]]*//p' | head -n1)"
-  if [ -n "$def" ]; then printf '%s\n' "$def"; return 0; fi
-  name="$(pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -i 'speaker\|head' | head -n1)"
-  [ -n "$name" ] || name="$(pactl list short sinks 2>/dev/null | awk '{print $2}' | head -n1)"
+  sinks="$(pactl list short sinks 2>/dev/null)"
+  name="$(printf '%s\n' "$sinks" | awk '{print $2}' | grep -i 'speaker' | head -n1)"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sinks" | awk '{print $2}' | grep -Ei 'line[._ -]*out|analog|hdmi' | head -n1)"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sinks" | awk '{print $2}' | grep -i 'headphone' | head -n1)"
+  [ -n "$name" ] || name="$(pactl info 2>/dev/null | sed -n 's/^Default Sink:[[:space:]]*//p' | head -n1)"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sinks" | awk '{print $2}' | head -n1)"
   printf '%s\n' "$name"
 }
 
@@ -4929,7 +4942,13 @@ audio_prepare_audioreach_udev_rule() {
 #   qcom-distro/Yocto - strict no-op
 #   Debian base       - ensure the mapped audio-base package set
 #   Debian overlay    - ensure audio-base and Debian AudioReach package sets
+#   Ubuntu server     - ensure ALSA utilities
+#   Ubuntu desktop    - ensure ALSA, PipeWire, PipeWire-Pulse, and WirePlumber
 #   other distros     - no-op until their package mappings are verified
+#
+# Environment:
+#   AUDIO_PACKAGE_PROFILE=auto|server|desktop
+#   AUDIO_PACKAGE_UPDATE=1 to upgrade installed mapped Ubuntu packages
 #
 # Return:
 #   0 - ready or not applicable
@@ -4980,7 +4999,7 @@ audio_prepare_test_packages() {
       log_info "Native image detected, Audio package preparation is not required"
       return 0
       ;;
-    debian)
+    debian|ubuntu)
       ;;
     *)
       log_info "Audio package preparation is not enabled for os=$atp_os_id"
@@ -4988,13 +5007,75 @@ audio_prepare_test_packages() {
       ;;
   esac
  
-  # Debian package preparation must run before the test is re-executed as the
-  # unprivileged Audio user.
+  # Debian and Ubuntu package preparation must run from root orchestration.
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-    log_fail "Debian Audio package preparation must run as root"
+    log_fail "Audio package preparation must run as root, os=$atp_os_id"
     return 1
   fi
- 
+
+  if [ "$atp_os_id" = "ubuntu" ]; then
+    atp_ubuntu_profile="${AUDIO_PACKAGE_PROFILE:-auto}"
+
+    case "$atp_ubuntu_profile" in
+      auto|server|desktop)
+        ;;
+      *)
+        log_fail "Invalid AUDIO_PACKAGE_PROFILE: $atp_ubuntu_profile"
+        return 1
+        ;;
+    esac
+
+    if [ "$atp_ubuntu_profile" = "auto" ]; then
+      if command -v systemctl >/dev/null 2>&1 &&
+         systemctl is-active --quiet graphical.target 2>/dev/null; then
+        atp_ubuntu_profile="desktop"
+      else
+        atp_ubuntu_profile="server"
+      fi
+    fi
+
+    if [ "${AUDIO_PACKAGE_UPDATE:-0}" = "1" ]; then
+      PKG_PACKAGE_SET_UPGRADE=1
+      export PKG_PACKAGE_SET_UPGRADE
+      log_info "Ubuntu Audio package update is enabled"
+    fi
+
+    if ! command -v pkg_ensure_required_package_set_present \
+        >/dev/null 2>&1; then
+      log_fail "Required package-set helper is unavailable"
+      return 1
+    fi
+
+    if ! pkg_ensure_required_package_set_present audio-base; then
+      log_fail "Failed to ensure Ubuntu Audio base package set"
+      return 1
+    fi
+
+    if [ "$atp_ubuntu_profile" = "desktop" ] &&
+       ! pkg_ensure_required_package_set_present audio-desktop; then
+      log_fail "Failed to ensure Ubuntu desktop Audio package set"
+      return 1
+    fi
+
+    if command -v modinfo >/dev/null 2>&1 &&
+       modinfo snd-soc-wcd938x >/dev/null 2>&1; then
+      if [ ! -d /sys/module/snd_soc_wcd938x ]; then
+        if command -v modprobe >/dev/null 2>&1; then
+          if modprobe snd-soc-wcd938x; then
+            log_info "Loaded optional Audio codec module: snd-soc-wcd938x"
+          else
+            log_warn "Unable to load optional Audio codec module: snd-soc-wcd938x"
+          fi
+        else
+          log_warn "Optional Audio codec module is available but modprobe is unavailable"
+        fi
+      fi
+    fi
+
+    log_pass "Ubuntu Audio package profile is ready: $atp_ubuntu_profile"
+    return 0
+  fi
+
   ###########################################################################
   # Debian base mode
   ###########################################################################
@@ -5456,11 +5537,75 @@ audio_prepare_debian_audio_environment() {
 #
 #       It is not required for direct ALSA commands such as aplay and arecord.
 #
+# Return the regular user that owns an active PipeWire or PulseAudio runtime.
+# Output is machine-readable so callers can use command substitution safely.
+# AUDIO_TEST_USER is preferred when it owns a usable runtime socket.
+audio_find_desktop_audio_user() {
+  adau_preferred_user="${AUDIO_TEST_USER:-}"
+  adau_runtime_dir=""
+  adau_uid=""
+  adau_user=""
+  adau_passwd_entry=""
+  adau_shell=""
+
+  if [ -n "$adau_preferred_user" ] && id "$adau_preferred_user" >/dev/null 2>&1; then
+    adau_uid="$(id -u "$adau_preferred_user" 2>/dev/null || true)"
+    adau_runtime_dir="/run/user/$adau_uid"
+
+    if [ -S "$adau_runtime_dir/pipewire-0" ] ||
+       [ -S "$adau_runtime_dir/pulse/native" ]; then
+      printf '%s\n' "$adau_preferred_user"
+      return 0
+    fi
+  fi
+
+  for adau_runtime_dir in /run/user/[0-9]*; do
+    [ -d "$adau_runtime_dir" ] || continue
+
+    adau_uid="${adau_runtime_dir##*/}"
+    case "$adau_uid" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+
+    if [ ! -S "$adau_runtime_dir/pipewire-0" ] &&
+       [ ! -S "$adau_runtime_dir/pulse/native" ]; then
+      continue
+    fi
+
+    if command -v getent >/dev/null 2>&1; then
+      adau_passwd_entry="$(getent passwd "$adau_uid" 2>/dev/null | sed -n '1p')"
+    else
+      adau_passwd_entry="$(awk -F: -v requested_uid="$adau_uid" '$3 == requested_uid { print; exit }' /etc/passwd 2>/dev/null)"
+    fi
+
+    adau_user="$(printf '%s\n' "$adau_passwd_entry" | awk -F: 'NR == 1 { print $1 }')"
+    adau_shell="$(printf '%s\n' "$adau_passwd_entry" | awk -F: 'NR == 1 { print $7 }')"
+    [ -n "$adau_user" ] || continue
+
+    case "$adau_shell" in
+      */false|*/nologin)
+        continue
+        ;;
+    esac
+
+    printf '%s\n' "$adau_user"
+    return 0
+  done
+
+  return 1
+}
+
 # Platform behavior:
 #   Debian:
 #     - require the caller to be root
 #     - verify the configured Audio user and audio-group membership
 #     - execute only the supplied command through runuser
+#
+#   Ubuntu root playback runs:
+#     - when AUDIO_USE_DESKTOP_SESSION=1, discover the active regular user
+#       owning PipeWire or PulseAudio and execute through that user session
 #
 #   Yocto/qcom-distro/other:
 #     - execute the command directly as the current user
@@ -5473,6 +5618,8 @@ audio_prepare_debian_audio_environment() {
 #   1 when user/session preparation is invalid.
 audio_run_as_test_user() {
   aratu_require_session=0
+  aratu_require_audio_group=0
+  aratu_desktop_session_mode=0
 
   case "${1:-}" in
     --require-session)
@@ -5508,6 +5655,16 @@ audio_run_as_test_user() {
 
   case "$aratu_os_id" in
     debian)
+      aratu_require_audio_group=1
+      ;;
+    ubuntu)
+      if [ "${AUDIO_USE_DESKTOP_SESSION:-0}" -ne 1 ] ||
+         [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        "$@"
+        return $?
+      fi
+
+      aratu_desktop_session_mode=1
       ;;
     *)
       # Preserve existing native/Yocto execution behavior.
@@ -5521,23 +5678,32 @@ audio_run_as_test_user() {
   ###########################################################################
 
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-    log_fail "Debian Audio command execution must be initiated by root"
+    log_fail "Audio command execution must be initiated by root"
     return 1
   fi
 
   if ! command -v runuser >/dev/null 2>&1; then
-    log_fail "runuser is unavailable, cannot execute an Audio command as the Debian user"
+    log_fail "runuser is unavailable, cannot execute an Audio command in the user session"
     return 1
   fi
 
-  aratu_user="${AUDIO_TEST_USER:-debian}"
+  if [ "$aratu_desktop_session_mode" -eq 1 ]; then
+    aratu_user="$(audio_find_desktop_audio_user)"
+    if [ -z "$aratu_user" ]; then
+      log_fail "No active regular-user PipeWire or PulseAudio session was found"
+      return 1
+    fi
+  else
+    aratu_user="${AUDIO_TEST_USER:-debian}"
+  fi
 
   if ! id "$aratu_user" >/dev/null 2>&1; then
-    log_fail "Debian Audio test user does not exist: $aratu_user"
+    log_fail "Audio test user does not exist: $aratu_user"
     return 1
   fi
 
-  if ! id -nG "$aratu_user" 2>/dev/null |
+  if [ "$aratu_require_audio_group" -eq 1 ] &&
+     ! id -nG "$aratu_user" 2>/dev/null |
       tr ' ' '\n' |
       grep -qx audio; then
     log_fail "Debian Audio test user is not a member of audio: $aratu_user"
@@ -5552,7 +5718,7 @@ audio_run_as_test_user() {
   aratu_uid="$(id -u "$aratu_user" 2>/dev/null || true)"
 
   if [ -z "$aratu_uid" ]; then
-    log_fail "Unable to resolve uid for Debian Audio test user: $aratu_user"
+    log_fail "Unable to resolve uid for Audio test user: $aratu_user"
     return 1
   fi
 
@@ -5587,15 +5753,20 @@ audio_run_as_test_user() {
   [ -n "$aratu_home" ] || aratu_home="/home/$aratu_user"
   [ -n "$aratu_shell" ] || aratu_shell="/bin/sh"
 
-  aratu_runtime_dir="$(
-    printf '%s\n' \
-      "${AUDIO_TEST_RUNTIME_DIR:-/run/user/$aratu_uid}"
-  )"
+  if [ "$aratu_desktop_session_mode" -eq 1 ]; then
+    aratu_runtime_dir="/run/user/$aratu_uid"
+    aratu_bus_address="unix:path=$aratu_runtime_dir/bus"
+  else
+    aratu_runtime_dir="$(
+      printf '%s\n' \
+        "${AUDIO_TEST_RUNTIME_DIR:-/run/user/$aratu_uid}"
+    )"
 
-  aratu_bus_address="$(
-    printf '%s\n' \
-      "${AUDIO_TEST_DBUS_ADDRESS:-unix:path=$aratu_runtime_dir/bus}"
-  )"
+    aratu_bus_address="$(
+      printf '%s\n' \
+        "${AUDIO_TEST_DBUS_ADDRESS:-unix:path=$aratu_runtime_dir/bus}"
+    )"
+  fi
 
   ###########################################################################
   # Optional user-session validation
@@ -5695,6 +5866,13 @@ audio_run_helper_as_test_user() {
 
   case "$arhatu_os_id" in
     debian)
+      ;;
+    ubuntu)
+      if [ "${AUDIO_USE_DESKTOP_SESSION:-0}" -ne 1 ] ||
+         [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        "$arhatu_helper" "$@"
+        return $?
+      fi
       ;;
     *)
       "$arhatu_helper" "$@"
