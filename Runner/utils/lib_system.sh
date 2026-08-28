@@ -342,6 +342,161 @@ efi_variable_list_contains() {
     grep -Fxq "$var_name" "$EFI_LIST_LOG" 2>/dev/null
 }
 
+# Find one EFI variable by its name suffix and print its GUID-qualified name.
+# Args:
+#   $1 - EFI variable name without the GUID, for example VendorDtbOverlays
+#   $2 - file that receives efivar list output
+# Diagnostic output is written to stderr so command-substitution callers only
+# receive the variable name.
+efi_find_variable_by_name() {
+    efvbn_name="$1"
+    efvbn_log_file="$2"
+    efvbn_matches=""
+    efvbn_count=0
+
+    if [ -z "$efvbn_name" ] || [ -z "$efvbn_log_file" ]; then
+        printf '%s\n' "efi_find_variable_by_name requires variable name and log file" >&2
+        return 1
+    fi
+
+    if ! command -v efivar >/dev/null 2>&1; then
+        printf '%s\n' "efivar command is unavailable" >&2
+        return 1
+    fi
+
+    if ! efivar -l > "$efvbn_log_file" 2>&1; then
+        printf '%s\n' "efivar could not list EFI variables" >&2
+        return 1
+    fi
+
+    efvbn_matches="$(awk -v suffix="-$efvbn_name" '
+        length($0) > length(suffix) && substr($0, length($0) - length(suffix) + 1) == suffix {
+            print
+        }
+    ' "$efvbn_log_file")"
+    efvbn_count="$(printf '%s\n' "$efvbn_matches" | awk 'NF { count++ } END { print count + 0 }')"
+
+    if [ "$efvbn_count" -ne 1 ]; then
+        printf '%s\n' "Expected one EFI variable named $efvbn_name, found $efvbn_count" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$efvbn_matches"
+    return 0
+}
+
+# Return success when an EFI variable printout contains a text payload.
+# Args:
+#   $1 - EFI variable name in GUID-Name form
+#   $2 - expected text payload, without a trailing newline
+#   $3 - file that receives efivar print output
+efi_text_variable_matches() {
+    etvm_var_name="$1"
+    etvm_value="$2"
+    etvm_log_file="$3"
+    etvm_data_file=""
+    etvm_expected_bytes=""
+    etvm_expected_pattern=""
+
+    if [ -z "$etvm_var_name" ] || [ -z "$etvm_value" ] || [ -z "$etvm_log_file" ]; then
+        log_warn "efi_text_variable_matches requires variable name, value, and log file"
+        return 1
+    fi
+
+    if ! command -v efivar >/dev/null 2>&1; then
+        log_warn "efivar command is unavailable"
+        return 1
+    fi
+
+    if ! efivar -n "$etvm_var_name" -p > "$etvm_log_file" 2>&1; then
+        return 1
+    fi
+
+    etvm_data_file="$(mktemp "${TMPDIR:-/tmp}/efivar_payload.XXXXXX" 2>/dev/null || true)"
+    if [ -z "$etvm_data_file" ]; then
+        log_warn "Could not create temporary EFI variable payload"
+        return 1
+    fi
+
+    if ! printf '%s' "$etvm_value" > "$etvm_data_file"; then
+        log_warn "Could not write temporary EFI variable payload"
+        rm -f "$etvm_data_file"
+        return 1
+    fi
+
+    etvm_expected_bytes="$(od -An -tx1 -v "$etvm_data_file" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+    rm -f "$etvm_data_file"
+
+    if [ -z "$etvm_expected_bytes" ]; then
+        log_warn "Could not derive EFI variable payload bytes"
+        return 1
+    fi
+
+    etvm_expected_pattern="$(printf '%s\n' "$etvm_expected_bytes" | sed 's/ /[[:space:]][[:space:]]*/g')"
+    grep -Eq "$etvm_expected_pattern" "$etvm_log_file"
+}
+
+# Write a text payload to an EFI variable and verify its printed byte value.
+# Args:
+#   $1 - EFI variable name in GUID-Name form
+#   $2 - text payload, written without a trailing newline
+#   $3 - file that receives efivar write and print output
+# The caller is responsible for arranging efi_restore_efivarfs_ro during
+# cleanup when efi_try_remount_rw changes the mount state.
+efi_write_text_variable() {
+    ewtv_var_name="$1"
+    ewtv_value="$2"
+    ewtv_log_file="$3"
+    ewtv_data_file=""
+
+    if [ -z "$ewtv_var_name" ] || [ -z "$ewtv_value" ] || [ -z "$ewtv_log_file" ]; then
+        log_warn "efi_write_text_variable requires variable name, value, and log file"
+        return 1
+    fi
+
+    if ! command -v efivar >/dev/null 2>&1; then
+        log_warn "efivar command is unavailable"
+        return 1
+    fi
+
+    if ! efi_mount_is_rw && ! efi_try_remount_rw; then
+        log_warn "efivarfs is not writable"
+        return 1
+    fi
+
+    ewtv_data_file="$(mktemp "${TMPDIR:-/tmp}/efivar_payload.XXXXXX" 2>/dev/null || true)"
+    if [ -z "$ewtv_data_file" ]; then
+        log_warn "Could not create temporary EFI variable payload"
+        return 1
+    fi
+
+    if ! printf '%s' "$ewtv_value" > "$ewtv_data_file"; then
+        log_warn "Could not write temporary EFI variable payload"
+        rm -f "$ewtv_data_file"
+        return 1
+    fi
+
+    if ! efivar -n "$ewtv_var_name" -w -f "$ewtv_data_file" > "$ewtv_log_file" 2>&1; then
+        log_warn "efivar write failed for $ewtv_var_name"
+        rm -f "$ewtv_data_file"
+        return 1
+    fi
+
+    rm -f "$ewtv_data_file"
+
+    if ! efi_text_variable_matches \
+        "$ewtv_var_name" \
+        "$ewtv_value" \
+        "$ewtv_log_file"; then
+        log_warn "EFI variable printout does not contain the requested payload"
+        return 1
+    fi
+
+    sync
+    log_info "EFI variable updated and verified: $ewtv_var_name"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Compatibility wrappers for existing EFI_Variable_Validation/run.sh names
 # ---------------------------------------------------------------------------
