@@ -57,7 +57,8 @@ The test suite includes 10 diverse audio clip configurations covering various sa
 
 ## Prerequisites
 
-Ensure the following components are present in the target Yocto build:
+Yocto images must provide the following components. The suite does not change
+the Yocto package flow.
 
 - PipeWire: `pw-play`, `wpctl`
 - PulseAudio: `paplay`, `pactl`
@@ -65,9 +66,38 @@ Ensure the following components are present in the target Yocto build:
 - Common tools: `pgrep`, `timeout`, `grep`, `wget`, `tar`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
+### Ubuntu package preparation
+
+When run as root, the suite uses the shared package provider to install missing
+Ubuntu audio packages. It does not run a blanket distribution upgrade.
+
+- `auto` is the default profile. It selects `desktop` when `graphical.target`
+  is active and otherwise selects `server`.
+- `server` ensures `alsa-utils` for ALSA playback.
+- `desktop` ensures `alsa-utils`, `pipewire`, `pipewire-pulse`, `wireplumber`,
+  `pipewire-bin`, and `pulseaudio-utils`.
+- Set `AUDIO_PACKAGE_UPDATE=1` only when installed packages should be upgraded
+  as part of the test preparation.
+
+The optional `snd-soc-wcd938x` codec module is loaded only when the running
+kernel provides it. Targets without that module are unchanged.
+
+```sh
+# Let the suite detect a server or desktop Ubuntu image
+./run.sh --clip-name "playback_config1 playback_config7"
+
+# Force desktop package preparation
+AUDIO_PACKAGE_PROFILE=desktop \
+  ./run.sh --clip-name "playback_config1 playback_config7"
+
+# Upgrade the selected profile's installed packages
+AUDIO_PACKAGE_PROFILE=desktop AUDIO_PACKAGE_UPDATE=1 \
+  ./run.sh --clip-name "playback_config1 playback_config7"
+```
+
 ## Backend and Route Selection
 
-When no backend is requested, the suite uses automatic selection. A physical PipeWire audio sink uses `pw-play`, and a physical PulseAudio sink uses `paplay`. Dummy, null, monitor, and loopback PipeWire sinks are not accepted as speaker routes.
+When no backend is requested, the suite uses automatic selection. A physical PipeWire audio sink uses `pw-play`, and a physical PulseAudio sink uses `paplay`. For the `speakers` route, a speaker endpoint takes precedence over headphones, then other physical outputs. Dummy, null, monitor, and loopback PipeWire sinks are not accepted as speaker routes.
 
 If automatic selection finds no physical managed speaker sink, the suite probes direct ALSA playback. It selects an ALSA card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `aplay -D <device>`. This supports the Shikra primary-MI2S, secondary-TDM, and codec-direct route capabilities without selecting a form factor or assuming card `0`.
 
@@ -243,6 +273,8 @@ VERBOSE	                 Enable verbose logging                            0
 EXTRACT_AUDIO_ASSETS     Download/extract audio assets if missing	       true
 ENABLE_NETWORK_DOWNLOAD  Enable network download of missing audio files    false
 AUDIO_CLIPS_BASE_DIR     Custom path to pre-staged audio clips (CI use)    unset
+AUDIO_PACKAGE_PROFILE    Ubuntu package profile: auto, server, or desktop  auto
+AUDIO_PACKAGE_UPDATE     Upgrade selected Ubuntu audio packages             0
 JUNIT_OUT                Path to write JUnit XML output                    unset
 SSID                     Wi-Fi SSID for network connection                 unset
 PASSWORD                 Wi-Fi password for network connection             unset

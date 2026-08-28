@@ -175,8 +175,15 @@ Usage: $0 [options]
 
 Environment:
   AUDIO_PLAYBACK_VOLUME
-      PipeWire speaker volume applied to the dynamically discovered sink.
-      Default: 1.0. Null sinks are not unmuted or assigned a volume.
+       PipeWire speaker volume applied to the dynamically discovered sink.
+       Default: 1.0. Null sinks are not unmuted or assigned a volume.
+
+  AUDIO_PACKAGE_PROFILE
+       On Ubuntu, select package preparation profile: auto, server, or desktop.
+       Auto selects desktop only when graphical.target is active.
+
+  AUDIO_PACKAGE_UPDATE=1
+       On Ubuntu, upgrade already installed packages in the selected Audio profile.
 
 Testing Modes:
   Clip Discovery Mode (Recommended):
@@ -459,7 +466,18 @@ if [ "$AUDIO_PLAYBACK_OS_ID" = "debian" ]; then
   AUDIO_PLAYBACK_DEBIAN_ROOT_MODE=1
 fi
 
-export AUDIO_PLAYBACK_DEBIAN_ROOT_MODE
+# Desktop Ubuntu images run PipeWire and the PulseAudio compatibility server in
+# the logged-in user's session. The test itself is often launched by root, so
+# command-level backend probes and players must join that session rather than
+# querying root's empty runtime directory. audio_run_as_test_user discovers the
+# owner dynamically, which avoids hardcoding a desktop username.
+AUDIO_USE_DESKTOP_SESSION=0
+if [ "$AUDIO_PLAYBACK_OS_ID" = "ubuntu" ] &&
+   [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]; then
+  AUDIO_USE_DESKTOP_SESSION=1
+fi
+
+export AUDIO_PLAYBACK_DEBIAN_ROOT_MODE AUDIO_USE_DESKTOP_SESSION
 
 # Auto-enable network download if WiFi credentials provided
 if [ -n "$SSID" ] && [ -n "$PASSWORD" ]; then
