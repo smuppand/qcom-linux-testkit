@@ -401,6 +401,67 @@ gstreamer_refine_codec_probe() {
   printf '%s\n' "$refine_rc"
 }
 
+# The codec-wide verdict, kept next to the per-element answers. A wedged codec
+# device does not wedge one element: gst-inspect hangs the same way for every
+# element the driver would have registered, so probing each one costs a further
+# GST_PROBE_TIMEOUT. A run resolving an encoder and two decoders pays it three
+# times over, which is how the outer LAVA timeout gets consumed even though each
+# probe is individually bounded. Recording the first unusable outcome lets the
+# rest of the lookups answer immediately.
+#
+# Named so it matches the entry shape the cache reset deletes, and so it can
+# never collide with a sanitised GStreamer element name.
+GST_CODEC_STATE_KEY="_codec_state"
+
+# gstreamer_codec_state
+# Prints the recorded codec-wide probe status, or fails if none is recorded.
+gstreamer_codec_state() {
+  state_f="$GST_ELEM_CACHE_DIR/$GST_CODEC_STATE_KEY"
+  [ -f "$state_f" ] || return 1
+  state_v=$(cat "$state_f" 2>/dev/null)
+  case "$state_v" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$state_v"
+}
+
+# gstreamer_mark_codec_state <rc>
+# Records a codec-wide probe status. Best effort: if it cannot be written the
+# probes still work, they are just not short-circuited.
+gstreamer_mark_codec_state() {
+  mkdir -p "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$1" > "$GST_ELEM_CACHE_DIR/$GST_CODEC_STATE_KEY" 2>/dev/null || true
+}
+
+# gstreamer_probe_codec_element <element>
+# Resolves one V4L2 hardware codec element. Prints the element name when it is
+# usable and nothing otherwise, returning the GST_ELEM_* classification.
+#
+# Answers from the codec-wide verdict when one is already recorded, so the
+# second and later lookups in a run with a wedged codec cost nothing. Only
+# outcomes that mean the probe could not complete are recorded that way: a
+# missing element is specific to that element and says nothing about the rest.
+gstreamer_probe_codec_element() {
+  probe_elem="$1"
+  if probe_rc=$(gstreamer_codec_state); then
+    printf '%s\n' ""
+    return "$probe_rc"
+  fi
+  has_element "$probe_elem"
+  probe_rc=$?
+  if [ "$probe_rc" -eq 0 ]; then
+    printf '%s\n' "$probe_elem"
+    return "$GST_ELEM_OK"
+  fi
+  if [ "$probe_rc" = "$GST_ELEM_TIMEOUT" ] || [ "$probe_rc" = "$GST_ELEM_NO_TIMEOUT" ]; then
+    log_warn "Codec probe unusable ($(gstreamer_probe_reason "$probe_rc")); skipping further hardware codec probes this run" >&2
+    gstreamer_mark_codec_state "$probe_rc"
+  fi
+  probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
+  printf '%s\n' ""
+  return "$probe_rc"
+}
+
 # gstreamer_reset_element_cache
 # Drops every cached has_element answer. Use after reloading codec modules or
 # otherwise changing which GStreamer elements are registered.
@@ -1221,26 +1282,12 @@ gstreamer_v4l2_encoder_for_codec() {
   codec="$1"
   case "$codec" in
     h264)
-      has_element v4l2h264enc
-      probe_rc=$?
-      if [ "$probe_rc" -eq 0 ]; then
-        printf '%s\n' "v4l2h264enc"
-        return "$GST_ELEM_OK"
-      fi
-      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
-      printf '%s\n' ""
-      return "$probe_rc"
+      gstreamer_probe_codec_element v4l2h264enc
+      return $?
       ;;
     h265|hevc)
-      has_element v4l2h265enc
-      probe_rc=$?
-      if [ "$probe_rc" -eq 0 ]; then
-        printf '%s\n' "v4l2h265enc"
-        return "$GST_ELEM_OK"
-      fi
-      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
-      printf '%s\n' ""
-      return "$probe_rc"
+      gstreamer_probe_codec_element v4l2h265enc
+      return $?
       ;;
     vp9)
       # VP9 is decode-only, no encoder support: genuinely absent, not broken.
@@ -1259,37 +1306,16 @@ gstreamer_v4l2_decoder_for_codec() {
   codec="$1"
   case "$codec" in
     h264)
-      has_element v4l2h264dec
-      probe_rc=$?
-      if [ "$probe_rc" -eq 0 ]; then
-        printf '%s\n' "v4l2h264dec"
-        return "$GST_ELEM_OK"
-      fi
-      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
-      printf '%s\n' ""
-      return "$probe_rc"
+      gstreamer_probe_codec_element v4l2h264dec
+      return $?
       ;;
     h265|hevc)
-      has_element v4l2h265dec
-      probe_rc=$?
-      if [ "$probe_rc" -eq 0 ]; then
-        printf '%s\n' "v4l2h265dec"
-        return "$GST_ELEM_OK"
-      fi
-      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
-      printf '%s\n' ""
-      return "$probe_rc"
+      gstreamer_probe_codec_element v4l2h265dec
+      return $?
       ;;
     vp9)
-      has_element v4l2vp9dec
-      probe_rc=$?
-      if [ "$probe_rc" -eq 0 ]; then
-        printf '%s\n' "v4l2vp9dec"
-        return "$GST_ELEM_OK"
-      fi
-      probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
-      printf '%s\n' ""
-      return "$probe_rc"
+      gstreamer_probe_codec_element v4l2vp9dec
+      return $?
       ;;
   esac
   printf '%s\n' ""
