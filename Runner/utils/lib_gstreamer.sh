@@ -67,7 +67,11 @@ GST_CODEC_FAULT_RE="${GST_CODEC_FAULT_RE:-(qcom-iris|qcom-venus|venus_core|video
 # so any variable the probe set would be discarded on return and every
 # resolution would pay the full GST_PROBE_TIMEOUT again. $$ is the invoking
 # shell's PID and is stable across subshells, so one run shares one directory.
-GST_ELEM_CACHE_DIR="${GST_ELEM_CACHE_DIR:-${TMPDIR:-/tmp}/gst-elem-cache-$$}"
+# Deliberately not read from the environment. gstreamer_reset_element_cache()
+# deletes from this directory and runs from the suite's EXIT trap, so the path
+# it clears has to be one this process derived, not one a caller can point
+# elsewhere. Callers that want a different location get a different TMPDIR.
+GST_ELEM_CACHE_DIR="${TMPDIR:-/tmp}/gst-elem-cache-$$"
 
 # Optional env overrides (set by run.sh)
 # GST_ALSA_PLAYBACK_DEVICE=hw:0,0
@@ -347,8 +351,28 @@ gstreamer_refine_codec_probe() {
 # gstreamer_reset_element_cache
 # Drops every cached has_element answer. Use after reloading codec modules or
 # otherwise changing which GStreamer elements are registered.
+# Clears the probe answers this process cached. Refuses any path other than the
+# one derived at load time: the variable is a plain shell variable that a caller
+# could reassign, and this runs from the suite's EXIT trap, so a stray value
+# must not turn cleanup into a delete of whatever that path names. Entries are
+# matched against the shape has_element() writes, so nothing else in a shared
+# TMPDIR is a candidate, and rmdir() removes the directory only if it is empty.
 gstreamer_reset_element_cache() {
-  rm -rf "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  reset_owned="${TMPDIR:-/tmp}/gst-elem-cache-$$"
+  if [ "$GST_ELEM_CACHE_DIR" != "$reset_owned" ]; then
+    log_warn "Refusing to clear '$GST_ELEM_CACHE_DIR': not this process's cache" >&2
+    return 1
+  fi
+  [ -d "$GST_ELEM_CACHE_DIR" ] || return 0
+  for reset_f in "$GST_ELEM_CACHE_DIR"/*; do
+    [ -f "$reset_f" ] || continue
+    case "${reset_f##*/}" in
+      *[!A-Za-z0-9_]*) continue ;;
+    esac
+    rm -f "$reset_f" 2>/dev/null || true
+  done
+  rmdir "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  return 0
 }
 
 # -------------------- Pretty printing (multi-line) --------------------
