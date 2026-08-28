@@ -16,6 +16,79 @@ GSTINSPECT="${GSTINSPECT:-gst-inspect-1.0}"
 GSTDISCOVER="${GSTDISCOVER:-gst-discoverer-1.0}"
 GSTLAUNCHFLAGS="${GSTLAUNCHFLAGS:--e -v -m}"
 
+# Time bounds for anything that touches the hardware codecs.
+# GST_PROBE_TIMEOUT bounds introspection (gst-inspect-1.0, gst-discoverer-1.0);
+# GST_KILL_GRACE is how long a process gets to react to the first signal before
+# it is SIGKILLed.
+#
+# The probe bound is deliberately generous: gst-inspect-1.0 legitimately takes
+# tens of seconds when it builds a cold plugin registry, or when a codec driver
+# retries a failing firmware load before giving up (~17s observed on
+# x1e80100). It only has to be short enough that a run against wedged hardware
+# still fits in the CI budget, which has_element's cache below takes care of.
+GST_PROBE_TIMEOUT="${GST_PROBE_TIMEOUT:-60}"
+GST_KILL_GRACE="${GST_KILL_GRACE:-10}"
+
+# Canonical gstreamer_run_bounded return codes, normalised across timeout(1)
+# implementations (GNU coreutils and BusyBox report differently).
+GST_RC_TIMEDOUT=124   # the command was stopped by the time bound
+GST_RC_NO_TIMEOUT=125 # no usable timeout(1); the command was NOT run
+
+# Element-probe outcomes returned by has_element(). Every non-zero value still
+# means "not usable", so boolean callers keep working, but the value says WHY:
+# a genuinely absent element is a legitimate SKIP, whereas a probe that had to
+# be stopped, or could not be bounded at all, points at broken hardware or a
+# broken environment and must not be reported as "not applicable".
+GST_ELEM_OK=0
+GST_ELEM_MISSING=1
+GST_ELEM_TIMEOUT=2
+GST_ELEM_NO_TIMEOUT=3
+GST_ELEM_HW_FAULT=4
+
+# Kernel signatures of a video codec driver that failed to come up. A driver
+# that does not come up never registers its V4L2 element, so gst-inspect reports
+# the element as simply absent - indistinguishable from a platform that
+# genuinely has no such codec. Only the kernel log separates the two, and only
+# the first is a failure. Kept deliberately narrow: hard faults that leave the
+# codec unusable, not transient session errors the driver recovers from.
+#
+# Two distinct shapes have to be covered, because they fail at different stages:
+#   - the driver binds, then cannot load or start its firmware
+#     ("firmware download failed", "core init failed", "initializing firmware")
+#   - the driver never binds at all ("probe with driver qcom-iris failed with
+#     error -5"), so it never reaches the point of mentioning firmware
+# The second shape prints no firmware wording whatsoever, so matching only the
+# first silently reports a dead codec as an unsupported one.
+GST_CODEC_FAULT_RE="${GST_CODEC_FAULT_RE:-(qcom-iris|qcom-venus|venus_core|video-codec).*(firmware download failed|core init failed|initializing firmware|probe with driver [^ ]+ failed|probe of [^ ]+ failed)}"
+
+# Where has_element() remembers probe outcomes. This has to be a file, not a
+# shell variable: the callers resolve elements inside command substitution
+# (encoder=$(gstreamer_v4l2_encoder_for_codec ...)), which runs in a subshell,
+# so any variable the probe set would be discarded on return and every
+# resolution would pay the full GST_PROBE_TIMEOUT again. $$ is the invoking
+# shell's PID and is stable across subshells, so one run shares one directory.
+# Deliberately not read from the environment. gstreamer_reset_element_cache()
+# deletes from this directory and runs from the suite's EXIT trap, so the path
+# it clears has to be one this process derived, not one a caller can point
+# elsewhere. Callers that want a different location get a different TMPDIR.
+GST_ELEM_CACHE_DIR="${TMPDIR:-/tmp}/gst-elem-cache-$$"
+
+# Where the codec-fault evidence is kept, and what scan_dmesg_errors() is asked
+# to look at when producing it. The module pattern has to tolerate the driver
+# name and the device node sharing one field ("qcom-iris aa00000.video-codec:"),
+# which is why each alternative reaches up to the colon.
+#
+# Declared after GST_ELEM_CACHE_DIR because the default derives from it: read
+# any earlier it would expand to the empty string, putting the snapshot at
+# /dmesg_snapshot.log and quietly disabling fault classification.
+#
+# Defaults to the probe cache dir so the library is usable on its own; the suite
+# points GST_CODEC_DMESG_DIR at its own dmesg directory so the snapshot and the
+# filtered error log are kept with the rest of the run's artifacts.
+GST_CODEC_DMESG_DIR="${GST_CODEC_DMESG_DIR:-$GST_ELEM_CACHE_DIR}"
+GST_CODEC_MODULE_RE="${GST_CODEC_MODULE_RE:-qcom-iris[^:]*|qcom-venus[^:]*|venus_core[^:]*|[^ ]*video-codec}"
+GST_CODEC_DMESG_EXCLUDE="${GST_CODEC_DMESG_EXCLUDE:-dummy regulator|supply [^ ]+ not found|using dummy regulator}"
+
 # Optional env overrides (set by run.sh)
 # GST_ALSA_PLAYBACK_DEVICE=hw:0,0
 # GST_ALSA_CAPTURE_DEVICE=hw:0,1
@@ -91,12 +164,329 @@ gstreamer_shared_recorded_dir() {
     
     gstreamer_shared_artifact_dir "AUDIO_SHARED_RECORDED_DIR" "audio-record-playback" "recorded" "$script_dir" "$outdir"
 }
+# -------------------- Bounded command execution --------------------
+# gstreamer_signum <name|number>
+# Maps a signal name to its number. timeout(1) implementations differ in which
+# signal names they accept, but every one of them accepts a number.
+gstreamer_signum() {
+  case "$1" in
+    INT|SIGINT|2)    printf '%s\n' 2 ;;
+    KILL|SIGKILL|9)  printf '%s\n' 9 ;;
+    TERM|SIGTERM|15) printf '%s\n' 15 ;;
+    *)               printf '%s\n' 15 ;;
+  esac
+}
+
+# gstreamer_timeout_supported
+# True when timeout(1) exists and understands the options this library needs.
+#
+# Only the short options -s and -k are used: GNU coreutils accepts both short
+# and long forms, BusyBox (as shipped in most Yocto images) accepts only the
+# short ones and fails outright on --signal=/--kill-after=.
+#
+# -k is required, not a nicety. Without the SIGKILL escalation a process that
+# ignores the first signal is never stopped, which is exactly the hang this
+# library exists to bound, so a timeout(1) lacking -k counts as unusable.
+gstreamer_timeout_supported() {
+  if [ -z "${GST_TIMEOUT_OK:-}" ]; then
+    if command -v timeout >/dev/null 2>&1 && timeout -s 15 -k 1 1 true >/dev/null 2>&1; then
+      GST_TIMEOUT_OK=1
+    else
+      GST_TIMEOUT_OK=0
+    fi
+  fi
+  [ "$GST_TIMEOUT_OK" = "1" ]
+}
+
+# gstreamer_run_bounded <secs> <signal> <cmd> [args...]
+# Runs <cmd> under timeout(1), escalating to SIGKILL after GST_KILL_GRACE
+# seconds if it does not react to <signal>.
+#
+# A process blocked in a V4L2 ioctl on a wedged hardware codec never reacts to
+# the first signal. Without the escalation timeout(1) then waits for it forever,
+# so the caller hangs until the CI harness times out the whole job instead of
+# reporting a single failed test case.
+#
+# Returns the command's own exit status, GST_RC_TIMEDOUT if the bound stopped
+# it, or GST_RC_NO_TIMEOUT if there is no usable timeout(1) - in which case the
+# command is deliberately NOT run. Falling back to an unbounded run would
+# reinstate the very hang this is here to prevent, so callers are expected to
+# fail or skip instead.
+#
+# GST_BOUNDED_RAW_RC keeps the pre-normalisation status for diagnostics.
+gstreamer_run_bounded() {
+  bounded_secs="$1"
+  bounded_sig="$2"
+  shift 2
+
+  if ! gstreamer_timeout_supported; then
+    log_error "No timeout(1) supporting -s/-k; refusing to run '$1' unbounded"
+    GST_BOUNDED_RAW_RC="$GST_RC_NO_TIMEOUT"
+    return "$GST_RC_NO_TIMEOUT"
+  fi
+
+  bounded_signum=$(gstreamer_signum "$bounded_sig")
+
+  timeout -s "$bounded_signum" -k "$GST_KILL_GRACE" "$bounded_secs" "$@"
+  bounded_rc=$?
+  GST_BOUNDED_RAW_RC="$bounded_rc"
+
+  # Normalise "the bound stopped it" across implementations:
+  #   GNU     reports 124 when its signal ended the command,
+  #   BusyBox reports 128+signal for the signal it delivered,
+  #   both    report 137 (128+SIGKILL) when the grace period had to escalate.
+  bounded_killed=$((128 + bounded_signum))
+  if [ "$bounded_rc" = "124" ] || [ "$bounded_rc" = "137" ] ||
+     [ "$bounded_rc" = "$bounded_killed" ]; then
+    bounded_rc="$GST_RC_TIMEDOUT"
+  fi
+
+  return "$bounded_rc"
+}
+
+# gstreamer_bounded_timed_out <rc>
+# True when gstreamer_run_bounded had to stop the command.
+gstreamer_bounded_timed_out() {
+  [ "$1" = "$GST_RC_TIMEDOUT" ]
+}
+
+# gstreamer_bounded_no_timeout <rc>
+# True when gstreamer_run_bounded refused to run the command because this
+# system has no usable timeout(1).
+gstreamer_bounded_no_timeout() {
+  [ "$1" = "$GST_RC_NO_TIMEOUT" ]
+}
+
 # -------------------- Element check --------------------
+# has_element <element>
+# True when the GStreamer element is registered and can be introspected.
+#
+# gst-inspect-1.0 opens every /dev/video* node while building or validating the
+# plugin registry. If a hardware codec has wedged, that open blocks in the
+# kernel and gst-inspect never returns. Bound it so a dead codec surfaces as
+# "element not available" (SKIP/FAIL) rather than a hung test run.
+#
+# The answer is cached per element. Callers probe the same element repeatedly
+# (run_encode_test asks once itself and once more via
+# gstreamer_build_v4l2_encode_pipeline), and against wedged hardware every one
+# of those probes would otherwise cost a full GST_PROBE_TIMEOUT. Caching keeps
+# the worst case proportional to the number of distinct elements.
+#
+# Call gstreamer_reset_element_cache after anything that changes which elements
+# exist, e.g. a video_ensure_stack hot switch that reloads the codec modules.
+#
+# Returns GST_ELEM_OK, GST_ELEM_MISSING, GST_ELEM_TIMEOUT or GST_ELEM_NO_TIMEOUT;
+# the classification is what gets cached, so a repeat probe keeps the reason.
 has_element() {
   elem="$1"
   [ -n "$elem" ] || return 1
   command -v "$GSTINSPECT" >/dev/null 2>&1 || return 1
-  "$GSTINSPECT" "$elem" >/dev/null 2>&1
+
+  # Element names become file names, so reduce them to a safe charset.
+  has_element_key=$(printf '%s' "$elem" | tr -c 'A-Za-z0-9_' '_')
+  has_element_cf="${GST_ELEM_CACHE_DIR}/${has_element_key}"
+  if [ -f "$has_element_cf" ]; then
+    has_element_cached=$(cat "$has_element_cf" 2>/dev/null)
+    case "$has_element_cached" in
+      ''|*[!0-9]*) : ;;   # unreadable or corrupt: fall through and re-probe
+      *) return "$has_element_cached" ;;
+    esac
+  fi
+
+  gstreamer_run_bounded "$GST_PROBE_TIMEOUT" TERM "$GSTINSPECT" "$elem" >/dev/null 2>&1
+  has_element_rc=$?
+
+  # Diagnostics go to stderr: has_element runs inside command substitution
+  # (gstreamer_v4l2_encoder_for_codec and the pipeline builders capture its
+  # caller's stdout), so anything written to stdout here ends up spliced into
+  # the element name and, from there, into the pipeline string.
+  if gstreamer_bounded_no_timeout "$has_element_rc"; then
+    log_error "Cannot probe '$elem' without a usable timeout(1)" >&2
+    has_element_rc="$GST_ELEM_NO_TIMEOUT"
+  elif gstreamer_bounded_timed_out "$has_element_rc"; then
+    log_warn "$GSTINSPECT timed out after ${GST_PROBE_TIMEOUT}s inspecting '$elem' (wedged codec device?)" >&2
+    has_element_rc="$GST_ELEM_TIMEOUT"
+  elif [ "$has_element_rc" -ne 0 ]; then
+    has_element_rc="$GST_ELEM_MISSING"
+  fi
+
+  # Best effort: if the cache cannot be written the probe still works, it just
+  # is not remembered.
+  mkdir -p "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$has_element_rc" > "$has_element_cf" 2>/dev/null || true
+
+  return "$has_element_rc"
+}
+
+# gstreamer_probe_unhealthy <rc>
+# True when an element probe failed for a reason that indicates broken hardware
+# or a broken environment rather than a genuinely absent element. Callers should
+# report FAIL for these, not SKIP.
+gstreamer_probe_unhealthy() {
+  [ "$1" = "$GST_ELEM_TIMEOUT" ] ||
+  [ "$1" = "$GST_ELEM_NO_TIMEOUT" ] ||
+  [ "$1" = "$GST_ELEM_HW_FAULT" ]
+}
+
+# gstreamer_probe_reason <rc>
+# Human-readable explanation of a probe outcome, for test log messages.
+gstreamer_probe_reason() {
+  case "$1" in
+    "$GST_ELEM_OK")         printf '%s\n' "available" ;;
+    "$GST_ELEM_MISSING")    printf '%s\n' "element not registered" ;;
+    "$GST_ELEM_TIMEOUT")    printf '%s\n' "probe timed out, codec appears wedged" ;;
+    "$GST_ELEM_NO_TIMEOUT") printf '%s\n' "no usable timeout(1), probe refused" ;;
+    "$GST_ELEM_HW_FAULT")   printf '%s\n' "codec driver failed to come up (firmware, core init or probe)" ;;
+    *)                      printf '%s\n' "unknown probe status $1" ;;
+  esac
+}
+
+# gstreamer_codec_dmesg_snapshot
+# Prints the path of the run's dmesg snapshot, capturing it once and reusing it
+# thereafter. This is the single authoritative capture for the run: the codec
+# probes classify against it and the suite's end-of-run check reports from the
+# error log taken alongside it, so the live ring buffer is read exactly once no
+# matter how many elements are probed.
+#
+# Goes through scan_dmesg_errors() so the snapshot and the filtered error log
+# are the suite's standard artifacts rather than a private copy, which keeps the
+# evidence for a classification on disk next to the run's other logs. Falls back
+# to a plain capture only where that helper is unavailable.
+#
+# scan_dmesg_errors() logs on stdout, and the codec lookups run inside command
+# substitution, so its output is sent to stderr here; letting it reach stdout
+# would splice log text into the element name the caller is resolving.
+gstreamer_codec_dmesg_snapshot() {
+  [ -n "$GST_CODEC_DMESG_DIR" ] || return 1
+  snap_file="$GST_CODEC_DMESG_DIR/dmesg_snapshot.log"
+  if [ -s "$snap_file" ]; then
+    printf '%s\n' "$snap_file"
+    return 0
+  fi
+  command -v dmesg >/dev/null 2>&1 || return 1
+  mkdir -p "$GST_CODEC_DMESG_DIR" 2>/dev/null || return 1
+  if command -v scan_dmesg_errors >/dev/null 2>&1; then
+    scan_dmesg_errors "$GST_CODEC_DMESG_DIR" "$GST_CODEC_MODULE_RE" \
+      "$GST_CODEC_DMESG_EXCLUDE" >&2 2>&2 || true
+  fi
+  if [ ! -s "$snap_file" ]; then
+    dmesg > "$snap_file" 2>/dev/null || true
+  fi
+  [ -s "$snap_file" ] || return 1
+  printf '%s\n' "$snap_file"
+}
+
+# gstreamer_codec_hw_faulted
+# True when the kernel log shows a video codec driver failing to come up,
+# either by failing to load its firmware or by failing to probe at all.
+# Reads the run's snapshot, so every probe classifies against the same evidence
+# and that evidence outlives the run.
+gstreamer_codec_hw_faulted() {
+  hwf_snap=$(gstreamer_codec_dmesg_snapshot) || return 1
+  grep -Eqi "$GST_CODEC_FAULT_RE" "$hwf_snap"
+}
+
+# gstreamer_refine_codec_probe <rc>
+# Prints <rc>, upgraded from GST_ELEM_MISSING to GST_ELEM_HW_FAULT when the
+# kernel log shows the codec driver failed to come up. Used only by the V4L2
+# hardware codec lookups: for those an absent element accompanied by a driver
+# fault is a broken device, not an unsupported feature, and reporting SKIP
+# there hides exactly the failure the test exists to catch.
+gstreamer_refine_codec_probe() {
+  refine_rc="$1"
+  if [ "$refine_rc" = "$GST_ELEM_MISSING" ] && gstreamer_codec_hw_faulted; then
+    printf '%s\n' "$GST_ELEM_HW_FAULT"
+    return 0
+  fi
+  printf '%s\n' "$refine_rc"
+}
+
+# The codec-wide verdict, kept next to the per-element answers. A wedged codec
+# device does not wedge one element: gst-inspect hangs the same way for every
+# element the driver would have registered, so probing each one costs a further
+# GST_PROBE_TIMEOUT. A run resolving an encoder and two decoders pays it three
+# times over, which is how the outer LAVA timeout gets consumed even though each
+# probe is individually bounded. Recording the first unusable outcome lets the
+# rest of the lookups answer immediately.
+#
+# Named so it matches the entry shape the cache reset deletes, and so it can
+# never collide with a sanitised GStreamer element name.
+GST_CODEC_STATE_KEY="_codec_state"
+
+# gstreamer_codec_state
+# Prints the recorded codec-wide probe status, or fails if none is recorded.
+gstreamer_codec_state() {
+  state_f="$GST_ELEM_CACHE_DIR/$GST_CODEC_STATE_KEY"
+  [ -f "$state_f" ] || return 1
+  state_v=$(cat "$state_f" 2>/dev/null)
+  case "$state_v" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$state_v"
+}
+
+# gstreamer_mark_codec_state <rc>
+# Records a codec-wide probe status. Best effort: if it cannot be written the
+# probes still work, they are just not short-circuited.
+gstreamer_mark_codec_state() {
+  mkdir -p "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$1" > "$GST_ELEM_CACHE_DIR/$GST_CODEC_STATE_KEY" 2>/dev/null || true
+}
+
+# gstreamer_probe_codec_element <element>
+# Resolves one V4L2 hardware codec element. Prints the element name when it is
+# usable and nothing otherwise, returning the GST_ELEM_* classification.
+#
+# Answers from the codec-wide verdict when one is already recorded, so the
+# second and later lookups in a run with a wedged codec cost nothing. Only
+# outcomes that mean the probe could not complete are recorded that way: a
+# missing element is specific to that element and says nothing about the rest.
+gstreamer_probe_codec_element() {
+  probe_elem="$1"
+  if probe_rc=$(gstreamer_codec_state); then
+    printf '%s\n' ""
+    return "$probe_rc"
+  fi
+  has_element "$probe_elem"
+  probe_rc=$?
+  if [ "$probe_rc" -eq 0 ]; then
+    printf '%s\n' "$probe_elem"
+    return "$GST_ELEM_OK"
+  fi
+  if [ "$probe_rc" = "$GST_ELEM_TIMEOUT" ] || [ "$probe_rc" = "$GST_ELEM_NO_TIMEOUT" ]; then
+    log_warn "Codec probe unusable ($(gstreamer_probe_reason "$probe_rc")); skipping further hardware codec probes this run" >&2
+    gstreamer_mark_codec_state "$probe_rc"
+  fi
+  probe_rc=$(gstreamer_refine_codec_probe "$probe_rc")
+  printf '%s\n' ""
+  return "$probe_rc"
+}
+
+# gstreamer_reset_element_cache
+# Drops every cached has_element answer. Use after reloading codec modules or
+# otherwise changing which GStreamer elements are registered.
+# Clears the probe answers this process cached. Refuses any path other than the
+# one derived at load time: the variable is a plain shell variable that a caller
+# could reassign, and this runs from the suite's EXIT trap, so a stray value
+# must not turn cleanup into a delete of whatever that path names. Entries are
+# matched against the shape has_element() writes, so nothing else in a shared
+# TMPDIR is a candidate, and rmdir() removes the directory only if it is empty.
+gstreamer_reset_element_cache() {
+  reset_owned="${TMPDIR:-/tmp}/gst-elem-cache-$$"
+  if [ "$GST_ELEM_CACHE_DIR" != "$reset_owned" ]; then
+    log_warn "Refusing to clear '$GST_ELEM_CACHE_DIR': not this process's cache" >&2
+    return 1
+  fi
+  [ -d "$GST_ELEM_CACHE_DIR" ] || return 0
+  for reset_f in "$GST_ELEM_CACHE_DIR"/*; do
+    [ -f "$reset_f" ] || continue
+    case "${reset_f##*/}" in
+      *[!A-Za-z0-9_]*) continue ;;
+    esac
+    rm -f "$reset_f" 2>/dev/null || true
+  done
+  rmdir "$GST_ELEM_CACHE_DIR" 2>/dev/null || true
+  return 0
 }
 
 # -------------------- Pretty printing (multi-line) --------------------
@@ -390,7 +780,15 @@ gstreamer_log_clip_metadata() {
 
   : >"$metaLog" 2>/dev/null || true
 
-  "$GSTDISCOVER" "$clip" >"$metaLog" 2>&1 || true
+  gstreamer_run_bounded "$GST_PROBE_TIMEOUT" TERM "$GSTDISCOVER" "$clip" >"$metaLog" 2>&1
+  clipmeta_rc=$?
+  if gstreamer_bounded_no_timeout "$clipmeta_rc"; then
+    log_warn "Skipping $GSTDISCOVER: no timeout(1) supporting -s/-k"
+    return 1
+  fi
+  if gstreamer_bounded_timed_out "$clipmeta_rc"; then
+    log_warn "$GSTDISCOVER timed out after ${GST_PROBE_TIMEOUT}s on '$clip'"
+  fi
 
   log_info "Clip metadata ($GSTDISCOVER):"
   while IFS= read -r line; do
@@ -522,25 +920,31 @@ gstreamer_run_gstlaunch_timeout() {
   secs="$1"
   pipe="$2"
 
+  # A non-numeric or non-positive bound is treated as invalid input and
+  # replaced with the default. There is deliberately no unbounded path here.
   case "$secs" in ''|*[!0-9]*) secs=10 ;; esac
+  [ "$secs" -gt 0 ] 2>/dev/null || secs=10
+
   command -v "$GSTBIN" >/dev/null 2>&1 || return 127
 
   gstreamer_print_cmd_multiline "$pipe"
 
-  if [ "$secs" -gt 0 ] 2>/dev/null; then
-    if command -v timeout >/dev/null 2>&1; then
-      # shellcheck disable=SC2086
-      # Send SIGINT instead of SIGTERM to trigger EOS via -e flag
-      timeout --signal=INT "$secs" "$GSTBIN" $GSTLAUNCHFLAGS $pipe
-      return $?
+  # shellcheck disable=SC2086
+  # Send SIGINT instead of SIGTERM to trigger EOS via -e flag
+  gstreamer_run_bounded "$secs" INT "$GSTBIN" $GSTLAUNCHFLAGS $pipe
+  gstlaunch_rc=$?
+
+  if gstreamer_bounded_no_timeout "$gstlaunch_rc"; then
+    log_error "Refusing to run $GSTBIN unbounded: no timeout(1) supporting -s/-k"
+  elif gstreamer_bounded_timed_out "$gstlaunch_rc"; then
+    if [ "$GST_BOUNDED_RAW_RC" = "137" ]; then
+      log_warn "$GSTBIN ignored SIGINT and was killed after ${secs}s + ${GST_KILL_GRACE}s (wedged codec device?)"
     else
-      log_warn "No timeout command available, running without timeout"
+      log_warn "$GSTBIN did not finish within ${secs}s"
     fi
   fi
 
-  # shellcheck disable=SC2086
-  "$GSTBIN" $GSTLAUNCHFLAGS $pipe
-  return $?
+  return "$gstlaunch_rc"
 }
 
 # -------------------- Audio Record/Playback pipeline builders --------------------
@@ -878,25 +1282,21 @@ gstreamer_v4l2_encoder_for_codec() {
   codec="$1"
   case "$codec" in
     h264)
-      if has_element v4l2h264enc; then
-        printf '%s\n' "v4l2h264enc"
-        return 0
-      fi
+      gstreamer_probe_codec_element v4l2h264enc
+      return $?
       ;;
     h265|hevc)
-      if has_element v4l2h265enc; then
-        printf '%s\n' "v4l2h265enc"
-        return 0
-      fi
+      gstreamer_probe_codec_element v4l2h265enc
+      return $?
       ;;
     vp9)
-      # VP9 is decode-only, no encoder support
+      # VP9 is decode-only, no encoder support: genuinely absent, not broken.
       printf '%s\n' ""
-      return 1
+      return "$GST_ELEM_MISSING"
       ;;
   esac
   printf '%s\n' ""
-  return 1
+  return "$GST_ELEM_MISSING"
 }
 
 # gstreamer_v4l2_decoder_for_codec <codec>
@@ -906,26 +1306,20 @@ gstreamer_v4l2_decoder_for_codec() {
   codec="$1"
   case "$codec" in
     h264)
-      if has_element v4l2h264dec; then
-        printf '%s\n' "v4l2h264dec"
-        return 0
-      fi
+      gstreamer_probe_codec_element v4l2h264dec
+      return $?
       ;;
     h265|hevc)
-      if has_element v4l2h265dec; then
-        printf '%s\n' "v4l2h265dec"
-        return 0
-      fi
+      gstreamer_probe_codec_element v4l2h265dec
+      return $?
       ;;
     vp9)
-      if has_element v4l2vp9dec; then
-        printf '%s\n' "v4l2vp9dec"
-        return 0
-      fi
+      gstreamer_probe_codec_element v4l2vp9dec
+      return $?
       ;;
   esac
   printf '%s\n' ""
-  return 1
+  return "$GST_ELEM_MISSING"
 }
 
 # gstreamer_container_ext_for_codec <codec>

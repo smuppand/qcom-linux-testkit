@@ -67,6 +67,13 @@ if ! mkdir -p "$OUTDIR" "$DMESG_DIR" "$ENCODED_DIR"; then
   exit 0
 fi
 
+# Keep the codec-fault evidence with the run's artifacts, and widen the module
+# filter to the set this suite cares about so the single capture below serves
+# both the codec classification and the end-of-run check.
+GST_CODEC_DMESG_DIR="$DMESG_DIR"
+GST_CODEC_MODULE_RE="qcom-iris[^:]*|qcom-venus[^:]*|venus_core[^:]*|[^ ]*video-codec|venus[^:]*|vcodec[^:]*|v4l2[^:]*|video[^:]*|gstreamer[^:]*"
+export GST_CODEC_DMESG_DIR GST_CODEC_MODULE_RE
+
 : >"$RES_FILE"
 : >"$GST_LOG"
 
@@ -123,6 +130,10 @@ cleanup() {
   # Best-effort: try to kill only children first; fall back to name-based kill
   if ! pkill -P "$$" -x gst-launch-1.0 >/dev/null 2>&1; then
     pkill -x gst-launch-1.0 >/dev/null 2>&1 || true
+  fi
+  # The element-probe cache is backed by files under TMPDIR; do not leave them.
+  if command -v gstreamer_reset_element_cache >/dev/null 2>&1; then
+    gstreamer_reset_element_cache
   fi
 }
 trap cleanup INT TERM EXIT
@@ -455,7 +466,15 @@ run_encode_test() {
   
   # Check if encoder is available
   encoder=$(gstreamer_v4l2_encoder_for_codec "$codec")
+  probe_rc=$?
   if [ -z "$encoder" ]; then
+    # A probe that timed out, or could not be bounded, means the codec is
+    # broken - not absent. Reporting SKIP there hides a hardware failure.
+    if gstreamer_probe_unhealthy "$probe_rc"; then
+      log_fail "$testname: FAIL (encoder for $codec unusable: $(gstreamer_probe_reason "$probe_rc"))"
+      fail_count=$((fail_count + 1))
+      return 1
+    fi
     log_warn "Encoder not available for $codec"
     skip_count=$((skip_count + 1))
     return 1
@@ -480,7 +499,12 @@ run_encode_test() {
   fi
   
   log_info "Pipeline: $pipeline"
-  
+
+  # Never judge this run on a file left behind by an earlier one: the encoded
+  # directory is shared between the test definitions in a job, so a stale or
+  # partially written artifact would otherwise satisfy the size check below.
+  rm -f "$output_file" 2>/dev/null || true
+
   # Run encoding
   if gstreamer_run_gstlaunch_timeout "$((duration + 10))" "$pipeline" >>"$test_log" 2>&1; then
     gstRc=0
@@ -489,7 +513,17 @@ run_encode_test() {
   fi
   
   log_info "Encode exit code: $gstRc"
-  
+
+  # An encode that did not exit cleanly is a failure. videotestsrc delivers a
+  # fixed number of buffers and the pipeline EOSes well inside the bound, so a
+  # timeout or a signal here means the encoder never completed - unlike the
+  # playback cases, where running until the bound is the intended behaviour.
+  if [ "$gstRc" -ne 0 ]; then
+    log_fail "$testname: FAIL (rc=$gstRc)"
+    fail_count=$((fail_count + 1))
+    return 1
+  fi
+
   # Check for GStreamer errors in log
   if ! gstreamer_validate_log "$test_log" "$testname"; then
     log_fail "$testname: FAIL (GStreamer errors detected)"
@@ -530,7 +564,13 @@ run_decode_test() {
   
   # Check if decoder is available
   decoder=$(gstreamer_v4l2_decoder_for_codec "$codec")
+  probe_rc=$?
   if [ -z "$decoder" ]; then
+    if gstreamer_probe_unhealthy "$probe_rc"; then
+      log_fail "$testname: FAIL (decoder for $codec unusable: $(gstreamer_probe_reason "$probe_rc"))"
+      fail_count=$((fail_count + 1))
+      return 1
+    fi
     log_warn "Decoder not available for $codec"
     skip_count=$((skip_count + 1))
     return 1
@@ -708,20 +748,19 @@ log_info "=========================================="
 log_info "DMESG ERROR SCAN"
 log_info "=========================================="
 
-# Scan for video-related errors in dmesg
-module_regex="venus|vcodec|v4l2|video|gstreamer"
-exclude_regex="dummy regulator|supply [^ ]+ not found|using dummy regulator"
-
-if command -v scan_dmesg_errors >/dev/null 2>&1; then
-  scan_dmesg_errors "$DMESG_DIR" "$module_regex" "$exclude_regex" || true
-  
+# Report from the run's single dmesg capture rather than re-reading the live
+# buffer. gstreamer_codec_dmesg_snapshot() takes it the first time a codec is
+# classified and is a no-op afterwards, so the errors reported here are the same
+# evidence the codec verdicts were based on.
+if gstreamer_codec_dmesg_snapshot >/dev/null 2>&1; then
+  log_info "dmesg snapshot: $DMESG_DIR/dmesg_snapshot.log"
   if [ -s "$DMESG_DIR/dmesg_errors.log" ]; then
     log_warn "dmesg scan found video-related warnings or errors in $DMESG_DIR/dmesg_errors.log"
   else
     log_info "No relevant video-related errors found in dmesg"
   fi
 else
-  log_info "scan_dmesg_errors not available, skipping dmesg scan"
+  log_info "dmesg snapshot unavailable, skipping dmesg scan"
 fi
 
 # -------------------- Summary --------------------
