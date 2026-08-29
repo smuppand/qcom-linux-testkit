@@ -81,7 +81,7 @@ ALLOW_RELAUNCH="${ALLOW_RELAUNCH:-0}"
 
 GPU_MODULE="${GPU_MODULE:-msm_kgsl}"
 GPU_OVERLAY_DEVICE="${GPU_OVERLAY_DEVICE:-/dev/kgsl-3d0}"
-GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-libgbm-msm1}"
+GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-}"
 
 OS_ID="unknown"
 DISTRO_GPU_HANDLING_SUPPORTED=0
@@ -287,6 +287,17 @@ fi
 
 [ -n "$OS_ID" ] || OS_ID="unknown"
 
+if [ -z "$GPU_OVERLAY_GBM_PACKAGE" ]; then
+    case "$OS_ID" in
+        ubuntu)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm"
+            ;;
+        *)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm1"
+            ;;
+    esac
+fi
+
 case "$OS_ID" in
     debian|ubuntu|centos|rhel|fedora)
         DISTRO_GPU_HANDLING_SUPPORTED=1
@@ -442,17 +453,19 @@ fi
 
 case "$OS_ID" in
     debian|ubuntu|centos|rhel|fedora)
-        if ! command -v weston_prepare_runtime >/dev/null 2>&1; then
+        if [ "$OS_ID" = "ubuntu" ] &&
+           command -v display_adopt_gnome_wayland_session >/dev/null 2>&1 &&
+           display_adopt_gnome_wayland_session; then
+            log_info "Using the active GNOME Wayland session for onscreen EGL validation"
+        elif ! command -v weston_prepare_runtime >/dev/null 2>&1; then
             log_fail "$TESTNAME FAIL - weston_prepare_runtime helper is unavailable"
             echo "$TESTNAME FAIL" >"$RES_FILE"
             exit 0
-        fi
-
-        if ! weston_prepare_runtime \
-            "$TESTNAME" \
-            "$WAIT_SECS" \
-            client \
-            "$ALLOW_RELAUNCH"; then
+        elif ! weston_prepare_runtime \
+                "$TESTNAME" \
+                "$WAIT_SECS" \
+                client \
+                "$ALLOW_RELAUNCH"; then
             log_fail "$TESTNAME FAIL - no usable managed Weston runtime is available for onscreen EGL clients"
             echo "$TESTNAME FAIL" >"$RES_FILE"
             exit 0
@@ -499,6 +512,15 @@ if ! display_resolve_test_fps_gate_policy \
     log_fail "$TESTNAME FAIL - failed to resolve testcase FPS gate policy"
     echo "$TESTNAME FAIL" >"$RES_FILE"
     exit 0
+fi
+
+if [ "${DISPLAY_RUNTIME_MODEL:-}" = "desktop-gnome-session" ]; then
+    # GDM intentionally throttles non-interactive greeter clients, so their
+    # compositor frame cadence is not a display-refresh or GPU-performance
+    # measurement. The client connection and EGL startup remain validated.
+    DISPLAY_TEST_FPS_POLICY="desktop-session-connectivity"
+    export DISPLAY_TEST_FPS_POLICY
+    log_info "FPS policy, desktop-session-connectivity, GNOME greeter throttling is not performance evidence"
 fi
 
 if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-functional-cap" ]; then
@@ -567,8 +589,9 @@ fi
 
 log_info "Using client binary, $BIN"
 log_info "Wayland socket, ${DISPLAY_WAYLAND_SOCKET:-<unknown>}"
-log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
-log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+log_info "Wayland session user, ${DISPLAY_WAYLAND_SESSION_USER:-current-user}"
+log_info "XDG_RUNTIME_DIR, ${DISPLAY_WAYLAND_SESSION_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-<unset>}}"
+log_info "WAYLAND_DISPLAY, $(basename "${DISPLAY_WAYLAND_SOCKET:-${WAYLAND_DISPLAY:-<unset>}}")"
 
 log_info "Client mode, compositor-synchronized weston-simple-egl"
 # Retain the existing environment on Yocto. Upstream weston-simple-egl prints
@@ -592,9 +615,32 @@ rc=0
 if command -v run_with_timeout >/dev/null 2>&1; then
     log_info "Using run_with_timeout"
 
-    if command -v stdbuf >/dev/null 2>&1; then
+    if [ -n "${DISPLAY_WAYLAND_SESSION_USER:-}" ] &&
+       command -v timeout >/dev/null 2>&1; then
+        log_info "Using session-local timeout to reap the desktop Wayland client"
+
+        if command -v stdbuf >/dev/null 2>&1; then
+            display_run_in_wayland_session \
+                timeout \
+                "$DURATION" \
+                stdbuf \
+                -oL \
+                -eL \
+                "$BIN" >>"$RUN_LOG" 2>&1
+            rc=$?
+        else
+            log_warn "stdbuf is unavailable, running the client without line buffering"
+
+            display_run_in_wayland_session \
+                timeout \
+                "$DURATION" \
+                "$BIN" >>"$RUN_LOG" 2>&1
+            rc=$?
+        fi
+    elif command -v stdbuf >/dev/null 2>&1; then
         run_with_timeout \
             "$DURATION" \
+            display_run_in_wayland_session \
             stdbuf \
             -oL \
             -eL \
@@ -605,6 +651,7 @@ if command -v run_with_timeout >/dev/null 2>&1; then
 
         run_with_timeout \
             "$DURATION" \
+            display_run_in_wayland_session \
             "$BIN" >>"$RUN_LOG" 2>&1
         rc=$?
     fi
@@ -624,7 +671,7 @@ else
     [ -n "$duration_secs" ] || duration_secs=30
     [ -n "$stop_grace_secs" ] || stop_grace_secs=3
 
-    "$BIN" >>"$RUN_LOG" 2>&1 &
+    display_run_in_wayland_session "$BIN" >>"$RUN_LOG" 2>&1 &
     APP_PID=$!
     run_elapsed=0
 
@@ -713,6 +760,8 @@ fi
 
 if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-functional-cap" ]; then
     log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=desktop-functional refresh=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz target=${DISPLAY_TEST_FPS_EXPECTED:-unknown} min_ok=${DISPLAY_TEST_FPS_MIN_OK:-unknown} graphics=${DISPLAY_BUILD_FLAVOUR} source=client-synchronized"
+elif [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-session-connectivity" ]; then
+    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=desktop-session-connectivity graphics=${DISPLAY_BUILD_FLAVOUR} source=client-synchronized"
 elif [ "${DISPLAY_FPS_MODE:-}" = "detected" ]; then
     log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=${DISPLAY_FPS_MODE} refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK} graphics=${DISPLAY_BUILD_FLAVOUR} source=client-synchronized"
 else
@@ -723,6 +772,12 @@ final="PASS"
 
 case "$rc" in
     0|143)
+        ;;
+    124)
+        if [ "${DISPLAY_RUNTIME_MODEL:-}" != "desktop-gnome-session" ]; then
+            log_fail "$TESTNAME execution timed out unexpectedly, rc=$rc runtime=${DISPLAY_RUNTIME_MODEL:-unknown}"
+            final="FAIL"
+        fi
         ;;
     *)
         log_fail "$TESTNAME execution failed, rc=$rc"

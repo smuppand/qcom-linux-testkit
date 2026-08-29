@@ -656,6 +656,114 @@ discover_wayland_socket_anywhere() {
     return 1
 }
 
+# Adopt the live GNOME Wayland session without changing the desktop compositor.
+# The selected socket must be owned by a running gnome-shell user so later
+# clients can be executed with the same uid and runtime directory.
+display_adopt_gnome_wayland_session() {
+    dagws_pid=""
+    dagws_user=""
+    dagws_uid=""
+    dagws_runtime_dir=""
+    dagws_socket=""
+    dagws_socket_uid=""
+    dagws_home=""
+
+    DISPLAY_WAYLAND_SESSION_USER=""
+    DISPLAY_WAYLAND_SESSION_HOME=""
+    DISPLAY_WAYLAND_SESSION_RUNTIME_DIR=""
+    DISPLAY_WAYLAND_SOCKET=""
+    DISPLAY_RUNTIME_MODEL="unknown"
+    export DISPLAY_WAYLAND_SESSION_USER
+    export DISPLAY_WAYLAND_SESSION_HOME
+    export DISPLAY_WAYLAND_SESSION_RUNTIME_DIR
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    command -v pgrep >/dev/null 2>&1 || return 1
+    command -v ps >/dev/null 2>&1 || return 1
+    command -v id >/dev/null 2>&1 || return 1
+
+    for dagws_pid in $(pgrep -x gnome-shell 2>/dev/null); do
+        dagws_user="$(ps -o user= -p "$dagws_pid" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+        [ -n "$dagws_user" ] || continue
+
+        dagws_uid="$(id -u "$dagws_user" 2>/dev/null || true)"
+        [ -n "$dagws_uid" ] || continue
+
+        dagws_runtime_dir="/run/user/$dagws_uid"
+        [ -d "$dagws_runtime_dir" ] || continue
+
+        for dagws_socket in "$dagws_runtime_dir"/wayland-*; do
+            [ -S "$dagws_socket" ] || continue
+
+            dagws_socket_uid="$(stat -c '%u' "$dagws_socket" 2>/dev/null || true)"
+            [ "$dagws_socket_uid" = "$dagws_uid" ] || continue
+
+            dagws_home="$(getent passwd "$dagws_user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')"
+            [ -n "$dagws_home" ] || dagws_home="/"
+
+            DISPLAY_WAYLAND_SESSION_USER="$dagws_user"
+            DISPLAY_WAYLAND_SESSION_HOME="$dagws_home"
+            DISPLAY_WAYLAND_SESSION_RUNTIME_DIR="$dagws_runtime_dir"
+            DISPLAY_WAYLAND_SOCKET="$dagws_socket"
+            DISPLAY_RUNTIME_MODEL="desktop-gnome-session"
+            export DISPLAY_WAYLAND_SESSION_USER
+            export DISPLAY_WAYLAND_SESSION_HOME
+            export DISPLAY_WAYLAND_SESSION_RUNTIME_DIR
+            export DISPLAY_WAYLAND_SOCKET
+            export DISPLAY_RUNTIME_MODEL
+
+            log_info "Adopted GNOME Wayland session, user=$dagws_user socket=$dagws_socket"
+            return 0
+        done
+    done
+
+    return 1
+}
+
+# Run a command in the user context that owns an adopted GNOME Wayland socket.
+# When no GNOME session was adopted, preserve the caller's existing execution.
+display_run_in_wayland_session() {
+    drws_user="${DISPLAY_WAYLAND_SESSION_USER:-}"
+    drws_home="${DISPLAY_WAYLAND_SESSION_HOME:-/}"
+    drws_runtime_dir="${DISPLAY_WAYLAND_SESSION_RUNTIME_DIR:-}"
+    drws_socket="${DISPLAY_WAYLAND_SOCKET:-}"
+
+    if [ -z "$drws_user" ] ||
+       [ -z "$drws_runtime_dir" ] ||
+       [ -z "$drws_socket" ]; then
+        "$@"
+        return $?
+    fi
+
+    if [ "$(id -un 2>/dev/null || true)" = "$drws_user" ]; then
+        env \
+            HOME="$drws_home" \
+            XDG_RUNTIME_DIR="$drws_runtime_dir" \
+            WAYLAND_DISPLAY="$(basename "$drws_socket")" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$drws_runtime_dir/bus" \
+            "$@"
+        return $?
+    fi
+
+    if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        log_error "Cannot access the adopted GNOME Wayland session as user=$drws_user without root"
+        return 1
+    fi
+
+    if ! command -v runuser >/dev/null 2>&1; then
+        log_error "runuser is unavailable, cannot access the adopted GNOME Wayland session"
+        return 1
+    fi
+
+    runuser -u "$drws_user" -- env \
+        HOME="$drws_home" \
+        XDG_RUNTIME_DIR="$drws_runtime_dir" \
+        WAYLAND_DISPLAY="$(basename "$drws_socket")" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$drws_runtime_dir/bus" \
+        "$@"
+}
+
 adopt_wayland_env_from_socket() {
     sock="$1"
     [ -n "$sock" ] || return 1
@@ -5450,10 +5558,19 @@ display_prepare_desktop_graphics_stack() {
     dpdgs_mode="${2:-auto}"
     dpdgs_gpu_module="${3:-msm_kgsl}"
     dpdgs_gpu_device="${4:-/dev/kgsl-3d0}"
-    dpdgs_gbm_package="${5:-libgbm-msm1}"
+    dpdgs_gbm_package="${5:-}"
     dpdgs_rc=0
     dpdgs_package_changed=0
     dpdgs_boot_changed=0
+
+    if [ -z "$dpdgs_gbm_package" ]; then
+        if command -v pkg_detect_os_id >/dev/null 2>&1 &&
+           [ "$(pkg_detect_os_id 2>/dev/null || true)" = "ubuntu" ]; then
+            dpdgs_gbm_package="libgbm-msm"
+        else
+            dpdgs_gbm_package="libgbm-msm1"
+        fi
+    fi
 
     case "$dpdgs_mode" in
         auto)
@@ -5865,6 +5982,16 @@ display_apply_test_fps_gate_policy() {
             ;;
     esac
 
+    if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-session-connectivity" ]; then
+        if [ "$datfgp_count" -eq 0 ]; then
+            log_warn "No FPS samples were produced by the desktop session, compositor connectivity was validated"
+        else
+            log_info "Recording desktop-session FPS samples without performance gating, samples=$datfgp_count avg=$datfgp_avg"
+        fi
+
+        return 0
+    fi
+
     if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" != "desktop-functional-cap" ]; then
         if command -v display_fps_gate_avg >/dev/null 2>&1; then
             display_fps_gate_avg "$datfgp_avg" "$datfgp_count"
@@ -5912,4 +6039,3 @@ display_apply_test_fps_gate_policy() {
     log_info "Desktop functional FPS gate passed, avg=$datfgp_avg (~$datfgp_rounded) >= ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
     return 0
 }
-
