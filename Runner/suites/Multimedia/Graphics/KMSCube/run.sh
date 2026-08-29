@@ -69,7 +69,7 @@ GPU_BOOT_ARTIFACTS_CHANGED=0
 
 GPU_MODULE="msm_kgsl"
 GPU_OVERLAY_DEVICE="/dev/kgsl-3d0"
-GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-libgbm-msm1}"
+GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-}"
 
 DISPLAY_MANAGER_SERVICE="${DISPLAY_MANAGER_SERVICE:-display-manager.service}"
 DISPLAY_MANAGER_STATE_FILE="/tmp/qcom-testkit-${TESTNAME}-display-manager.$$.state"
@@ -113,6 +113,17 @@ elif [ -r /etc/os-release ]; then
 fi
 
 [ -n "$OS_ID" ] || OS_ID="unknown"
+
+if [ -z "$GPU_OVERLAY_GBM_PACKAGE" ]; then
+    case "$OS_ID" in
+        ubuntu)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm"
+            ;;
+        *)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm1"
+            ;;
+    esac
+fi
 
 case "$OS_ID" in
     debian|ubuntu|centos|rhel|fedora)
