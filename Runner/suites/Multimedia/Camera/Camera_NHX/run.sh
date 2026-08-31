@@ -74,6 +74,7 @@ if [ -z "$MARKER" ]; then
 fi
 
 CAM_SERVER_PRESENT=0
+CAM_SERVER_SERVICE=""
 CAM_SERVER_STOPPED_FOR_TEST=0
 
 NHX_JSON="${NHX_JSON:-}"
@@ -90,7 +91,7 @@ cleanup() {
   fi
 
   if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ] && [ "$CAM_SERVER_PRESENT" -eq 1 ]; then
-    systemd_service_start_safe "cam-server" >/dev/null 2>&1 || true
+    systemd_service_start_safe "$CAM_SERVER_SERVICE" >/dev/null 2>&1 || true
   fi
 
   if [ -n "${MARKER:-}" ]; then
@@ -492,36 +493,59 @@ log_info "NHX_OUTDIR=$NHX_OUTDIR"
 log_info "CKSUM_TOOL=${CKSUM_TOOL:-none}"
 
 # -----------------------------------------------------------------------------
-# cam-server stop before NHX
+# Camera server stop before NHX
 # -----------------------------------------------------------------------------
-if systemd_service_exists "cam-server"; then
+CAM_SERVER_SERVICE="$(
+  systemd_service_first_existing \
+    "qti-cam-server.service" \
+    "cam-server.service" \
+    2>/dev/null || true
+)"
+
+if [ -n "$CAM_SERVER_SERVICE" ]; then
   CAM_SERVER_PRESENT=1
 
   CAM_SERVER_TS_BEFORE_STOP='5 minutes ago'
 
-  log_info "cam-server status before stop"
-  systemd_service_status_log "cam-server BEFORE stop (status only)" "$RUN_LOG" "cam-server" || true
+  log_info "Camera server selected for NHX: $CAM_SERVER_SERVICE"
+  log_info "Camera server status before NHX"
+  systemd_service_status_log "Camera server BEFORE NHX (status only)" \
+    "$RUN_LOG" "$CAM_SERVER_SERVICE" || true
 
-  log_info "cam-server stdout before stop"
-  systemd_service_stdout_since "cam-server BEFORE stop (stdout recent)" \
-    "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "cam-server.service" || true
+  log_info "Camera server stdout before NHX"
+  systemd_service_stdout_since "Camera server BEFORE NHX (stdout recent)" \
+    "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "$CAM_SERVER_SERVICE" || true
 
-  log_info "Stopping cam-server before nhx.sh"
-  if systemd_service_stop_safe "cam-server"; then
+  if systemd_service_is_active "$CAM_SERVER_SERVICE"; then
+    log_info "Stopping active camera server before nhx.sh"
+
+    if ! systemd_service_stop_safe "$CAM_SERVER_SERVICE"; then
+      log_fail "$TESTNAME FAIL - unable to stop active $CAM_SERVER_SERVICE before nhx.sh"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+
+    if systemd_service_is_active "$CAM_SERVER_SERVICE"; then
+      log_fail "$TESTNAME FAIL - $CAM_SERVER_SERVICE remains active after stop request"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+
     CAM_SERVER_STOPPED_FOR_TEST=1
     CAM_SERVER_TS_AFTER_STOP="$(date '+%Y-%m-%d %H:%M:%S')"
 
-    log_info "cam-server status after stop"
-    systemd_service_status_log "cam-server AFTER stop (status only)" "$RUN_LOG" "cam-server" || true
+    log_info "Camera server status after stop"
+    systemd_service_status_log "Camera server AFTER stop (status only)" \
+      "$RUN_LOG" "$CAM_SERVER_SERVICE" || true
 
-    log_info "cam-server stdout after stop"
-    systemd_service_stdout_since "cam-server AFTER stop (stdout since stop marker)" \
-      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "cam-server.service" || true
+    log_info "Camera server stdout after stop"
+    systemd_service_stdout_since "Camera server AFTER stop (stdout since stop marker)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "$CAM_SERVER_SERVICE" || true
   else
-    log_warn "Failed to stop cam-server before nhx.sh"
+    log_info "Camera server was already inactive, leaving it inactive after NHX"
   fi
 else
-  log_info "cam-server service not present, continuing"
+  log_info "No qti-cam-server.service or cam-server.service present, continuing"
 fi
 
 # -----------------------------------------------------------------------------
@@ -616,25 +640,26 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# cam-server start after NHX
+# Restore camera server state after NHX
 # -----------------------------------------------------------------------------
 if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ]; then
-  log_info "Starting cam-server after nhx.sh"
-  if systemd_service_start_safe "cam-server"; then
+  log_info "Restoring camera server after nhx.sh: $CAM_SERVER_SERVICE"
+  if systemd_service_start_safe "$CAM_SERVER_SERVICE"; then
     CAM_SERVER_STOPPED_FOR_TEST=0
     CAM_SERVER_TS_AFTER_START="$(date '+%Y-%m-%d %H:%M:%S')"
 
-    log_info "cam-server status after start"
-    systemd_service_status_log "cam-server AFTER start (status only)" "$RUN_LOG" "cam-server" || true
+    log_info "Camera server status after restore"
+    systemd_service_status_log "Camera server AFTER restore (status only)" \
+      "$RUN_LOG" "$CAM_SERVER_SERVICE" || true
 
-    log_info "cam-server stdout after start"
-    systemd_service_stdout_since "cam-server AFTER start (stdout since start marker)" \
-      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "cam-server.service" || true
+    log_info "Camera server stdout after restore"
+    systemd_service_stdout_since "Camera server AFTER restore (stdout since restore marker)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "$CAM_SERVER_SERVICE" || true
   else
-    log_warn "Failed to start cam-server after nhx.sh"
+    log_warn "Failed to restore camera server after nhx.sh: $CAM_SERVER_SERVICE"
   fi
 else
-  log_info "cam-server was not stopped for test, skipping restart"
+  log_info "Camera server state was not changed for NHX, skipping restore"
 fi
 
 # -----------------------------------------------------------------------------

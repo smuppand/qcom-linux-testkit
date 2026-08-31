@@ -4398,6 +4398,20 @@ systemd_service_exists() {
     systemctl cat "$svc" >/dev/null 2>&1
 }
 
+# Print the first existing systemd service/unit from the supplied candidates.
+systemd_service_first_existing() {
+    for svc in "$@"; do
+        [ -n "$svc" ] || continue
+
+        if systemd_service_exists "$svc"; then
+            printf '%s\n' "$svc"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # Check whether a systemd service/unit is currently active.
 systemd_service_is_active() {
     svc="$1"
