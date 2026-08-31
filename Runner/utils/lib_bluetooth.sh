@@ -124,8 +124,51 @@ bt_ubuntu_user_systemctl() {
     return 1
 }
 
+# Ensure the Debian-family Bluetooth control tools required by the shared
+# power and scan helpers are installed before a suite starts.
+bt_prepare_debian_bluetooth_tools() {
+    bt_pdbt_os_id="$1"
+
+    case "$bt_pdbt_os_id" in
+        debian|ubuntu)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        log_fail "Debian-family Bluetooth tool preparation must run as root"
+        return 1
+    fi
+
+    if ! command -v pkg_ensure_command >/dev/null 2>&1 &&
+       [ -n "${TOOLS:-}" ] &&
+       [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+        # shellcheck disable=SC1090,SC1091
+        . "$TOOLS/lib_pkg_provider.sh"
+    fi
+
+    if ! command -v pkg_ensure_command >/dev/null 2>&1; then
+        log_fail "Bluetooth command package helper is unavailable"
+        return 1
+    fi
+
+    # rfkill is used for bounded controller recovery. expect provides the PTY
+    # needed for the same bluetoothctl interaction as a manual session.
+    for bt_pdbt_command in rfkill expect; do
+        if ! pkg_ensure_command "$bt_pdbt_command"; then
+            log_fail "Failed to prepare required Bluetooth command: $bt_pdbt_command"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 # Prepare the Ubuntu Bluetooth stack used by all current BT tests.
-# Debian, Yocto, and other distributions return immediately without changes.
+# Debian receives the shared control-tool preparation and no Ubuntu-specific
+# service or desktop changes. Yocto and other distributions return unchanged.
 bt_prepare_ubuntu_stack() {
     if command -v pkg_detect_os_id >/dev/null 2>&1; then
         bt_pus_os_id="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
@@ -134,6 +177,10 @@ bt_prepare_ubuntu_stack() {
             bt_os_release_value ID 2>/dev/null |
                 tr '[:upper:]' '[:lower:]'
         )"
+    fi
+
+    if ! bt_prepare_debian_bluetooth_tools "$bt_pus_os_id"; then
+        return 1
     fi
 
     if [ "$bt_pus_os_id" != "ubuntu" ]; then
@@ -1100,6 +1147,14 @@ bt_scan_devices() {
         fi
     done
 
+    if [ "${BT_SCAN_INTERACTIVE_FALLBACK:-1}" = "1" ] && \
+       command -v expect >/dev/null 2>&1; then
+        log_warn "bt_scan_devices: trying expect PTY fallback"
+        if bt_scan_devices_expect "$mac_id"; then
+            return 0
+        fi
+    fi
+
     if [ "${BT_SCAN_INTERACTIVE_FALLBACK:-1}" = "1" ]; then
         if bt_scan_devices_interactive_fallback "$adapter" "$scan_window" "$mac_id_up"; then
             return 0
@@ -1748,6 +1803,111 @@ btctl_script() {
             sleep 0.2
         done
         sleep 1
+    } | bluetoothctl 2>/dev/null
+}
+
+# Request a Bluetooth controller power transition while keeping bluetoothctl
+# connected long enough for BlueZ to complete its asynchronous operation.
+# Args: <adapter> <on|off>
+bt_request_power() {
+    # Keep the adapter argument for API compatibility. The original helper
+    # deliberately used BlueZ's default controller, which is required by some
+    # minimal/Yocto bluetoothctl implementations.
+    want="${2:-}"
+    settle_seconds="${BT_POWER_REQUEST_WAIT:-5}"
+
+    case "$want" in
+        on|off)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    case "$settle_seconds" in
+        ""|*[!0-9]*)
+            settle_seconds=5
+            ;;
+    esac
+
+    if [ "$settle_seconds" -lt 1 ] 2>/dev/null; then
+        settle_seconds=1
+    fi
+
+    request_timeout=$((settle_seconds + 8))
+
+    # bluetoothctl changes behaviour when stdin is a pipe on some BlueZ
+    # releases. Use a PTY when expect is available, matching the manual
+    # `bluetoothctl` flow and waiting for BlueZ to acknowledge the command.
+    if command -v expect >/dev/null 2>&1; then
+        BT_POWER_REQUEST_MODE="$want" \
+            BT_POWER_REQUEST_SETTLE="$settle_seconds" \
+            expect <<'__BT_POWER__'
+                set timeout 15
+                set mode $env(BT_POWER_REQUEST_MODE)
+                set settle $env(BT_POWER_REQUEST_SETTLE)
+
+                proc wait_prompt {} {
+                    expect {
+                        -re {(\r\n|\n)?(\[.*\][#>]|[#>])} {
+                            return 1
+                        }
+                        timeout {
+                            return 0
+                        }
+                        eof {
+                            return 0
+                        }
+                    }
+                }
+
+                spawn bluetoothctl
+                if {![wait_prompt]} {
+                    exit 1
+                }
+
+                send "power $mode\r"
+                expect {
+                    -re {Changing power (on|off) succeeded} {}
+                    -re {(Failed|failed|not available|No default controller)} {
+                        exit 1
+                    }
+                    timeout {
+                        exit 1
+                    }
+                    eof {
+                        exit 1
+                    }
+                }
+
+                after [expr {$settle * 1000}]
+                send "show\r"
+                if {![wait_prompt]} {
+                    exit 1
+                }
+
+                send "quit\r"
+                expect {
+                    eof {}
+                    timeout {}
+                }
+__BT_POWER__
+        return $?
+    fi
+
+    if command -v run_with_timeout >/dev/null 2>&1; then
+        {
+            printf 'power %s\n' "$want"
+            sleep "$settle_seconds"
+            printf 'quit\n'
+        } | run_with_timeout "$request_timeout" bluetoothctl 2>/dev/null
+        return $?
+    fi
+
+    {
+        printf 'power %s\n' "$want"
+        sleep "$settle_seconds"
+        printf 'quit\n'
     } | bluetoothctl 2>/dev/null
 }
 
@@ -2773,28 +2933,81 @@ btgetpower() {
         )"
     fi
  
+    # Newer BlueZ versions complete `show` synchronously when invoked with
+    # arguments. Prefer that form before the interactive fallback below. The
+    # fallback is retained for minimal images where non-interactive output is
+    # incomplete.
     if [ -n "$mac" ]; then
+        if command -v run_with_timeout >/dev/null 2>&1; then
+            out="$(
+                run_with_timeout 3 bluetoothctl show "$mac" 2>/dev/null \
+                    | sanitize_bt_output || true
+            )"
+        else
+            out="$(bluetoothctl show "$mac" 2>/dev/null | sanitize_bt_output || true)"
+        fi
+
+        state="$(printf '%s\n' "$out" \
+            | awk -F':[[:space:]]*' '
+                /^[[:space:]]*Powered:/ {
+                    v = tolower($2);
+                    gsub(/\r/, "", v);
+                    gsub(/[[:space:]]+/, "", v);
+                    print v;
+                    exit
+                }
+            ')"
+    fi
+
+    # The default controller form is the most portable query on Debian and
+    # Ubuntu. It also covers BlueZ releases that do not accept an address as
+    # the argument to `show`.
+    if [ -z "$state" ]; then
+        if command -v run_with_timeout >/dev/null 2>&1; then
+            out="$(
+                run_with_timeout 3 bluetoothctl show 2>/dev/null \
+                    | sanitize_bt_output || true
+            )"
+        else
+            out="$(bluetoothctl show 2>/dev/null | sanitize_bt_output || true)"
+        fi
+
+        state="$(printf '%s\n' "$out" \
+            | awk -F':[[:space:]]*' '
+                /^[[:space:]]*Powered:/ {
+                    v = tolower($2);
+                    gsub(/\r/, "", v);
+                    gsub(/[[:space:]]+/, "", v);
+                    print v;
+                    exit
+                }
+            ')"
+    fi
+
+    if [ -z "$state" ] && [ -n "$mac" ]; then
         out="$(
             btctl_script "show $mac" "quit" 2>/dev/null \
                 | sanitize_bt_output || true
         )"
-    else
+    elif [ -z "$state" ]; then
         out="$(
             btctl_script "show" "quit" 2>/dev/null \
                 | sanitize_bt_output || true
         )"
     fi
  
-    state="$(printf '%s\n' "$out" \
-        | awk -F':[[:space:]]*' '
-            /^[[:space:]]*Powered:/ {
-                v = tolower($2);
-                gsub(/\r/, "", v);
-                gsub(/[[:space:]]+/, "", v);
-                print v;
-                exit
-            }
-        ')"
+    if [ -z "$state" ]; then
+        state="$(printf '%s\n' "$out" \
+            | awk -F':[[:space:]]*' '
+                /^[[:space:]]*Powered:/ {
+                    v = tolower($2);
+                    gsub(/\r/, "", v);
+                    gsub(/[[:space:]]+/, "", v);
+                    print v;
+                    exit
+                }
+            ')"
+    fi
  
     # Fallback: try default controller if adapter-specific attempt didn’t yield Powered:
     if [ -z "$state" ]; then
@@ -2855,37 +3068,71 @@ btpower() {
     fi
  
     log_info "btpower: requesting '$want' on $dev (current=$cur_state)"
- 
-    # Drive bluetoothctl interactively (works on ramdisk where non-interactive list/show may be empty)
-    # Do NOT use "select hci0" (it can say "Controller hci0 not available" even when controller exists).
-    btctl_script "power $want" "quit" >/dev/null 2>&1 || true
- 
-    i=0
-    max_tries=10
+
+    request_attempts="${BT_POWER_REQUEST_ATTEMPTS:-3}"
+    verify_attempts="${BT_POWER_VERIFY_ATTEMPTS:-10}"
+    retry_delay="${BT_POWER_REQUEST_RETRY_DELAY:-2}"
+
+    case "$request_attempts" in
+        ""|*[!0-9]*) request_attempts=3 ;;
+    esac
+    case "$verify_attempts" in
+        ""|*[!0-9]*) verify_attempts=10 ;;
+    esac
+    case "$retry_delay" in
+        ""|*[!0-9]*) retry_delay=2 ;;
+    esac
+
+    if [ "$request_attempts" -lt 1 ] 2>/dev/null; then
+        request_attempts=1
+    fi
+    if [ "$verify_attempts" -lt 1 ] 2>/dev/null; then
+        verify_attempts=1
+    fi
+
+    log_info "btpower: request attempts=$request_attempts verify attempts=$verify_attempts retry delay=${retry_delay}s"
+    if command -v expect >/dev/null 2>&1; then
+        log_info "btpower: using an expect PTY for interactive bluetoothctl power requests"
+    else
+        log_warn "btpower: expect is unavailable, using the portable stdin-pipe fallback"
+    fi
+
+    request_attempt=1
     state=""
     pstate=""
- 
-    while [ "$i" -lt "$max_tries" ]; do
-        # Read Powered via btgetpower (must be interactive-based implementation)
-        state="$(btgetpower "$dev" 2>/dev/null || true)"
- 
-        if [ "$want" = "on" ] && [ "$state" = "yes" ]; then
-            log_info "btpower: $dev Powered=yes after request."
-            return 0
+
+    while [ "$request_attempt" -le "$request_attempts" ]; do
+        # Drive bluetoothctl interactively against BlueZ's default controller,
+        # which matches the established minimal/ramdisk flow. Its exit status
+        # is informational because BlueZ completes power changes asynchronously.
+        if ! bt_request_power "$dev" "$want" >/dev/null 2>&1; then
+            log_warn "btpower: bluetoothctl request attempt $request_attempt/$request_attempts exited without confirmation"
         fi
- 
-        if [ "$want" = "off" ] && [ "$state" = "no" ]; then
-            log_info "btpower: $dev Powered=no after request."
-            return 0
-        fi
- 
-        # If Powered line is not available yet, try to parse PowerState as an informational fallback
-        # (Some stacks lag on Powered; PowerState can show transitions like off-enabling/on-disabling.)
+
+        verify_attempt=1
+        while [ "$verify_attempt" -le "$verify_attempts" ]; do
+            state="$(btgetpower "$dev" 2>/dev/null || true)"
+
+            if [ "$want" = "on" ] && [ "$state" = "yes" ]; then
+                log_info "btpower: $dev Powered=yes after request attempt $request_attempt."
+                return 0
+            fi
+
+            if [ "$want" = "off" ] && [ "$state" = "no" ]; then
+                log_info "btpower: $dev Powered=no after request attempt $request_attempt."
+                return 0
+            fi
+
+            sleep 1
+            verify_attempt=$((verify_attempt + 1))
+        done
+
+        # Keep PowerState as diagnostic evidence only. A PASS always requires
+        # the stable Powered=yes/no value above.
         out="$(
             btctl_script "show" "quit" 2>/dev/null \
                 | sanitize_bt_output || true
         )"
- 
         pstate="$(printf '%s\n' "$out" \
             | awk -F':[[:space:]]*' '
                 /^[[:space:]]*PowerState:/ {
@@ -2895,11 +3142,13 @@ btpower() {
                     print v;
                     exit
                 }')"
- 
-        # If Powered was empty but PowerState suggests we reached a stable end state,
-        # keep waiting a little more for Powered to update (do not treat pstate as PASS alone).
-        sleep 1
-        i=$((i + 1))
+
+        if [ "$request_attempt" -lt "$request_attempts" ]; then
+            log_warn "btpower: request attempt $request_attempt/$request_attempts did not reach $want, retrying in ${retry_delay}s (Powered=${state:-unknown}, PowerState=${pstate:-unknown})"
+            sleep "$retry_delay"
+        fi
+
+        request_attempt=$((request_attempt + 1))
     done
  
     if [ -z "$state" ]; then
