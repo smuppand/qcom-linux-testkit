@@ -53,7 +53,7 @@ ALLOW_RELAUNCH="${ALLOW_RELAUNCH:-0}"
 REQUESTED_GRAPHICS_MODE="default"
 GPU_MODULE="${GPU_MODULE:-msm_kgsl}"
 GPU_OVERLAY_DEVICE="${GPU_OVERLAY_DEVICE:-/dev/kgsl-3d0}"
-GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-libgbm-msm1}"
+GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-}"
 CLIENT_PID=""
 
 while [ "$#" -gt 0 ]; do
@@ -152,6 +152,17 @@ elif [ -r /etc/os-release ]; then
     )"
 fi
 [ -n "$OS_ID" ] || OS_ID="unknown"
+
+if [ -z "$GPU_OVERLAY_GBM_PACKAGE" ]; then
+    case "$OS_ID" in
+        ubuntu)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm"
+            ;;
+        *)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm1"
+            ;;
+    esac
+fi
 
 DISTRO_GPU_HANDLING_SUPPORTED=0
 case "$OS_ID" in

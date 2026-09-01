@@ -1,9 +1,12 @@
 Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 
-SPDX-License-Identifier: BSD-3-Clause# weston-simple-egl GraphicsTest Scripts for Qualcomm Linux based platform (Yocto)
+SPDX-License-Identifier: BSD-3-Clause
+
+# weston-simple-egl Graphics Test
+
 # Overview
 
-Graphics scripts automates the validation of Graphics OpenGL ES 2.0 capabilities on the Qualcomm RB3 Gen2 platform running a Yocto-based Linux system. It utilizes Weston-Simple-EGL test app which is publicly available at https://github.com/krh/weston
+This suite validates OpenGL ES 2.0 through the `weston-simple-egl` Wayland client on Qualcomm Linux platforms. It supports image-provided Weston on Yocto and active desktop Wayland sessions on Debian-family distributions.
 
 ## Features
 
@@ -13,10 +16,26 @@ Graphics scripts automates the validation of Graphics OpenGL ES 2.0 capabilities
 
 ## Prerequisites
 
-Ensure the following components are present in the target Yocto build:
+Yocto images must provide the required client and Weston runtime. On Ubuntu and Debian, the shared package provider ensures the mapped Weston and graphics packages.
 
 - `weston-simple-egl` (Binary Available in /usr/bin) be default
 - Write access to root filesystem (for environment setup)
+
+## Desktop distribution modes
+
+- `./run.sh --base` selects the upstream MSM/freedreno stack and ensures the OS-specific Mesa package set.
+- `./run.sh --overlay` selects the Qualcomm KGSL/Adreno stack and ensures the OS-specific overlay package set. Package or DKMS changes can require a reboot before validation continues.
+- Debian uses `libgbm-msm1`, while Ubuntu uses `libgbm-msm`. Set `GPU_OVERLAY_GBM_PACKAGE` only when an explicit override is required.
+- On Ubuntu, the test reuses an active GNOME Wayland session when Weston is not running. A root-launched test executes the client as the Wayland socket owner without stopping or restarting GDM.
+- GDM can throttle an unfocused greeter client. That path validates compositor connectivity and EGL startup while recording, but not performance-gating, any FPS samples.
+
+Examples:
+
+```sh
+./run.sh --base
+./run.sh --overlay
+./run.sh --auto
+```
 
 ## Directory Structure
 
