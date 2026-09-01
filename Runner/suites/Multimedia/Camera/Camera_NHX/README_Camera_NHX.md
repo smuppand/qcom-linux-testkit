@@ -2,7 +2,7 @@
 
 Camera NHX validation test for the Qualcomm CAMX proprietary camera stack. This test runs `nhx.sh`, collects generated image dumps, validates dumps (existence + non-zero size), and produces a PASS/FAIL `.res` file suitable for LAVA gating.
 
-The test supports the legacy/default NHX flow and optional target-specific JSON selection for preview, video, preview+video, and snapshot validation.
+The test supports the legacy/default NHX flow, optional target-specific JSON selection for preview, video, preview+video, and snapshot validation, and an opt-in desktop CAMX package and FIT-DTB selection flow.
 
 ---
 
@@ -12,6 +12,8 @@ The test supports the legacy/default NHX flow and optional target-specific JSON 
 - Utilities:
   - `Runner/utils/functestlib.sh`
   - `Runner/utils/camera/lib_camera.sh`
+  - `Runner/utils/lib_pkg_provider.sh` for optional desktop package recovery
+  - `Runner/utils/lib_system.sh` for EFI variable discovery and update
 - Target-specific NHX JSON configs:
   - `Runner/suites/Multimedia/Camera/Camera_NHX/Kodiak/*.json`
   - `Runner/suites/Multimedia/Camera/Camera_NHX/Lemans/*.json`
@@ -101,6 +103,44 @@ Snapshot JSON files are currently expected only for targets where the files are 
      - Any dump is missing or zero bytes
      - Dump checksum validation helper fails
    - Writes final result to: `Camera_NHX.res`
+
+---
+
+## Desktop CAMX overlay flow
+
+Yocto and meta-qcom LAVA images keep their image-provided camera stack and do
+not use this flow. On Debian, Ubuntu, and CentOS, an explicit overlay request
+installs the `camera-nhx` package set:
+
+```text
+camx-dkms camx-glymur libcamx-glymur1 camx-firmware-glymur camx-nhx
+```
+
+To select a FIT DTB, pass its compatibility name with `--fit-dtb`. For CAMX,
+the compatibility name is `camx`:
+
+```sh
+./run.sh --overlay --fit-dtb camx
+```
+
+The test discovers the platform's `VendorDtbOverlays` EFI variable with
+`efivar -l`. The EFI variable GUID is never supplied by the user or hardcoded
+in the test. It writes the requested FIT DTB name without a trailing newline,
+verifies the value through `efivar -p`, and synchronizes storage.
+
+When a new DTB selection is written, the test records `Camera_NHX SKIP` with a
+reboot-required message instead of rebooting within the LAVA test shell. Reboot
+the target, then rerun the same command to perform NHX validation with the new
+device tree:
+
+```sh
+reboot
+./run.sh --overlay --fit-dtb camx
+```
+
+If the requested FIT DTB is already selected, the test continues directly to
+the normal NHX checks. `--overlay` without `--fit-dtb` only performs the
+optional package preparation and does not change the boot DTB.
 
 ---
 
@@ -231,12 +271,19 @@ NHX JSON argument
 ## Command usage
 
 ```sh
-./run.sh [--json JSON_FILE] [--target TARGET] [--help]
+./run.sh [--overlay] [--fit-dtb NAME] [--json JSON_FILE] [--target TARGET] [--help]
 ```
 
 Options:
 
 ```text
+--overlay          Install the optional Camera NHX CAMX package set on Debian,
+                   Ubuntu, or CentOS.
+
+--fit-dtb NAME     Select NAME as the FIT DTB compatibility name for the next
+                   boot. Requires --overlay on a supported desktop distro.
+                   Use camx to select the CAMX DTB overlay.
+
 --json JSON_FILE   NHX JSON file to pass to nhx.sh.
                    Can be absolute, relative to Camera_NHX/, or relative
                    to the target folder when --target is provided.
@@ -251,6 +298,10 @@ Examples:
 
 ```sh
 ./run.sh
+```
+
+```sh
+./run.sh --overlay --fit-dtb camx
 ```
 
 ```sh
@@ -403,6 +454,8 @@ run:
 ### SKIP
 
 - Missing CAMX prerequisites, such as DT patterns, camera module artifact/loaded state, ICP firmware, CAMX packages, or `nhx.sh`
+- The requested FIT DTB selection was written and a reboot is required before validation
+- `VendorDtbOverlays` is unavailable when `--overlay --fit-dtb` was requested
 - `fdtdump` is not available or camera node evidence is inconclusive
 - Requested `--json` file is not found
 - Requested JSON filename is ambiguous and `--target` was not supplied

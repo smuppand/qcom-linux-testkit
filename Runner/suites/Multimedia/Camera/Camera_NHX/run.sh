@@ -38,7 +38,15 @@ fi
 . "$TOOLS/functestlib.sh"
 
 # shellcheck disable=SC1090,SC1091
+. "$TOOLS/lib_system.sh"
+
+# shellcheck disable=SC1090,SC1091
 . "$TOOLS/camera/lib_camera.sh"
+
+if [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+  # shellcheck disable=SC1090,SC1091
+  . "$TOOLS/lib_pkg_provider.sh"
+fi
 
 LOG_DIR="$SCRIPT_DIR/logs"
 OUT_DIR="$SCRIPT_DIR/out"
@@ -50,6 +58,8 @@ TS=$(date "+%Y%m%d_%H%M%S")
 RUN_LOG="$LOG_DIR/${TESTNAME}_${TS}.log"
 SUMMARY_TXT="$OUT_DIR/${TESTNAME}_summary_${TS}.txt"
 DMESG_DIR="$LOG_DIR/dmesg_${TS}"
+CAMX_EFI_LOG="$LOG_DIR/${TESTNAME}_camx_efi_${TS}.log"
+CAMX_EFI_LIST_LOG="$LOG_DIR/${TESTNAME}_camx_efi_list_${TS}.log"
 
 NHX_OUTDIR="$OUT_DIR/nhx_${TS}"
 
@@ -64,17 +74,24 @@ if [ -z "$MARKER" ]; then
 fi
 
 CAM_SERVER_PRESENT=0
+CAM_SERVER_SERVICE=""
 CAM_SERVER_STOPPED_FOR_TEST=0
 
 NHX_JSON="${NHX_JSON:-}"
 NHX_TARGET="${NHX_TARGET:-}"
 NHX_JSON_RESOLVED=""
 NHX_JSON_ARG=""
+OVERLAY_REQUESTED=0
+FIT_DTB_NAME=""
 
 # shellcheck disable=SC2317
 cleanup() {
+  if command -v efi_restore_efivarfs_ro >/dev/null 2>&1; then
+    efi_restore_efivarfs_ro >/dev/null 2>&1 || true
+  fi
+
   if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ] && [ "$CAM_SERVER_PRESENT" -eq 1 ]; then
-    systemd_service_start_safe "cam-server" >/dev/null 2>&1 || true
+    systemd_service_start_safe "$CAM_SERVER_SERVICE" >/dev/null 2>&1 || true
   fi
 
   if [ -n "${MARKER:-}" ]; then
@@ -86,9 +103,15 @@ trap 'cleanup' EXIT INT TERM
 
 usage() {
   cat <<EOF
-Usage: $0 [--json JSON_FILE] [--target TARGET] [--help]
+Usage: $0 [--overlay] [--fit-dtb NAME] [--json JSON_FILE] [--target TARGET] [--help]
 
 Options:
+  --overlay        Install the Camera NHX CAMX package set on supported
+                   Debian, Ubuntu, or CentOS images.
+  --fit-dtb NAME    Select this FIT DTB compatibility name for the next boot.
+                   For example, pass camx to select the CAMX DTB overlay.
+                   This option is applied only with --overlay on supported
+                   desktop distributions.
   --json JSON_FILE NHX JSON file to pass to nhx.sh.
                      Can be absolute, relative to Camera_NHX/, or relative
                      to target folder when --target is provided.
@@ -98,6 +121,8 @@ Options:
 
 Examples:
   $0
+  $0 --overlay
+  $0 --overlay --fit-dtb camx
   $0 --json Lemans/Prev_plus_Video_YUVNV12_MaxResolution_NHX.json
   $0 --json Snapshot_YUVNV12_MaxResolution_NHX.json --target Kodiak
   NHX_JSON=Talos/Video_YUVNV12_MaxResolution_NHX.json $0
@@ -106,6 +131,23 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --overlay)
+      OVERLAY_REQUESTED=1
+      shift
+      ;;
+    --fit-dtb)
+      if [ "$#" -lt 2 ]; then
+        echo "[ERROR] --fit-dtb requires an argument" >&2
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+      fi
+      FIT_DTB_NAME="$2"
+      shift 2
+      ;;
+    --fit-dtb=*)
+      FIT_DTB_NAME="${1#--fit-dtb=}"
+      shift
+      ;;
     --json)
       if [ "$#" -lt 2 ]; then
         echo "[ERROR] --json requires an argument" >&2
@@ -145,6 +187,105 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$OVERLAY_REQUESTED" -eq 1 ]; then
+  for required_helper in \
+    pkg_provider_init \
+    pkg_ensure_optional_package_set_present \
+    pkg_verify_package_set_installed; do
+    if ! command -v "$required_helper" >/dev/null 2>&1; then
+      log_fail "$TESTNAME FAIL - required package helper is unavailable: $required_helper"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+  done
+
+  pkg_provider_init
+
+  if ! pkg_ensure_optional_package_set_present \
+    camera-nhx \
+    qli-staging \
+    auto \
+    --overlay; then
+    log_fail "$TESTNAME FAIL - failed to ensure Camera NHX CAMX package set"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+    exit 0
+  fi
+
+  log_pass "Camera NHX CAMX package set is ready"
+
+  CAMX_OVERLAY_OS_ID="$(pkg_detect_os_id 2>/dev/null || true)"
+  case "$CAMX_OVERLAY_OS_ID" in
+    debian|ubuntu|centos)
+      if [ -z "$FIT_DTB_NAME" ]; then
+        log_info "No FIT DTB compatibility name was requested, skipping EFI overlay selection"
+      else
+
+        case "$FIT_DTB_NAME" in
+          *[!A-Za-z0-9._-]* )
+            log_fail "$TESTNAME FAIL - invalid FIT DTB compatibility name: $FIT_DTB_NAME"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+            ;;
+        esac
+
+        for required_helper in \
+          efi_find_variable_by_name \
+          efi_text_variable_matches \
+          efi_write_text_variable \
+          efi_restore_efivarfs_ro; do
+          if ! command -v "$required_helper" >/dev/null 2>&1; then
+            log_fail "$TESTNAME FAIL - required EFI helper is unavailable: $required_helper"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+          fi
+        done
+
+        if ! CHECK_DEPS_NO_EXIT=1 check_dependencies efivar mount mktemp od tr sed grep sync awk; then
+          log_skip "$TESTNAME SKIP - CAMX overlay selection requires efivar and EFI runtime tools"
+          echo "$TESTNAME SKIP" >"$RES_FILE"
+          exit 0
+        fi
+
+        CAMX_DTB_OVERLAY_VARIABLE="$(efi_find_variable_by_name \
+          VendorDtbOverlays \
+          "$CAMX_EFI_LIST_LOG" 2>>"$CAMX_EFI_LOG")"
+        if [ -z "$CAMX_DTB_OVERLAY_VARIABLE" ]; then
+          log_skip "$TESTNAME SKIP - VendorDtbOverlays EFI variable was not found"
+          echo "$TESTNAME SKIP" >"$RES_FILE"
+          exit 0
+        fi
+
+        if efi_text_variable_matches \
+          "$CAMX_DTB_OVERLAY_VARIABLE" \
+          "$FIT_DTB_NAME" \
+          "$CAMX_EFI_LOG"; then
+          log_info "FIT DTB compatibility name is already selected: $FIT_DTB_NAME"
+        else
+          log_info "Selecting FIT DTB compatibility name for the next boot: $FIT_DTB_NAME"
+
+          if ! efi_write_text_variable \
+            "$CAMX_DTB_OVERLAY_VARIABLE" \
+            "$FIT_DTB_NAME" \
+            "$CAMX_EFI_LOG"; then
+            log_fail "$TESTNAME FAIL - could not select FIT DTB compatibility name: $FIT_DTB_NAME"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+          fi
+
+          log_skip "$TESTNAME SKIP - FIT DTB compatibility name selected, reboot required before NHX validation"
+          echo "$TESTNAME SKIP" >"$RES_FILE"
+          exit 0
+        fi
+      fi
+      ;;
+    *)
+      log_info "CAMX device-tree overlay selection is not applicable, os=${CAMX_OVERLAY_OS_ID:-unknown}"
+      ;;
+  esac
+else
+  log_info "Camera NHX overlay package installation not requested"
+fi
 
 # -----------------------------------------------------------------------------
 # Deps check
@@ -352,36 +493,59 @@ log_info "NHX_OUTDIR=$NHX_OUTDIR"
 log_info "CKSUM_TOOL=${CKSUM_TOOL:-none}"
 
 # -----------------------------------------------------------------------------
-# cam-server stop before NHX
+# Camera server stop before NHX
 # -----------------------------------------------------------------------------
-if systemd_service_exists "cam-server"; then
+CAM_SERVER_SERVICE="$(
+  systemd_service_first_existing \
+    "qti-cam-server.service" \
+    "cam-server.service" \
+    2>/dev/null || true
+)"
+
+if [ -n "$CAM_SERVER_SERVICE" ]; then
   CAM_SERVER_PRESENT=1
 
   CAM_SERVER_TS_BEFORE_STOP='5 minutes ago'
 
-  log_info "cam-server status before stop"
-  systemd_service_status_log "cam-server BEFORE stop (status only)" "$RUN_LOG" "cam-server" || true
+  log_info "Camera server selected for NHX: $CAM_SERVER_SERVICE"
+  log_info "Camera server status before NHX"
+  systemd_service_status_log "Camera server BEFORE NHX (status only)" \
+    "$RUN_LOG" "$CAM_SERVER_SERVICE" || true
 
-  log_info "cam-server stdout before stop"
-  systemd_service_stdout_since "cam-server BEFORE stop (stdout recent)" \
-    "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "cam-server.service" || true
+  log_info "Camera server stdout before NHX"
+  systemd_service_stdout_since "Camera server BEFORE NHX (stdout recent)" \
+    "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "$CAM_SERVER_SERVICE" || true
 
-  log_info "Stopping cam-server before nhx.sh"
-  if systemd_service_stop_safe "cam-server"; then
+  if systemd_service_is_active "$CAM_SERVER_SERVICE"; then
+    log_info "Stopping active camera server before nhx.sh"
+
+    if ! systemd_service_stop_safe "$CAM_SERVER_SERVICE"; then
+      log_fail "$TESTNAME FAIL - unable to stop active $CAM_SERVER_SERVICE before nhx.sh"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+
+    if systemd_service_is_active "$CAM_SERVER_SERVICE"; then
+      log_fail "$TESTNAME FAIL - $CAM_SERVER_SERVICE remains active after stop request"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+
     CAM_SERVER_STOPPED_FOR_TEST=1
     CAM_SERVER_TS_AFTER_STOP="$(date '+%Y-%m-%d %H:%M:%S')"
 
-    log_info "cam-server status after stop"
-    systemd_service_status_log "cam-server AFTER stop (status only)" "$RUN_LOG" "cam-server" || true
+    log_info "Camera server status after stop"
+    systemd_service_status_log "Camera server AFTER stop (status only)" \
+      "$RUN_LOG" "$CAM_SERVER_SERVICE" || true
 
-    log_info "cam-server stdout after stop"
-    systemd_service_stdout_since "cam-server AFTER stop (stdout since stop marker)" \
-      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "cam-server.service" || true
+    log_info "Camera server stdout after stop"
+    systemd_service_stdout_since "Camera server AFTER stop (stdout since stop marker)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "$CAM_SERVER_SERVICE" || true
   else
-    log_warn "Failed to stop cam-server before nhx.sh"
+    log_info "Camera server was already inactive, leaving it inactive after NHX"
   fi
 else
-  log_info "cam-server service not present, continuing"
+  log_info "No qti-cam-server.service or cam-server.service present, continuing"
 fi
 
 # -----------------------------------------------------------------------------
@@ -476,25 +640,26 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# cam-server start after NHX
+# Restore camera server state after NHX
 # -----------------------------------------------------------------------------
 if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ]; then
-  log_info "Starting cam-server after nhx.sh"
-  if systemd_service_start_safe "cam-server"; then
+  log_info "Restoring camera server after nhx.sh: $CAM_SERVER_SERVICE"
+  if systemd_service_start_safe "$CAM_SERVER_SERVICE"; then
     CAM_SERVER_STOPPED_FOR_TEST=0
     CAM_SERVER_TS_AFTER_START="$(date '+%Y-%m-%d %H:%M:%S')"
 
-    log_info "cam-server status after start"
-    systemd_service_status_log "cam-server AFTER start (status only)" "$RUN_LOG" "cam-server" || true
+    log_info "Camera server status after restore"
+    systemd_service_status_log "Camera server AFTER restore (status only)" \
+      "$RUN_LOG" "$CAM_SERVER_SERVICE" || true
 
-    log_info "cam-server stdout after start"
-    systemd_service_stdout_since "cam-server AFTER start (stdout since start marker)" \
-      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "cam-server.service" || true
+    log_info "Camera server stdout after restore"
+    systemd_service_stdout_since "Camera server AFTER restore (stdout since restore marker)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "$CAM_SERVER_SERVICE" || true
   else
-    log_warn "Failed to start cam-server after nhx.sh"
+    log_warn "Failed to restore camera server after nhx.sh: $CAM_SERVER_SERVICE"
   fi
 else
-  log_info "cam-server was not stopped for test, skipping restart"
+  log_info "Camera server state was not changed for NHX, skipping restore"
 fi
 
 # -----------------------------------------------------------------------------
