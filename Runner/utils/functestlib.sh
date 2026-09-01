@@ -3544,6 +3544,14 @@ dt_list_compatible_nodes() {
     esac
 
     dtlc_found=0
+    if [ -r "${DT_COMPATIBLE_INDEX:-}" ]; then
+        if [ "$dtlc_mode" = "regex" ]; then
+            awk -F '|' -v pattern="$dtlc_pattern" '$2 ~ pattern { print $1; found=1 } END { exit !found }' "$DT_COMPATIBLE_INDEX"
+        else
+            awk -F '|' -v pattern="$dtlc_pattern" 'index($2, pattern) { print $1; found=1 } END { exit !found }' "$DT_COMPATIBLE_INDEX"
+        fi
+        return $?
+    fi
     dtlc_previous_root=""
     for dtlc_root in /proc/device-tree /sys/firmware/devicetree/base; do
         [ -d "$dtlc_root" ] || continue
@@ -3579,6 +3587,159 @@ dt_list_compatible_nodes() {
     done
 
     [ "$dtlc_found" -eq 1 ]
+}
+
+###############################################################################
+# dt_build_runtime_indexes <dt-root> <result-dir>
+# Builds reusable enabled-compatible, provider-property, and platform-device
+# indexes. The files are retained with the suite artifacts for diagnosis.
+###############################################################################
+dt_build_runtime_indexes() {
+    dbri_root="$1"
+    dbri_result_dir="$2"
+    dbri_compatible_file="$dbri_result_dir/dt_compatible_index.log"
+    dbri_property_file="$dbri_result_dir/dt_property_index.log"
+    dbri_platform_file="$dbri_result_dir/platform_device_index.log"
+    [ -d "$dbri_root" ] && [ -n "$dbri_result_dir" ] || return 3
+
+    : >"$dbri_compatible_file"
+    : >"$dbri_property_file"
+    : >"$dbri_platform_file"
+
+    find "$dbri_root" -type f \( \
+        -name compatible -o \
+        -name numa-node-id -o \
+        -name interrupt-controller -o \
+        -name '#clock-cells' -o \
+        -name '#reset-cells' -o \
+        -name regulator-name -o \
+        -name '#mbox-cells' -o \
+        -name '#interconnect-cells' \
+    \) 2>/dev/null |
+    while IFS= read -r dbri_path; do
+        dbri_node=$(dirname "$dbri_path")
+        dt_node_enabled "$dbri_node" || continue
+        dbri_property=$(basename "$dbri_path")
+        if [ "$dbri_property" = "compatible" ]; then
+            dbri_text=$(dt_property_text "$dbri_node" compatible 2>/dev/null || true)
+            [ -n "$dbri_text" ] || continue
+            printf '%s|%s\n' "$dbri_node" "$dbri_text" >>"$dbri_compatible_file"
+        else
+            printf '%s|%s\n' "$dbri_property" "$dbri_node" >>"$dbri_property_file"
+        fi
+    done
+
+    for dbri_of_node in /sys/bus/platform/devices/*/of_node; do
+        [ -e "$dbri_of_node" ] || continue
+        dbri_node=$(readlink -f "$dbri_of_node" 2>/dev/null || true)
+        [ -n "$dbri_node" ] || continue
+        dbri_device=$(dirname "$dbri_of_node")
+        printf '%s|%s\n' "$dbri_node" "$dbri_device" >>"$dbri_platform_file"
+    done
+
+    DT_COMPATIBLE_INDEX="$dbri_compatible_file"
+    DT_PROPERTY_INDEX="$dbri_property_file"
+    DT_PLATFORM_DEVICE_INDEX="$dbri_platform_file"
+    export DT_COMPATIBLE_INDEX DT_PROPERTY_INDEX DT_PLATFORM_DEVICE_INDEX
+    log_info "Runtime DT indexes: compatible=$(wc -l <"$dbri_compatible_file" | tr -d '[:space:]') property=$(wc -l <"$dbri_property_file" | tr -d '[:space:]') platform=$(wc -l <"$dbri_platform_file" | tr -d '[:space:]')"
+}
+
+###############################################################################
+# dt_hw_capability_parse_args [--area <list>] [--list-areas] [--help]
+# Validates suite area selection and stores the comma-separated selection in
+# DTRHC_AREAS. Returns 2 after printing informational output.
+###############################################################################
+dt_hw_capability_parse_args() {
+    DTRHC_AREAS="all"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --area)
+                shift
+                [ "$#" -gt 0 ] || return 3
+                DTRHC_AREAS="$1"
+                ;;
+            --list-areas)
+                printf '%s\n' "identity boot cpu-memory interrupts fabric storage usb pcie network multimedia remoteproc security health"
+                return 2
+                ;;
+            --help|-h)
+                printf '%s\n' "Usage: ./run.sh [--area all|identity,boot,cpu-memory,interrupts,fabric,storage,usb,pcie,network,multimedia,remoteproc,security,health] [--list-areas]"
+                return 2
+                ;;
+            *)
+                return 3
+                ;;
+        esac
+    done
+    DTRHC_AREAS=$(printf '%s' "$DTRHC_AREAS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [ -n "$DTRHC_AREAS" ] || return 3
+    dthc_remaining=$DTRHC_AREAS
+    while [ -n "$dthc_remaining" ]; do
+        dthc_area=${dthc_remaining%%,*}
+        case "$dthc_area" in
+            all|identity|boot|cpu-memory|interrupts|fabric|storage|usb|pcie|network|multimedia|remoteproc|security|health)
+                ;;
+            *)
+                return 3
+                ;;
+        esac
+        [ "$dthc_remaining" = "$dthc_area" ] && break
+        dthc_remaining=${dthc_remaining#*,}
+    done
+    export DTRHC_AREAS
+}
+
+# dt_hw_capability_area_enabled <area>
+# Returns success when all areas or the supplied area was selected.
+dt_hw_capability_area_enabled() {
+    dthcae_area="$1"
+    case ",${DTRHC_AREAS:-all}," in
+        *,all,*|*,$dthcae_area,*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# dt_summary_begin_area <result-dir> <area-label>
+# Snapshots shared result counters before one validation area runs.
+dt_summary_begin_area() {
+    DTSUMMARY_RESULT_DIR="$1"
+    DTSUMMARY_AREA="$2"
+    DTSUMMARY_PASS_BEFORE=$TEST_RESULT_PASS_COUNT
+    DTSUMMARY_FAIL_BEFORE=$TEST_RESULT_FAIL_COUNT
+    DTSUMMARY_SKIP_BEFORE=$TEST_RESULT_SKIP_COUNT
+    [ -n "$DTSUMMARY_RESULT_DIR" ] && [ -n "$DTSUMMARY_AREA" ] || return 3
+}
+
+# dt_summary_end_area
+# Appends the selected area's result delta to the retained summary artifact.
+dt_summary_end_area() {
+    dtsummary_file="$DTSUMMARY_RESULT_DIR/dt_area_summary.tsv"
+    dtsummary_pass=$((TEST_RESULT_PASS_COUNT - DTSUMMARY_PASS_BEFORE))
+    dtsummary_fail=$((TEST_RESULT_FAIL_COUNT - DTSUMMARY_FAIL_BEFORE))
+    dtsummary_skip=$((TEST_RESULT_SKIP_COUNT - DTSUMMARY_SKIP_BEFORE))
+    if [ "$dtsummary_fail" -gt 0 ]; then
+        dtsummary_result="FAIL"
+    elif [ "$dtsummary_pass" -gt 0 ]; then
+        dtsummary_result="PASS"
+    else
+        dtsummary_result="SKIP"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$DTSUMMARY_AREA" "$dtsummary_result" "$dtsummary_pass" "$dtsummary_fail" "$dtsummary_skip" >>"$dtsummary_file"
+}
+
+# dt_summary_print <result-dir>
+# Prints a compact area-level summary from the retained TSV artifact.
+dt_summary_print() {
+    dtsummary_file="$1/dt_area_summary.tsv"
+    [ -r "$dtsummary_file" ] || return 1
+    log_info "Device Tree Capability Summary"
+    printf '%-26s %-6s %5s %5s %5s\n' "Area" "Result" "Pass" "Fail" "Skip"
+    dtsummary_tab=$(printf '\t')
+    while IFS="$dtsummary_tab" read -r dtsummary_area dtsummary_result dtsummary_pass dtsummary_fail dtsummary_skip; do
+        printf '%-26s %-6s %5s %5s %5s\n' "$dtsummary_area" "$dtsummary_result" "$dtsummary_pass" "$dtsummary_fail" "$dtsummary_skip"
+    done <"$dtsummary_file"
 }
 
 # dt_list_qcom_icc_provider_nodes
@@ -3644,6 +3805,15 @@ find_platform_device_for_dt_node() {
 
     fpdd_target_node=$(readlink -f "$fpdd_node_dir" 2>/dev/null || true)
     [ -n "$fpdd_target_node" ] || fpdd_target_node="$fpdd_node_dir"
+
+    if [ -r "${DT_PLATFORM_DEVICE_INDEX:-}" ]; then
+        fpdd_index_device=$(awk -F '|' -v node="$fpdd_target_node" '$1 == node { print $2; exit }' "$DT_PLATFORM_DEVICE_INDEX")
+        if [ -n "$fpdd_index_device" ]; then
+            printf '%s\n' "$fpdd_index_device"
+            return 0
+        fi
+        return 1
+    fi
 
     for fpdd_of_node_link in /sys/bus/platform/devices/*/of_node; do
         [ -e "$fpdd_of_node_link" ] || continue
@@ -3724,6 +3894,737 @@ dt_property_text() {
     [ -n "$node_dir" ] && [ -n "$property" ] || return 3
     [ -r "$node_dir/$property" ] || return 1
     tr '\000' ' ' <"$node_dir/$property" | tr -cd '[:print:] \n' | sed 's/[[:space:]]*$//'
+}
+
+###############################################################################
+# dt_runtime_root
+# Prints the resolved runtime device-tree root, preferring sysfs over procfs.
+###############################################################################
+dt_runtime_root() {
+    dtrr_candidate=""
+
+    for dtrr_candidate in /sys/firmware/devicetree/base /proc/device-tree; do
+        [ -d "$dtrr_candidate" ] || continue
+        dtrr_resolved=$(readlink -f "$dtrr_candidate" 2>/dev/null || true)
+        if [ -n "$dtrr_resolved" ] && [ -d "$dtrr_resolved" ]; then
+            printf '%s\n' "$dtrr_resolved"
+        else
+            printf '%s\n' "$dtrr_candidate"
+        fi
+        return 0
+    done
+
+    return 1
+}
+
+###############################################################################
+# dt_node_enabled <node-directory>
+# Returns success unless the node status explicitly disables or fails the node.
+###############################################################################
+dt_node_enabled() {
+    dtne_node_dir="$1"
+    [ -n "$dtne_node_dir" ] || return 3
+    dtne_status=$(dt_property_text "$dtne_node_dir" status 2>/dev/null || true)
+
+    case "$dtne_status" in
+        disabled|fail|failed)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+###############################################################################
+# dt_count_enabled_cpu_nodes <dt-root>
+# Prints the number of enabled CPU nodes described by the supplied DT root.
+###############################################################################
+dt_count_enabled_cpu_nodes() {
+    dtcec_root="$1"
+    dtcec_count=0
+    [ -d "$dtcec_root/cpus" ] || {
+        printf '%s\n' 0
+        return 1
+    }
+
+    for dtcec_type_file in "$dtcec_root"/cpus/*/device_type; do
+        [ -r "$dtcec_type_file" ] || continue
+        dtcec_type=$(tr -d '\000[:space:]' <"$dtcec_type_file" 2>/dev/null)
+        [ "$dtcec_type" = "cpu" ] || continue
+        dtcec_node=$(dirname "$dtcec_type_file")
+        dt_node_enabled "$dtcec_node" || continue
+        dtcec_count=$((dtcec_count + 1))
+    done
+
+    printf '%s\n' "$dtcec_count"
+    [ "$dtcec_count" -gt 0 ]
+}
+
+###############################################################################
+# dt_count_kernel_cpu_nodes
+# Prints the number of CPU directories exposed by the running kernel.
+###############################################################################
+dt_count_kernel_cpu_nodes() {
+    find /sys/devices/system/cpu -maxdepth 1 -type d -name 'cpu[0-9]*' 2>/dev/null |
+        wc -l |
+        tr -d '[:space:]'
+}
+
+###############################################################################
+# dt_list_enabled_memory_nodes <dt-root>
+# Prints enabled memory nodes directly below the supplied DT root.
+###############################################################################
+dt_list_enabled_memory_nodes() {
+    dtlem_root="$1"
+    dtlem_found=0
+    [ -d "$dtlem_root" ] || return 3
+
+    for dtlem_node in "$dtlem_root"/memory@* "$dtlem_root"/memory; do
+        [ -d "$dtlem_node" ] || continue
+        dt_node_enabled "$dtlem_node" || continue
+        printf '%s\n' "$dtlem_node"
+        dtlem_found=1
+    done
+
+    [ "$dtlem_found" -eq 1 ]
+}
+
+###############################################################################
+# dt_list_enabled_reserved_memory_nodes <dt-root>
+# Prints enabled reserved-memory child nodes from the supplied DT root.
+###############################################################################
+dt_list_enabled_reserved_memory_nodes() {
+    dtlrm_root="$1"
+    dtlrm_found=0
+    dtlrm_reserved_root="$dtlrm_root/reserved-memory"
+    [ -d "$dtlrm_reserved_root" ] || return 1
+
+    for dtlrm_node in "$dtlrm_reserved_root"/*; do
+        [ -d "$dtlrm_node" ] || continue
+        dt_node_enabled "$dtlrm_node" || continue
+        printf '%s\n' "$dtlrm_node"
+        dtlrm_found=1
+    done
+
+    [ "$dtlrm_found" -eq 1 ]
+}
+
+###############################################################################
+# dt_profile_id <dt-root>
+# Prints a stable profile identifier derived from the first root compatible.
+###############################################################################
+dt_profile_id() {
+    dtpi_root="$1"
+    dtpi_first_compatible=""
+    [ -d "$dtpi_root" ] || return 3
+
+    if [ -r "$dtpi_root/compatible" ]; then
+        dtpi_first_compatible=$(tr '\000' '\n' <"$dtpi_root/compatible" 2>/dev/null | sed -n '1p')
+    fi
+    [ -n "$dtpi_first_compatible" ] || return 1
+
+    printf '%s\n' "$dtpi_first_compatible" |
+        tr '[:upper:]' '[:lower:]' |
+        tr ',.-' '___' |
+        tr -cd '[:alnum:]_'
+}
+
+###############################################################################
+# dt_list_enabled_property_nodes <dt-root> <property>
+# Prints enabled DT node directories that expose the exact property name.
+###############################################################################
+dt_list_enabled_property_nodes() {
+    dtlep_root="$1"
+    dtlep_property="$2"
+    dtlep_file=""
+    [ -d "$dtlep_root" ] && [ -n "$dtlep_property" ] || return 3
+
+    if [ -r "${DT_PROPERTY_INDEX:-}" ]; then
+        awk -F '|' -v property="$dtlep_property" '$1 == property { print $2; found=1 } END { exit !found }' "$DT_PROPERTY_INDEX"
+        return $?
+    fi
+
+    dtlep_file=$(mktemp "${TMPDIR:-/tmp}/dt-property.XXXXXX") || return 1
+    find "$dtlep_root" -type f -name "$dtlep_property" 2>/dev/null |
+    while IFS= read -r dtlep_property_file; do
+        dtlep_node=$(dirname "$dtlep_property_file")
+        dt_node_enabled "$dtlep_node" || continue
+        printf '%s\n' "$dtlep_node" >>"$dtlep_file"
+    done
+
+    if [ -s "$dtlep_file" ]; then
+        sort -u "$dtlep_file"
+        rm -f "$dtlep_file"
+        return 0
+    fi
+
+    rm -f "$dtlep_file"
+    return 1
+}
+
+###############################################################################
+# dt_validate_property_provider <dt-root> <label> <property> <result-dir>
+# Records enabled provider nodes and optional platform-driver binding evidence.
+###############################################################################
+dt_validate_property_provider() {
+    dtvpp_root="$1"
+    dtvpp_label="$2"
+    dtvpp_property="$3"
+    dtvpp_result_dir="$4"
+    dtvpp_node_file="$dtvpp_result_dir/${dtvpp_label}_providers.log"
+    dtvpp_count=0
+    dtvpp_no_device_count=0
+    dtvpp_unbound_count=0
+
+    [ -d "$dtvpp_root" ] && [ -n "$dtvpp_label" ] &&
+        [ -n "$dtvpp_property" ] && [ -n "$dtvpp_result_dir" ] || return 3
+    : >"$dtvpp_node_file"
+
+    if ! dt_list_enabled_property_nodes "$dtvpp_root" "$dtvpp_property" >"$dtvpp_node_file"; then
+        test_result_record "SKIP" "$dtvpp_label provider property is not present in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvpp_node_dir; do
+        [ -n "$dtvpp_node_dir" ] || continue
+        dtvpp_count=$((dtvpp_count + 1))
+        dtvpp_compatible=$(dt_property_text "$dtvpp_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[$dtvpp_label-DT] node=$dtvpp_node_dir compatible=$dtvpp_compatible"
+        test_result_record "PASS" "$dtvpp_label provider exposes $dtvpp_property: ${dtvpp_node_dir##*/}"
+
+        if dtvpp_device_dir=$(find_platform_device_for_dt_node "$dtvpp_node_dir"); then
+            dtvpp_device_name=$(basename "$dtvpp_device_dir")
+            if dtvpp_driver_name=$(platform_device_driver_name "$dtvpp_device_dir"); then
+                test_result_record "PASS" "$dtvpp_label provider is bound: device=$dtvpp_device_name driver=$dtvpp_driver_name"
+            else
+                dtvpp_unbound_count=$((dtvpp_unbound_count + 1))
+                log_info "$dtvpp_label provider platform device is not bound: $dtvpp_device_name"
+            fi
+        else
+            dtvpp_no_device_count=$((dtvpp_no_device_count + 1))
+            log_info "$dtvpp_label provider has no platform-device representation: ${dtvpp_node_dir##*/}"
+        fi
+    done <"$dtvpp_node_file"
+
+    log_info "$dtvpp_label provider totals: discovered=$dtvpp_count"
+    if [ "$dtvpp_no_device_count" -gt 0 ] || [ "$dtvpp_unbound_count" -gt 0 ]; then
+        test_result_record "SKIP" "$dtvpp_label provider runtime binding is not exposed for $((dtvpp_no_device_count + dtvpp_unbound_count)) framework provider nodes"
+    fi
+}
+
+###############################################################################
+# dt_validate_runtime_path <label> <path-pattern>
+# Records PASS when a runtime sysfs or device path pattern has an existing match.
+###############################################################################
+dt_validate_runtime_path() {
+    dtvrp_label="$1"
+    dtvrp_pattern="$2"
+    dtvrp_match=""
+
+    [ -n "$dtvrp_label" ] && [ -n "$dtvrp_pattern" ] || return 3
+
+    for dtvrp_candidate in $dtvrp_pattern; do
+        [ -e "$dtvrp_candidate" ] || continue
+        dtvrp_match="$dtvrp_candidate"
+        break
+    done
+
+    if [ -n "$dtvrp_match" ]; then
+        test_result_record "PASS" "$dtvrp_label runtime evidence is present: $dtvrp_match"
+    else
+        test_result_record "SKIP" "$dtvrp_label runtime evidence is not exposed"
+    fi
+}
+
+###############################################################################
+# dt_validate_network_runtime <label>
+# Records runtime network evidence only for a non-loopback, non-virtual
+# interface, avoiding container bridges such as docker0.
+###############################################################################
+dt_validate_network_runtime() {
+    dtvnr_label="$1"
+    [ -n "$dtvnr_label" ] || return 3
+
+    for dtvnr_path in /sys/class/net/*; do
+        [ -d "$dtvnr_path" ] || continue
+        dtvnr_name=${dtvnr_path##*/}
+        [ "$dtvnr_name" = "lo" ] && continue
+        dtvnr_resolved=$(readlink -f "$dtvnr_path" 2>/dev/null || true)
+        case "$dtvnr_resolved" in
+            /sys/devices/virtual/*|"")
+                continue
+                ;;
+        esac
+        test_result_record "PASS" "$dtvnr_label runtime evidence is present: $dtvnr_path"
+        return 0
+    done
+
+    test_result_record "SKIP" "$dtvnr_label runtime evidence is not exposed"
+}
+
+###############################################################################
+# dt_validate_usb_host_runtime
+# Records host-controller evidence or reports the current USB role when host
+# mode is inactive, distinguishing a missing fixture from a missing driver.
+###############################################################################
+dt_validate_usb_host_runtime() {
+    for dtvuhr_host in /sys/bus/usb/devices/usb*; do
+        [ -d "$dtvuhr_host" ] || continue
+        test_result_record "PASS" "USB host controller runtime evidence is present: $dtvuhr_host"
+        return 0
+    done
+
+    for dtvuhr_role in /sys/class/usb_role/*/role /sys/class/typec/*/data_role; do
+        [ -r "$dtvuhr_role" ] || continue
+        dtvuhr_value=$(tr -d '[:space:]' <"$dtvuhr_role" 2>/dev/null)
+        [ -n "$dtvuhr_value" ] || continue
+        test_result_record "SKIP" "USB host controller is not active, current role=$dtvuhr_value"
+        return 0
+    done
+
+    test_result_record "SKIP" "USB host controller runtime evidence is not exposed"
+}
+
+###############################################################################
+# dt_validate_tee_runtime <result-dir>
+# Distinguishes declared OP-TEE from a generic TEE device, which is commonly
+# the Qualcomm TEE flow on platforms without an OP-TEE DT node.
+###############################################################################
+dt_validate_tee_runtime() {
+    dtvtr_result_dir="$1"
+    [ -n "$dtvtr_result_dir" ] || return 3
+
+    if dt_list_compatible_nodes '(^|[[:space:]])linaro,optee-tz([[:space:]]|$)' regex >/dev/null; then
+        dt_validate_node_inventory "OP-TEE" '(^|[[:space:]])linaro,optee-tz([[:space:]]|$)' "$dtvtr_result_dir"
+        dt_validate_runtime_path "OP-TEE device" '/dev/tee*'
+        return 0
+    fi
+
+    for dtvtr_tee in /dev/tee*; do
+        [ -e "$dtvtr_tee" ] || continue
+        test_result_record "PASS" "TEE device runtime evidence is present: $dtvtr_tee"
+        test_result_record "SKIP" "OP-TEE is not declared in the runtime device tree, Qualcomm TEE flow is likely"
+        return 0
+    done
+
+    test_result_record "SKIP" "OP-TEE is not declared and no TEE device runtime evidence is exposed"
+}
+
+###############################################################################
+# dt_validate_node_inventory <label> <compatible-regex> <result-dir>
+# Records enabled matching DT nodes without assuming a platform-device binding.
+###############################################################################
+dt_validate_node_inventory() {
+    dtvni_label="$1"
+    dtvni_regex="$2"
+    dtvni_result_dir="$3"
+    dtvni_node_file="$dtvni_result_dir/${dtvni_label}_nodes.log"
+    dtvni_count=0
+
+    [ -n "$dtvni_label" ] && [ -n "$dtvni_regex" ] && [ -n "$dtvni_result_dir" ] || return 3
+    : >"$dtvni_node_file"
+
+    if ! dt_list_compatible_nodes "$dtvni_regex" regex >"$dtvni_node_file"; then
+        test_result_record "SKIP" "$dtvni_label capability is not enabled in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvni_node_dir; do
+        [ -n "$dtvni_node_dir" ] || continue
+        dtvni_count=$((dtvni_count + 1))
+        dtvni_compatible=$(dt_property_text "$dtvni_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[$dtvni_label-DT] node=$dtvni_node_dir compatible=$dtvni_compatible"
+        test_result_record "PASS" "$dtvni_label capability is enabled: ${dtvni_node_dir##*/}"
+
+        if dtvni_device_dir=$(find_platform_device_for_dt_node "$dtvni_node_dir"); then
+            dtvni_device_name=$(basename "$dtvni_device_dir")
+            if dtvni_driver_name=$(platform_device_driver_name "$dtvni_device_dir"); then
+                test_result_record "PASS" "$dtvni_label platform device is bound: device=$dtvni_device_name driver=$dtvni_driver_name"
+            else
+                test_result_record "SKIP" "$dtvni_label platform device is not bound: $dtvni_device_name"
+            fi
+        else
+            test_result_record "SKIP" "$dtvni_label capability has no platform-device representation: ${dtvni_node_dir##*/}"
+        fi
+    done <"$dtvni_node_file"
+
+    log_info "$dtvni_label capability totals: discovered=$dtvni_count"
+}
+
+###############################################################################
+# dt_validate_platform_capability <label> <compatible-regex> <result-dir>
+# Records structural and platform-driver checks for enabled matching controllers.
+###############################################################################
+dt_validate_platform_capability() {
+    dtvpc_label="$1"
+    dtvpc_regex="$2"
+    dtvpc_result_dir="$3"
+    dtvpc_node_file="$dtvpc_result_dir/${dtvpc_label}_nodes.log"
+    dtvpc_count=0
+
+    [ -n "$dtvpc_label" ] && [ -n "$dtvpc_regex" ] && [ -n "$dtvpc_result_dir" ] || return 3
+    : >"$dtvpc_node_file"
+
+    if ! dt_list_compatible_nodes "$dtvpc_regex" regex >"$dtvpc_node_file"; then
+        test_result_record "SKIP" "$dtvpc_label capability is not enabled in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvpc_node_dir; do
+        [ -n "$dtvpc_node_dir" ] || continue
+        dtvpc_count=$((dtvpc_count + 1))
+        dtvpc_compatible=$(dt_property_text "$dtvpc_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[$dtvpc_label-DT] node=$dtvpc_node_dir compatible=$dtvpc_compatible"
+
+        if dt_node_has_property "$dtvpc_node_dir" reg; then
+            test_result_record "PASS" "$dtvpc_label controller exposes reg property: ${dtvpc_node_dir##*/}"
+        else
+            test_result_record "FAIL" "$dtvpc_label controller lacks reg property: ${dtvpc_node_dir##*/}"
+        fi
+
+        if ! dtvpc_device_dir=$(find_platform_device_for_dt_node "$dtvpc_node_dir"); then
+            test_result_record "FAIL" "$dtvpc_label controller has no runtime platform device: ${dtvpc_node_dir##*/}"
+            continue
+        fi
+
+        dtvpc_device_name=$(basename "$dtvpc_device_dir")
+        if dtvpc_driver_name=$(platform_device_driver_name "$dtvpc_device_dir"); then
+            test_result_record "PASS" "$dtvpc_label controller is bound: device=$dtvpc_device_name driver=$dtvpc_driver_name"
+        else
+            test_result_record "FAIL" "$dtvpc_label controller platform device is unbound: $dtvpc_device_name"
+        fi
+    done <"$dtvpc_node_file"
+
+    log_info "$dtvpc_label capability totals: discovered=$dtvpc_count"
+}
+
+###############################################################################
+# dt_validate_remoteproc_inventory <result-dir>
+# Records enabled Qualcomm remoteproc DT nodes and exposed runtime instances.
+###############################################################################
+dt_validate_remoteproc_inventory() {
+    dvri_result_dir="$1"
+    dvri_node_file="$dvri_result_dir/remoteproc_nodes.log"
+    dvri_runtime_file="$dvri_result_dir/remoteproc_runtime.log"
+    dvri_node_count=0
+    dvri_runtime_count=0
+
+    [ -n "$dvri_result_dir" ] || return 3
+    : >"$dvri_node_file"
+    : >"$dvri_runtime_file"
+
+    if ! dt_list_compatible_nodes 'qcom,.*(adsp|cdsp|gpdsp|mpss|wpss|remoteproc)' regex >"$dvri_node_file"; then
+        test_result_record "SKIP" "No enabled Qualcomm remoteproc nodes were discovered"
+        return 0
+    fi
+
+    while IFS= read -r dvri_node_dir; do
+        [ -n "$dvri_node_dir" ] || continue
+        dvri_node_count=$((dvri_node_count + 1))
+        dvri_compatible=$(dt_property_text "$dvri_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[REMOTEPROC-DT] node=$dvri_node_dir compatible=$dvri_compatible"
+
+        if dt_node_has_property "$dvri_node_dir" memory-region; then
+            test_result_record "PASS" "Remoteproc node exposes memory-region: ${dvri_node_dir##*/}"
+        else
+            test_result_record "SKIP" "Remoteproc node does not expose an optional memory-region: ${dvri_node_dir##*/}"
+        fi
+
+        dvri_firmware=$(dt_property_text "$dvri_node_dir" firmware-name 2>/dev/null || true)
+        if [ -n "$dvri_firmware" ]; then
+            log_info "[REMOTEPROC-DT] firmware-name=$dvri_firmware"
+            if find_image_firmware "$dvri_firmware" >/dev/null 2>&1; then
+                test_result_record "PASS" "Remoteproc firmware is provisioned: $dvri_firmware"
+            else
+                test_result_record "SKIP" "Remoteproc firmware is not provisioned in the image: $dvri_firmware"
+            fi
+        else
+            test_result_record "SKIP" "Remoteproc node does not expose an optional firmware-name: ${dvri_node_dir##*/}"
+        fi
+    done <"$dvri_node_file"
+
+    if list_remoteproc_instances "$dvri_runtime_file"; then
+        while IFS= read -r dvri_entry; do
+            [ -n "$dvri_entry" ] || continue
+            dvri_runtime_count=$((dvri_runtime_count + 1))
+            log_info "[REMOTEPROC-RUNTIME] $dvri_entry"
+        done <"$dvri_runtime_file"
+        test_result_record "PASS" "Remoteproc runtime inventory is available: dt_nodes=$dvri_node_count runtime_instances=$dvri_runtime_count"
+    else
+        test_result_record "SKIP" "Remoteproc DT nodes are present but no runtime remoteproc instance is exposed"
+    fi
+}
+
+###############################################################################
+# dt_validate_runtime_hardware_capabilities <dt-root> <result-dir>
+# Records baseline DT, controller binding, remoteproc, and kernel-health checks.
+###############################################################################
+dt_validate_runtime_hardware_capabilities() {
+    dtrhc_root="$1"
+    dtrhc_result_dir="$2"
+    dtrhc_compatible=""
+    dtrhc_model=""
+    dtrhc_profile_id=""
+    dtrhc_stdout_path=""
+    dtrhc_stdout_target=""
+    dtrhc_bootargs=""
+    dtrhc_dt_cpu_count=0
+    dtrhc_kernel_cpu_count=0
+    dtrhc_memory_file="$dtrhc_result_dir/memory_nodes.log"
+    dtrhc_reserved_file="$dtrhc_result_dir/reserved_memory_nodes.log"
+
+    [ -d "$dtrhc_root" ] && [ -n "$dtrhc_result_dir" ] || return 3
+    mkdir -p "$dtrhc_result_dir" || return 1
+    : >"$dtrhc_result_dir/dt_area_summary.tsv"
+    dt_build_runtime_indexes "$dtrhc_root" "$dtrhc_result_dir" || return 1
+
+    dtrhc_compatible=$(dt_property_text "$dtrhc_root" compatible 2>/dev/null || true)
+    dtrhc_model=$(dt_property_text "$dtrhc_root" model 2>/dev/null || true)
+    log_info "Runtime device-tree root: $dtrhc_root"
+
+    if dt_hw_capability_area_enabled "health"; then
+        scan_dmesg_errors \
+            "$dtrhc_result_dir" \
+            'of|device.tree|devicetree|qcom.*(smmu|pcie|ufs|sdhci|dwc3|usb|ethqos|dpu|mdss)' \
+            '-517|EPROBE_DEFER|deferred probe|dummy regulator|supply [^ ]+ not found' || true
+        log_info "Captured DT and controller kernel-health snapshot"
+    fi
+
+    if dt_hw_capability_area_enabled "identity"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Identity"
+    if [ -z "$dtrhc_compatible" ]; then
+        test_result_record "FAIL" "Runtime device tree does not expose a readable compatible property"
+    else
+        log_info "Runtime device-tree compatible: $dtrhc_compatible"
+        test_result_record "PASS" "Runtime device tree exposes compatible identity"
+        dtrhc_profile_id=$(dt_profile_id "$dtrhc_root" 2>/dev/null || true)
+        if [ -n "$dtrhc_profile_id" ]; then
+            log_info "Selected runtime DT profile: $dtrhc_profile_id"
+            test_result_record "PASS" "Runtime device-tree profile was selected from the first compatible string"
+        else
+            test_result_record "SKIP" "Runtime device-tree profile could not be derived from compatible"
+        fi
+        case "$dtrhc_compatible" in
+            *qcom,*|*qcom.*)
+                test_result_record "PASS" "Runtime device tree identifies a Qualcomm platform"
+                ;;
+            *)
+                test_result_record "SKIP" "Runtime device tree has no Qualcomm compatible string"
+                ;;
+        esac
+    fi
+
+    if dt_node_has_property "$dtrhc_root" '#address-cells' &&
+       dt_node_has_property "$dtrhc_root" '#size-cells'; then
+        test_result_record "PASS" "Runtime device tree exposes root address and size cell properties"
+    else
+        test_result_record "FAIL" "Runtime device tree lacks root address or size cell properties"
+    fi
+
+    if [ -n "$dtrhc_model" ]; then
+        log_info "Runtime device-tree model: $dtrhc_model"
+        test_result_record "PASS" "Runtime device tree exposes model information"
+    else
+        test_result_record "SKIP" "Runtime device tree does not expose an optional model property"
+    fi
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "boot"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Boot handoff"
+    if [ -d "$dtrhc_root/chosen" ]; then
+        dtrhc_stdout_path=$(dt_property_text "$dtrhc_root/chosen" stdout-path 2>/dev/null || true)
+        dtrhc_bootargs=$(dt_property_text "$dtrhc_root/chosen" bootargs 2>/dev/null || true)
+        if [ -n "$dtrhc_stdout_path" ] || [ -n "$dtrhc_bootargs" ]; then
+            log_info "Chosen node: stdout-path=${dtrhc_stdout_path:-unset} bootargs=${dtrhc_bootargs:-unset}"
+            test_result_record "PASS" "Runtime device tree exposes chosen boot handoff data"
+
+            if [ -n "$dtrhc_stdout_path" ]; then
+                dtrhc_stdout_target=${dtrhc_stdout_path%%:*}
+                case "$dtrhc_stdout_target" in
+                    /*)
+                        dtrhc_stdout_target="$dtrhc_root$dtrhc_stdout_target"
+                        ;;
+                    *)
+                        if [ -r "$dtrhc_root/aliases/$dtrhc_stdout_target" ]; then
+                            dtrhc_stdout_target=$(tr -d '\000' <"$dtrhc_root/aliases/$dtrhc_stdout_target" 2>/dev/null)
+                            dtrhc_stdout_target="$dtrhc_root$dtrhc_stdout_target"
+                        else
+                            dtrhc_stdout_target=""
+                        fi
+                        ;;
+                esac
+
+                if [ -n "$dtrhc_stdout_target" ] && [ -d "$dtrhc_stdout_target" ]; then
+                    test_result_record "PASS" "Chosen stdout-path resolves to a runtime DT node"
+                else
+                    test_result_record "FAIL" "Chosen stdout-path does not resolve to a runtime DT node"
+                fi
+            fi
+        else
+            test_result_record "SKIP" "Chosen node has no stdout-path or bootargs property"
+        fi
+    else
+        test_result_record "SKIP" "Runtime device tree does not expose an optional chosen node"
+    fi
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "cpu-memory"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "CPU and memory"
+    dtrhc_dt_cpu_count=$(dt_count_enabled_cpu_nodes "$dtrhc_root" || true)
+    dtrhc_kernel_cpu_count=$(dt_count_kernel_cpu_nodes)
+    if [ "${dtrhc_dt_cpu_count:-0}" -le 0 ] 2>/dev/null; then
+        test_result_record "FAIL" "Runtime device tree exposes no enabled CPU nodes"
+    elif [ "${dtrhc_kernel_cpu_count:-0}" -le 0 ] 2>/dev/null; then
+        test_result_record "FAIL" "Running kernel exposes no CPU directories"
+    else
+        log_info "CPU topology: dt_enabled=$dtrhc_dt_cpu_count kernel_exposed=$dtrhc_kernel_cpu_count"
+        if [ "$dtrhc_dt_cpu_count" -lt "$dtrhc_kernel_cpu_count" ]; then
+            test_result_record "FAIL" "Kernel exposes more CPUs than the runtime device tree describes"
+        else
+            test_result_record "PASS" "Runtime device-tree CPU topology covers all kernel CPUs"
+        fi
+    fi
+
+    : >"$dtrhc_memory_file"
+    if dt_list_enabled_memory_nodes "$dtrhc_root" >"$dtrhc_memory_file"; then
+        while IFS= read -r dtrhc_memory_node; do
+            [ -n "$dtrhc_memory_node" ] || continue
+            if dt_node_has_property "$dtrhc_memory_node" reg; then
+                test_result_record "PASS" "Memory node exposes reg property: ${dtrhc_memory_node##*/}"
+            else
+                test_result_record "FAIL" "Memory node lacks reg property: ${dtrhc_memory_node##*/}"
+            fi
+        done <"$dtrhc_memory_file"
+    else
+        test_result_record "FAIL" "Runtime device tree exposes no enabled memory node"
+    fi
+
+    : >"$dtrhc_reserved_file"
+    if dt_list_enabled_reserved_memory_nodes "$dtrhc_root" >"$dtrhc_reserved_file"; then
+        while IFS= read -r dtrhc_reserved_node; do
+            [ -n "$dtrhc_reserved_node" ] || continue
+            if dt_node_has_property "$dtrhc_reserved_node" reg ||
+               dt_node_has_property "$dtrhc_reserved_node" size; then
+                test_result_record "PASS" "Reserved-memory node has size or reg data: ${dtrhc_reserved_node##*/}"
+            else
+                test_result_record "FAIL" "Reserved-memory node lacks size and reg data: ${dtrhc_reserved_node##*/}"
+            fi
+        done <"$dtrhc_reserved_file"
+    elif [ -d "$dtrhc_root/reserved-memory" ]; then
+        test_result_record "SKIP" "Reserved-memory root has no enabled child nodes"
+    else
+        test_result_record "SKIP" "Runtime device tree does not expose optional reserved-memory nodes"
+    fi
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "interrupts"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Interrupts"
+    dt_validate_property_provider "$dtrhc_root" "NUMA" "numa-node-id" "$dtrhc_result_dir"
+
+    if [ -r /proc/interrupts ]; then
+        test_result_record "PASS" "Kernel interrupt table is readable"
+    else
+        test_result_record "FAIL" "Kernel interrupt table is not readable"
+    fi
+
+    dt_validate_property_provider "$dtrhc_root" "Interrupt controller" "interrupt-controller" "$dtrhc_result_dir"
+    dt_validate_node_inventory "GIC" 'arm,.*gic' "$dtrhc_result_dir"
+    dt_validate_node_inventory "PDC" 'qcom,.*pdc' "$dtrhc_result_dir"
+    dt_validate_platform_capability "GPIO" 'qcom,.*(gpio|tlmm)' "$dtrhc_result_dir"
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "fabric"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Core SoC fabric"
+    dt_validate_property_provider "$dtrhc_root" "Clock" "#clock-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Reset" "#reset-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Regulator" "regulator-name" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Mailbox" "#mbox-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Interconnect" "#interconnect-cells" "$dtrhc_result_dir"
+    dt_validate_node_inventory "RPMh" 'qcom,.*rpmh' "$dtrhc_result_dir"
+    dt_validate_platform_capability "LLCC" 'qcom,.*llcc' "$dtrhc_result_dir"
+    dt_validate_platform_capability "SMMU" 'qcom,.*smmu-500' "$dtrhc_result_dir"
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "usb"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "USB"
+    dt_validate_platform_capability "USB" 'qcom,.*(dwc3|usb)' "$dtrhc_result_dir"
+    dt_validate_usb_host_runtime
+    dt_validate_runtime_path "USB gadget controller" '/sys/class/udc/*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "pcie"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "PCIe"
+    dt_validate_platform_capability "PCIe" 'qcom,.*pcie' "$dtrhc_result_dir"
+    dt_validate_runtime_path "PCIe endpoint" '/sys/bus/pci/devices/*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "storage"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Storage"
+    dt_validate_platform_capability "Storage" 'qcom,.*(ufs|sdhci|spi)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "SPI NOR" 'jedec,spi-nor' "$dtrhc_result_dir"
+    dt_validate_runtime_path "NVMe controller" '/sys/class/nvme/nvme*'
+    dt_validate_runtime_path "MTD storage" '/sys/class/mtd/mtd*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "network"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Networking"
+    dt_validate_platform_capability "Ethernet" 'qcom,.*(ethqos|emac)' "$dtrhc_result_dir"
+    dt_validate_network_runtime "Network interface"
+    dt_validate_node_inventory "WiFi" 'qcom,.*(wlan|wifi)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "Bluetooth" 'qcom,.*(bluetooth|wcn.*-bt)' "$dtrhc_result_dir"
+    dt_validate_runtime_path "Bluetooth HCI" '/sys/class/bluetooth/hci*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "multimedia"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Display and multimedia"
+    dt_validate_platform_capability "Display" 'qcom,.*(dpu|mdss)' "$dtrhc_result_dir"
+    dt_validate_platform_capability "GPU" 'qcom,.*(adreno|gpu)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "Audio" 'qcom,.*(audio|lpass)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "Camera" 'qcom,.*(camss|camera)' "$dtrhc_result_dir"
+    dt_validate_runtime_path "DRM device" '/sys/class/drm/card*'
+    dt_validate_runtime_path "ALSA card" '/sys/class/sound/card*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "remoteproc"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Remote processors"
+    dt_validate_remoteproc_inventory "$dtrhc_result_dir"
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "security"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Security and virtualization"
+    dt_validate_tee_runtime "$dtrhc_result_dir"
+    dt_validate_node_inventory "SCM" 'qcom,.*scm' "$dtrhc_result_dir"
+    dt_validate_node_inventory "TPM" '.*tpm' "$dtrhc_result_dir"
+    dt_validate_runtime_path "TPM device" '/dev/tpm*'
+    dt_validate_node_inventory "KVM EL2" 'qcom,.*el2' "$dtrhc_result_dir"
+    dt_validate_runtime_path "KVM device" '/dev/kvm'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "health"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Kernel health"
+    if [ -s "$dtrhc_result_dir/dmesg_errors.log" ]; then
+        test_result_record "FAIL" "Relevant DT or hardware-controller errors were found in the captured kernel log"
+    else
+        test_result_record "PASS" "No relevant DT or hardware-controller errors were found in the captured kernel log"
+    fi
+        dt_summary_end_area
+    fi
+
+    dt_summary_print "$dtrhc_result_dir"
+
+    return 0
 }
 
 ###############################################################################
