@@ -140,6 +140,24 @@ sensors_type_present() {
   printf '%s\n' "$types_nl" | grep -Fxq "$needle" 2>/dev/null
 }
 
+# Print discovered sensor types that support the streaming validation tools.
+# Service, registry, diagnostic, camera, and test endpoint types are omitted
+# because they are not hardware data sensors for see_workhorse/ssc_drva_test.
+sensors_select_testable_types() {
+  types_nl="$1"
+
+  printf '%s\n' "$types_nl" | while IFS= read -r sensor_type; do
+    case "$sensor_type" in
+      accel|gyro|mag|pressure|light|prox|temperature|humidity|gravity|\
+      linear_accel|rotation_vector|game_rotation_vector|\
+      geomagnetic_rotation_vector|step_counter|step_detector|\
+      significant_motion|tilt)
+        printf '%s\n' "$sensor_type"
+        ;;
+    esac
+  done
+}
+
 # Run a command in background, redirect all output to logfile, and print a heartbeat.
 # sensors_run_cmd_with_progress <logfile> <label> <duration_sec> <heartbeat_sec> -- <cmd...>
 sensors_run_cmd_with_progress() {

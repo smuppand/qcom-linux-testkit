@@ -31,14 +31,15 @@ Discovery:
                              core : accel,gyro
                              vision: accel,gyro,mag,pressure
                              all : all discovered types (debug)
-                           Default: auto (core/vision inferred by presence of mag/pressure)
+                           Default: auto (all discovered testable data sensors)
 
 Durations / progress:
   --out <dir> Output directory (default: ./logs_Sensors)
   --see-duration <sec> see_workhorse duration (default: 5)
   --drva-duration <sec> ssc_drva_test duration (default: 10)
   --hb <sec> Heartbeat seconds (default: 5)
-  --strict <0|1> Require accel+gyro to exist (default: 1)
+  --strict <0|1> Fail when an explicitly selected or named-profile sensor is
+                absent (default: 1). Auto mode uses present sensors only.
 
 Other:
   --help Show this help
@@ -323,33 +324,12 @@ if [ "$LIST_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-# strict accel+gyro requirement
-req_missing=0
-for r in accel gyro; do
-  if ! sensors_type_present "$types_nl" "$r"; then
-    log_warn "Missing required sensor type: $r"
-    req_missing=1
-  fi
-done
-if [ "$STRICT_REQUIRED" = "1" ] && [ "$req_missing" -eq 1 ]; then
-  log_fail "$TESTNAME FAIL - required sensor types missing (need accel+gyro)"
-  echo "$TESTNAME FAIL" >"$RES_FILE"
-  exit 0
-fi
-
-# infer kit for auto profile
-is_vision=0
-if sensors_type_present "$types_nl" "mag" || sensors_type_present "$types_nl" "pressure"; then
-  is_vision=1
-  log_info "Kit guess (DT-free): Vision-like (mag/pressure present)"
-else
-  log_info "Kit guess (DT-free): Core-like (mag/pressure not present)"
-fi
-
 TARGET_NL=""
+TARGET_SOURCE=""
 
 # 1) explicit sensor list overrides everything
 if [ -n "$SENSORS_CSV" ]; then
+  TARGET_SOURCE="explicit list"
   OLDIFS=$IFS
   IFS=,
   set -- "$SENSORS_CSV"
@@ -363,26 +343,28 @@ else
   # 2) profile selection
   case "$PROFILE" in
     auto)
-      if [ "$is_vision" -eq 1 ]; then
-        PROFILE="vision"
-      else
-        PROFILE="core"
-      fi
+      TARGET_SOURCE="dynamic inventory"
+      TARGET_NL="$(sensors_select_testable_types "$types_nl")"
       ;;
   esac
 
   case "$PROFILE" in
+    auto)
+      ;;
     basic|core)
+      TARGET_SOURCE="$PROFILE profile"
       TARGET_NL="accel
 gyro"
       ;;
     vision)
+      TARGET_SOURCE="vision profile"
       TARGET_NL="accel
 gyro
 mag
 pressure"
       ;;
     all)
+      TARGET_SOURCE="all profile"
       TARGET_NL="$types_nl"
       ;;
     *)
@@ -393,7 +375,40 @@ pressure"
   esac
 fi
 
-log_info "Sensors selected to test:"
+present_targets=""
+missing_targets=""
+for s in $TARGET_NL; do
+  if sensors_type_present "$types_nl" "$s"; then
+    present_targets="$(sensors_append_unique_line "$present_targets" "$s")"
+  else
+    missing_targets="$(sensors_append_unique_line "$missing_targets" "$s")"
+  fi
+done
+
+if [ -n "$missing_targets" ]; then
+  printf '%s\n' "$missing_targets" | while IFS= read -r s; do
+    [ -n "$s" ] && log_warn "Selected sensor type is not present: $s"
+  done
+
+  if [ "$STRICT_REQUIRED" = "1" ]; then
+    if [ "$PROFILE" != "auto" ] || [ -n "$SENSORS_CSV" ]; then
+      log_fail "$TESTNAME FAIL - required selected sensor types are missing"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+  fi
+fi
+
+TARGET_NL="$present_targets"
+
+if [ -z "$TARGET_NL" ]; then
+  log_info "No streamable data sensor types are present, completing SSC control-plane validation only"
+  log_pass "$TESTNAME PASS - SSC control plane is healthy, no physical data-sensor streaming was applicable"
+  echo "$TESTNAME PASS" >"$RES_FILE"
+  exit 0
+fi
+
+log_info "Sensors selected to test from $TARGET_SOURCE:"
 printf '%s\n' "$TARGET_NL" | while IFS= read -r s; do
   [ -n "$s" ] && log_info " - $s"
 done
@@ -457,4 +472,3 @@ else
 fi
 
 exit 0
-

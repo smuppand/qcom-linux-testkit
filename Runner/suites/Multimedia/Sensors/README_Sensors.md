@@ -34,9 +34,12 @@ This test validates Qualcomm SSC/ADSP sensor streaming **without relying on Devi
    - Parses **TYPE** entries where `AVAILABLE=true` (and prefers physical sensors where possible)
 
 3. **Auto-selects sensor set**
-   - Default: `--profile auto`
-   - If `mag` or `pressure` is present → **Vision-like** profile: `accel,gyro,mag,pressure`
-   - Else → **Core-like** profile: `accel,gyro`
+- Default: `--profile auto`
+- Auto mode selects the discovered sensor types supported by the streaming
+  tools, such as `accel`, `gyro`, `mag`, and `pressure`.
+- Auto mode passes the SSC platform-service validation when no testable data
+  sensor is present. Service and test endpoint types are not functional
+  streaming targets.
 
 4. **Runs functional validation**
    - For each selected sensor TYPE:
@@ -99,7 +102,7 @@ Profiles:
 - `basic` / `core`: `accel,gyro`
 - `vision`: `accel,gyro,mag,pressure`
 - `all`: all discovered types (debug)
-- `auto` (default): picks core/vision based on presence of `mag`/`pressure`
+- `auto` (default): tests discovered supported data sensor types only
 
 ### Run an explicit list of sensors
 ```sh
@@ -134,7 +137,8 @@ Profiles:
 - `--hb <sec>`  
   Heartbeat interval printed to stdout (default: `5`)
 - `--strict <0|1>`  
-  Require `accel` and `gyro` to exist (default: `1`)
+  Fail when an explicitly selected or named-profile sensor is absent (default:
+  `1`). Auto mode always uses the discovered present-sensor set.
 
 ### Environment overrides
 - `OUT_DIR` (same as `--out`)
@@ -170,7 +174,22 @@ Result file:
 - `Sensors.res` in the testcase directory
   - `Sensors PASS`
   - `Sensors FAIL`
-  - `Sensors SKIP`
+- `Sensors SKIP`
+
+## Verdict policy
+
+- **PASS, control plane only:** package/runtime checks, `sscrpcd`, ADSP, and
+  `ssc_sensor_info` are healthy, but the runtime inventory has no streamable
+  physical data-sensor type. This does not claim that sensor streaming was
+  tested.
+- **PASS, functional:** one or more discovered streamable data sensors pass
+  `see_workhorse` and the available `ssc_drva_test` validation.
+- **FAIL:** a required runtime component is broken, a discovered streamable
+  sensor fails functional validation, or an explicitly requested/named-profile
+  sensor is absent while strict mode is enabled.
+- **SKIP:** prerequisites are unavailable or the runtime cannot provide a
+  usable inventory, for example no Sensors configuration, no ADSP remoteproc,
+  missing commands, or no parsable `ssc_sensor_info` output.
 
 ---
 
