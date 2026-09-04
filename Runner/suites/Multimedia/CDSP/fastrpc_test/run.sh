@@ -59,6 +59,7 @@ CLI_DOMAIN=""
 CLI_DOMAIN_NAME=""
 DOMAIN_MODE="all-supported" # Default: test all supported domains
 PD_MODE="both" # Default: test both PDs where supported
+QRTR_LOOKUP_TIMEOUT="${QRTR_LOOKUP_TIMEOUT:-10}"
 
 # usage
 # Print the supported FastRPC test CLI, environment overrides, and selection policy.
@@ -103,6 +104,7 @@ Env:
   FASTRPC_EXTRA_FLAGS Extra flags appended (space-separated).
   FASTRPC_HEALTHCHECK_BIN Optional path to fastrpc-healthcheck.
   ALLOW_BIN_FASTRPC=1 Permit using /bin/fastrpc_test when --bin-dir=/bin.
+  QRTR_LOOKUP_TIMEOUT=<sec> Bound optional QRTR diagnostics (default: 10).
 
 Notes:
 - Script *cd*s into the binary directory and launches ./fastrpc_test.
@@ -333,6 +335,8 @@ if ! mkdir -p "$LOG_ROOT"; then
 fi
 
 log_info "Evidence directory: $test_path/$LOG_ROOT"
+
+fastrpc_capture_qrtr_evidence "$LOG_ROOT"
 
 # Prepare the image-provided DSP artifacts before healthcheck records capability.
 # This is idempotent and remains a clean no-op when no source is available.

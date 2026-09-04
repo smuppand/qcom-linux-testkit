@@ -7,6 +7,11 @@ offloading work to all supported DSP domains (ADSP, MDSP, SDSP, CDSP, CDSP1, GDS
 It wraps the public [fastrpc test application](https://github.com/quic/fastrpc) with **robust
 logging, parameter control, and CI-friendly output**.
 
+When QRTR and `qrtr-lookup` are available, the suite captures one bounded QRTR
+service-topology snapshot with its normal artifacts. This remains diagnostic
+evidence and does not make QRTR a prerequisite for FastRPC transports on other
+platforms. `QRTR_LOOKUP_TIMEOUT` optionally overrides the ten-second default.
+
 Supported capabilities:
 - Uses `fastrpc-healthcheck` when available to discover online DSPs, FastRPC support, signed and
   unsigned PD support, firmware information, and DSP library paths. The reported DMA-BUF system
@@ -97,6 +102,7 @@ Env:
   FASTRPC_EXTRA_FLAGS              Extra flags appended (space-separated).
   FASTRPC_HEALTHCHECK_BIN          Optional path to fastrpc-healthcheck.
   ALLOW_BIN_FASTRPC=1              Permit using /bin/fastrpc_test when --bin-dir=/bin.
+  QRTR_LOOKUP_TIMEOUT=<sec>        Bound optional QRTR diagnostics (default: 10).
 ```
 
 ### Quick start
@@ -107,6 +113,12 @@ Env:
 
 # With repeat and timeout:
 ./run.sh --repeat 3 --timeout 60
+```
+
+To override the default bounded QRTR diagnostic window:
+
+```sh
+QRTR_LOOKUP_TIMEOUT=20 ./run.sh --repeat 1 --timeout 60
 ```
 
 ### Common scenarios
@@ -215,6 +227,8 @@ package gap remains visible until a matching payload is provisioned. Other domai
 - **Per-iteration logs**: `logs_fastrpc_test_<timestamp>/<domain>_<pd>_iter<N>.out` (+ `.rc`, `.env`, `.cmd`)
 - **Kernel evidence on failure**: one shared `logs_fastrpc_test_<timestamp>/kernel/` snapshot is
   captured through `scan_dmesg_errors` after the invocation matrix.
+- **Optional QRTR evidence**: `logs_fastrpc_test_<timestamp>/qrtr_topology.log` when QRTR and
+  `qrtr-lookup` are available.
 - **Summary result file**: `fastrpc_test.res` (`PASS` / `FAIL` / `SKIP`)
 - **Verbose mode**: adds environment, library resolution, and timing details
 
