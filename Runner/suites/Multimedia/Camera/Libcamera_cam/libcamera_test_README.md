@@ -19,11 +19,16 @@ This repository contains a **POSIX shell** test harness for exercising `libcamer
 
 ## Requirements
 
-- `cam` (from libcamera)
+- `cam` (from the `libcamera-tools` package on Debian and Ubuntu)
 - Standard tools: `awk`, `sed`, `grep`, `sort`, `cut`, `tr`, `wc`, `find`, `stat`, `head`, `tail`, `dd`
 - Optional: `sha256sum` or `md5sum` (for duplicate BIN detection)
 - **BusyBox compatibility**:
   - We avoid `find -printf` and `od -A` options (not available on BusyBox).
+
+When `cam` is missing on an APT-based target, the shared package provider
+refreshes package metadata, installs `libcamera-tools`, and verifies the
+command before capture starts. Other images continue to use their configured
+provider or image-provided command and report the missing dependency cleanly.
 
 > The harness tolerates noisy `cam -l` / `cam -I` output (WARN/ERROR lines). It only requires that cameras and/or stream info are ultimately reported.
 

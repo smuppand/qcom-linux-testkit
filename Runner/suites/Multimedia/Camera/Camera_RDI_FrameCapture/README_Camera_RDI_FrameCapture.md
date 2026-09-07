@@ -36,6 +36,14 @@ Make sure the following tools are available in the target filesystem:
 - `yavta`
 - `v4l2-ctl`
 - `python3`
+
+On APT-based Debian and Ubuntu targets, missing camera utilities are recovered
+through the shared package provider. The `yavta` command is supplied by the
+`yavta` package, while `media-ctl` and `v4l2-ctl` are supplied by `v4l-utils`.
+The provider refreshes package metadata before installing missing packages.
+Other images continue to use their configured provider or image-provided
+commands and skip cleanly when recovery is unavailable.
+
 - Python camera pipeline parser (see `utils/camera/parse_media_topology.py`)
 - Kernel module: `qcom_camss`
 - Required DT nodes for `camss`, `isp`, or `camera` compatible strings
