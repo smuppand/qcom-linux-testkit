@@ -242,7 +242,8 @@ if scan_dmesg_errors "$SCRIPT_DIR" "$DMESG_MODULES" "$DMESG_EXCLUDE"; then
 fi
 
 # --------- Dependency Checks ---------
-check_dependencies media-ctl yavta python3 v4l2-ctl || {
+log_info "Ensuring camera RDI userspace tools are available: media-ctl, yavta, v4l2-ctl"
+CHECK_DEPS_NO_EXIT=1 check_dependencies media-ctl yavta python3 v4l2-ctl || {
     log_skip "$TESTNAME SKIP – Required tools missing"
     echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 2

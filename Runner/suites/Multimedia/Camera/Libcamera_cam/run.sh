@@ -144,9 +144,9 @@ else
 fi
 
 # ---------- Dependencies ----------
-log_info "Reviewing the dependencies needed to run the cam test."
-check_dependencies cam || {
-    log_error "cam utility not found"
+log_info "Ensuring the libcamera cam utility is available."
+CHECK_DEPS_NO_EXIT=1 check_dependencies cam || {
+    log_error "cam utility remains unavailable after package recovery"
     echo "$TESTNAME FAIL" > "$RES_FILE"
     exit 1
 }
