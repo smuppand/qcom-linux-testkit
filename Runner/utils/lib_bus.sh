@@ -49,8 +49,8 @@ bus_validation_ancestor_driver_name() {
             if [ -n "$bidn_driver" ]; then
                 bidn_driver_name=$(basename "$bidn_driver")
                 case "$bidn_driver_name" in
-                    port)
-                        # serial-core exposes a wrapper on the TTY port.
+                    port|ctrl)
+                        # serial-core exposes wrappers around the controller.
                         # Continue upward to report the hardware controller.
                         ;;
                     *)
@@ -259,6 +259,97 @@ bus_validation_dt_nodes() {
     [ -s "$bidn_output" ]
 }
 
+# uart_validate_bluetooth_transport <uart-dt-node> <result-dir>
+# Correlates a Bluetooth serdev UART with HCI and runs a bounded control probe.
+uart_validate_bluetooth_transport() {
+    uvbt_uart_node="$1"
+    uvbt_result_dir="$2"
+    [ -n "$uvbt_uart_node" ] && [ -n "$uvbt_result_dir" ] || return 3
+
+    uvbt_log="$uvbt_result_dir/uart_bluetooth_hci.log"
+    uvbt_class_root="${UART_SYS_CLASS_BLUETOOTH_ROOT:-/sys/class/bluetooth}"
+    uvbt_matches=0
+    uvbt_failures=0
+    : >>"$uvbt_log"
+
+    log_info "[UART-BT] validation=starting uart_node=$uvbt_uart_node intent=correlate-serdev-to-HCI-and-run-bounded-control-probe"
+    for uvbt_hci_path in "$uvbt_class_root"/hci*; do
+        [ -e "$uvbt_hci_path/device" ] || continue
+        uvbt_hci=$(basename "$uvbt_hci_path")
+        uvbt_hci_node=$(bus_validation_of_node "$uvbt_hci_path/device" 2>/dev/null || true)
+        case "$uvbt_hci_node" in
+            "$uvbt_uart_node"|"$uvbt_uart_node"/*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        uvbt_matches=$((uvbt_matches + 1))
+        uvbt_device=$(readlink -f "$uvbt_hci_path/device" 2>/dev/null || true)
+        uvbt_driver=$(bus_validation_ancestor_driver_name "$uvbt_hci_path/device" 2>/dev/null || true)
+        uvbt_address=$(cat "$uvbt_hci_path/address" 2>/dev/null || printf '%s\n' unavailable)
+        uvbt_name=$(cat "$uvbt_hci_path/name" 2>/dev/null || printf '%s\n' unavailable)
+        uvbt_probe=none
+        uvbt_probe_status=unavailable
+        uvbt_probe_output="$uvbt_result_dir/uart_bluetooth_${uvbt_hci}_probe.log"
+        : >"$uvbt_probe_output"
+
+        if command -v btmgmt >/dev/null 2>&1; then
+            uvbt_probe=btmgmt
+            uvbt_index=${uvbt_hci#hci}
+            if run_with_timeout 5 btmgmt --index "$uvbt_index" info >"$uvbt_probe_output" 2>&1 &&
+               [ -s "$uvbt_probe_output" ]; then
+                uvbt_probe_status=pass
+            else
+                uvbt_probe_status=fail
+                uvbt_failures=$((uvbt_failures + 1))
+            fi
+        elif command -v hciconfig >/dev/null 2>&1; then
+            uvbt_probe=hciconfig
+            if run_with_timeout 5 hciconfig -a "$uvbt_hci" >"$uvbt_probe_output" 2>&1 &&
+               [ -s "$uvbt_probe_output" ]; then
+                uvbt_probe_status=pass
+            else
+                uvbt_probe_status=fail
+                uvbt_failures=$((uvbt_failures + 1))
+            fi
+        elif command -v bluetoothctl >/dev/null 2>&1; then
+            uvbt_probe=bluetoothctl
+            if run_with_timeout 5 bluetoothctl show "$uvbt_address" >"$uvbt_probe_output" 2>&1 &&
+               grep -q 'Controller' "$uvbt_probe_output"; then
+                uvbt_probe_status=pass
+            else
+                uvbt_probe_status=diagnostic-unavailable
+            fi
+        fi
+
+        printf 'uart_node=%s hci=%s device=%s driver=%s address=%s name=%s probe=%s status=%s artifact=%s\n' \
+            "$uvbt_uart_node" "$uvbt_hci" "${uvbt_device:-unknown}" \
+            "${uvbt_driver:-unbound}" "$uvbt_address" "$uvbt_name" \
+            "$uvbt_probe" "$uvbt_probe_status" "$uvbt_probe_output" >>"$uvbt_log"
+
+        case "$uvbt_probe_status" in
+            pass)
+                log_info "[UART-BT] uart_node=$uvbt_uart_node hci=$uvbt_hci driver=${uvbt_driver:-unbound} address=$uvbt_address probe=$uvbt_probe status=pass artifact=$uvbt_probe_output"
+                ;;
+            fail)
+                log_fail "[UART-BT-FAIL] uart_node=$uvbt_uart_node hci=$uvbt_hci expected=successful-HCI-control-probe observed=$uvbt_probe-failed artifact=$uvbt_probe_output"
+                ;;
+            *)
+                log_warn "[UART-BT] uart_node=$uvbt_uart_node hci=$uvbt_hci driver=${uvbt_driver:-unbound} address=$uvbt_address probe=$uvbt_probe status=$uvbt_probe_status kernel_transport=registered artifact=$uvbt_probe_output"
+                ;;
+        esac
+    done
+
+    if [ "$uvbt_matches" -eq 0 ]; then
+        log_fail "[UART-BT-FAIL] uart_node=$uvbt_uart_node expected=HCI-adapter-for-bound-Bluetooth-serdev observed=none artifact=$uvbt_log"
+        return 1
+    fi
+    [ "$uvbt_failures" -eq 0 ] || return 1
+    return 0
+}
+
 # uart_validate_runtime <result-dir>
 # Correlates enabled UART DT nodes with platform drivers, TTYs, and serdev consumers.
 uart_validate_runtime() {
@@ -276,6 +367,7 @@ uart_validate_runtime() {
     ucri_failures=0
     ucri_dt_count=0
     ucri_runtime_count=0
+    ucri_bt_transport_count=0
 
     printf 'kind\tobject\tdriver\tof_node\tconsumer\tdetails\n' >"$ucri_evidence"
     printf 'tty\tdriver\tof_node\tconsole\tdevice\n' >"$ucri_ttys"
@@ -283,17 +375,17 @@ uart_validate_runtime() {
     : >"$ucri_registered_drivers"
 
     for ucri_serial_root in $ucri_serial_roots; do
-        bus_validation_capture_driver_names "$ucri_serial_root/drivers" "$ucri_result_dir/.uart_drivers.tmp" || true
-        if [ -s "$ucri_result_dir/.uart_drivers.tmp" ]; then
-            cat "$ucri_result_dir/.uart_drivers.tmp" >>"$ucri_registered_drivers"
+        bus_validation_capture_driver_names "$ucri_serial_root/drivers" "$ucri_result_dir/uart_drivers_tmp.log" || true
+        if [ -s "$ucri_result_dir/uart_drivers_tmp.log" ]; then
+            cat "$ucri_result_dir/uart_drivers_tmp.log" >>"$ucri_registered_drivers"
         fi
     done
-    if sort -u "$ucri_registered_drivers" >"$ucri_result_dir/.uart_drivers.sorted"; then
-        mv "$ucri_result_dir/.uart_drivers.sorted" "$ucri_registered_drivers"
+    if sort -u "$ucri_registered_drivers" >"$ucri_result_dir/uart_drivers_sorted.log"; then
+        mv "$ucri_result_dir/uart_drivers_sorted.log" "$ucri_registered_drivers"
     else
-        rm -f "$ucri_result_dir/.uart_drivers.sorted"
+        rm -f "$ucri_result_dir/uart_drivers_sorted.log"
     fi
-    rm -f "$ucri_result_dir/.uart_drivers.tmp"
+    rm -f "$ucri_result_dir/uart_drivers_tmp.log"
 
     if [ -d "$ucri_tty_root" ]; then
         for ucri_tty_path in "$ucri_tty_root"/*; do
@@ -346,6 +438,7 @@ uart_validate_runtime() {
         ucri_tty_names=$(awk -F '\t' -v node="$ucri_node" 'NR > 1 && $3 == node { printf "%s%s", separator, $1; separator="," } END { if (separator != "") print "" }' "$ucri_ttys")
         ucri_serdev_names=""
         ucri_serdev_bound=0
+        ucri_bluetooth_serdev=0
         for ucri_serial_root in $ucri_serial_roots; do
             if [ -d "$ucri_serial_root/devices" ]; then
                 for ucri_serdev in "$ucri_serial_root"/devices/*; do
@@ -358,6 +451,11 @@ uart_validate_runtime() {
                             ucri_serdev_names="${ucri_serdev_names}${ucri_serdev_names:+,}$ucri_serdev_name:${ucri_serdev_driver:-unbound}"
                             if [ -n "$ucri_serdev_driver" ]; then
                                 ucri_serdev_bound=$((ucri_serdev_bound + 1))
+                                case "$ucri_serdev_driver:$ucri_serdev_name" in
+                                    *hci*|*bluetooth*|*btqca*)
+                                        ucri_bluetooth_serdev=1
+                                        ;;
+                                esac
                             fi
                             ;;
                     esac
@@ -384,9 +482,17 @@ uart_validate_runtime() {
             log_fail "[UART-FAIL] object=$(basename "$ucri_device_dir") expected=TTY-or-bound-serdev-consumer observed=none driver=$ucri_driver artifact=$ucri_evidence"
             ucri_failures=$((ucri_failures + 1))
         fi
+
+        if [ "$ucri_bluetooth_serdev" -eq 1 ]; then
+            if uart_validate_bluetooth_transport "$ucri_node" "$ucri_result_dir"; then
+                ucri_bt_transport_count=$((ucri_bt_transport_count + 1))
+            else
+                ucri_failures=$((ucri_failures + 1))
+            fi
+        fi
     done <"$ucri_dt_nodes"
 
-    log_info "UART runtime summary: dt_controllers=$ucri_dt_count physical_ttys=$ucri_runtime_count failures=$ucri_failures artifact=$ucri_evidence"
+    log_info "UART runtime summary: dt_controllers=$ucri_dt_count physical_ttys=$ucri_runtime_count bluetooth_transports=$ucri_bt_transport_count failures=$ucri_failures artifact=$ucri_evidence"
 
     if [ "$ucri_dt_count" -eq 0 ] && [ "$ucri_runtime_count" -eq 0 ]; then
         return 2
@@ -662,11 +768,11 @@ can_validate_runtime() {
     printf 'kind\tobject\tdriver\tparent\tof_node\toperstate\tcan_state\tbitrate\tdbitrate\tctrlmode\tberr_tx\tberr_rx\trx_errors\ttx_errors\n' >"$ccri_evidence"
     : >"$ccri_dt_nodes"
     : >"$ccri_ip_log"
-    bus_validation_capture_driver_names "$ccri_spi_root/drivers" "$ccri_result_dir/.can_spi_drivers.tmp" || true
-    bus_validation_capture_driver_names "$ccri_platform_root/drivers" "$ccri_result_dir/.can_platform_drivers.tmp" || true
-    cat "$ccri_result_dir/.can_spi_drivers.tmp" "$ccri_result_dir/.can_platform_drivers.tmp" 2>/dev/null |
+    bus_validation_capture_driver_names "$ccri_spi_root/drivers" "$ccri_result_dir/can_spi_drivers_tmp.log" || true
+    bus_validation_capture_driver_names "$ccri_platform_root/drivers" "$ccri_result_dir/can_platform_drivers_tmp.log" || true
+    cat "$ccri_result_dir/can_spi_drivers_tmp.log" "$ccri_result_dir/can_platform_drivers_tmp.log" 2>/dev/null |
         sort -u >"$ccri_registered_drivers"
-    rm -f "$ccri_result_dir/.can_spi_drivers.tmp" "$ccri_result_dir/.can_platform_drivers.tmp"
+    rm -f "$ccri_result_dir/can_spi_drivers_tmp.log" "$ccri_result_dir/can_platform_drivers_tmp.log"
 
     if [ -n "$ccri_dt_root" ]; then
         bus_validation_dt_nodes "$ccri_dt_root" '^can(@|$)' "$ccri_dt_nodes" || true
@@ -695,7 +801,7 @@ can_validate_runtime() {
             ccri_berr_tx=unknown
             ccri_berr_rx=unknown
             if command -v ip >/dev/null 2>&1; then
-                ccri_ip_tmp="$ccri_result_dir/.can_ip_$ccri_iface.log"
+                ccri_ip_tmp="$ccri_result_dir/can_ip_${ccri_iface}_tmp.log"
                 if ip -details -statistics link show dev "$ccri_iface" >"$ccri_ip_tmp" 2>&1; then
                     printf '===== %s =====\n' "$ccri_iface" >>"$ccri_ip_log"
                     cat "$ccri_ip_tmp" >>"$ccri_ip_log"
@@ -798,7 +904,7 @@ bus_validation_suite_run() {
     bisr_script_dir="$4"
     [ -n "$bisr_bus" ] && [ -n "$bisr_test_name" ] && [ -n "$bisr_result_file" ] && [ -n "$bisr_script_dir" ] || return 3
 
-    bisr_result_dir="$bisr_script_dir/.${bisr_test_name}.work.$$"
+    bisr_result_dir="$bisr_script_dir/results/$bisr_test_name/run-$(date '+%Y%m%d-%H%M%S')-$$"
 
     case "$bisr_bus" in
         uart)
@@ -841,12 +947,12 @@ bus_validation_suite_run() {
 
     test_result_init "$bisr_test_name" "$bisr_result_file" || return 1
     if ! mkdir -p "$bisr_result_dir"; then
-        test_result_finish "FAIL" "$bisr_test_name FAIL: cannot create temporary evidence directory"
+        test_result_finish "FAIL" "$bisr_test_name FAIL: cannot create retained evidence directory $bisr_result_dir"
     fi
-    trap 'rm -rf "$bisr_result_dir"' EXIT HUP INT TERM
 
     log_info "--------------------------------------------------------------------------"
     log_info "Starting $bisr_test_name"
+    log_info "Evidence directory: $bisr_result_dir"
     log_info "${bisr_dmesg_label} validation: $bisr_intent"
 
     if ! bus_validation_require_commands awk basename cat dirname find grep mkdir mv od readlink rm sort tr; then
@@ -955,39 +1061,188 @@ uart_loopback_device_use_reason() {
     return 1
 }
 
-# uart_loopback_select_device
-# Prints the first runtime-discovered physical, accessible, non-console TTY.
-uart_loopback_select_device() {
-    ulsd_tty_root="${UART_SYS_CLASS_TTY_ROOT:-/sys/class/tty}"
-    ulsd_dev_root="${UART_DEV_ROOT:-/dev}"
-    ulsd_candidate=""
-    ulsd_count=0
+# uart_loopback_list_devices
+# Prints every runtime-discovered physical, accessible, unused non-console TTY.
+uart_loopback_list_devices() {
+    ulld_tty_root="${UART_SYS_CLASS_TTY_ROOT:-/sys/class/tty}"
+    ulld_dev_root="${UART_DEV_ROOT:-/dev}"
+    ulld_count=0
 
-    [ -d "$ulsd_tty_root" ] || return 2
-    for ulsd_tty_path in "$ulsd_tty_root"/*; do
-        [ -e "$ulsd_tty_path/device" ] || continue
-        ulsd_tty=$(basename "$ulsd_tty_path")
-        ulsd_device=$(readlink -f "$ulsd_tty_path/device" 2>/dev/null || true)
-        case "$ulsd_device" in
+    [ -d "$ulld_tty_root" ] || return 2
+    for ulld_tty_path in "$ulld_tty_root"/*; do
+        [ -e "$ulld_tty_path/device" ] || continue
+        ulld_tty=$(basename "$ulld_tty_path")
+        ulld_device=$(readlink -f "$ulld_tty_path/device" 2>/dev/null || true)
+        case "$ulld_device" in
             /sys/devices/virtual/*)
                 continue
                 ;;
         esac
-        ulsd_of_node=$(bus_validation_of_node "$ulsd_tty_path/device" 2>/dev/null || true)
-        [ -n "$ulsd_of_node" ] || continue
-        ulsd_devnode="$ulsd_dev_root/$ulsd_tty"
-        [ -c "$ulsd_devnode" ] || continue
-        if [ ! -r "$ulsd_devnode" ] || [ ! -w "$ulsd_devnode" ]; then
+        ulld_of_node=$(bus_validation_of_node "$ulld_tty_path/device" 2>/dev/null || true)
+        [ -n "$ulld_of_node" ] || continue
+        ulld_devnode="$ulld_dev_root/$ulld_tty"
+        [ -c "$ulld_devnode" ] || continue
+        if [ ! -r "$ulld_devnode" ] || [ ! -w "$ulld_devnode" ]; then
             continue
         fi
-        uart_device_is_console "$ulsd_tty" && continue
-        ulsd_candidate="$ulsd_devnode"
-        ulsd_count=$((ulsd_count + 1))
+        uart_device_is_console "$ulld_tty" && continue
+        if uart_loopback_device_use_reason "$ulld_devnode" >/dev/null 2>&1; then
+            continue
+        fi
+        printf '%s\n' "$ulld_devnode"
+        ulld_count=$((ulld_count + 1))
     done
 
-    [ "$ulsd_count" -eq 0 ] && return 2
+    [ "$ulld_count" -gt 0 ] || return 2
+    return 0
+}
+
+# uart_loopback_select_device
+# Prints the unique eligible UART and rejects ambiguous multi-device selection.
+uart_loopback_select_device() {
+    ulsd_candidates=$(uart_loopback_list_devices)
+    ulsd_status=$?
+    [ "$ulsd_status" -eq 0 ] || return "$ulsd_status"
+
+    ulsd_count=$(printf '%s\n' "$ulsd_candidates" | awk 'NF { count++ } END { print count + 0 }')
     [ "$ulsd_count" -eq 1 ] || return 1
-    printf '%s\n' "$ulsd_candidate"
+    printf '%s\n' "$ulsd_candidates"
+    return 0
+}
+
+# uart_loopback_report_candidates <output-file>
+# Logs why each DT-backed physical TTY is eligible or rejected for loopback.
+uart_loopback_report_candidates() {
+    ulrc_output="$1"
+    ulrc_tty_root="${UART_SYS_CLASS_TTY_ROOT:-/sys/class/tty}"
+    ulrc_dev_root="${UART_DEV_ROOT:-/dev}"
+    [ -n "$ulrc_output" ] || return 3
+
+    printf 'tty\tdevnode\tdriver\tof_node\tconsole\taccess\towner\truntime_pm\teligible\n' >"$ulrc_output" || return 1
+    [ -d "$ulrc_tty_root" ] || return 2
+
+    for ulrc_tty_path in "$ulrc_tty_root"/*; do
+        [ -e "$ulrc_tty_path/device" ] || continue
+        ulrc_tty=$(basename "$ulrc_tty_path")
+        ulrc_device=$(readlink -f "$ulrc_tty_path/device" 2>/dev/null || true)
+        case "$ulrc_device" in
+            /sys/devices/virtual/*)
+                continue
+                ;;
+        esac
+        ulrc_of_node=$(bus_validation_of_node "$ulrc_tty_path/device" 2>/dev/null || true)
+        [ -n "$ulrc_of_node" ] || continue
+        ulrc_driver=$(bus_validation_ancestor_driver_name "$ulrc_tty_path/device" 2>/dev/null || true)
+        ulrc_devnode="$ulrc_dev_root/$ulrc_tty"
+        ulrc_console=no
+        uart_device_is_console "$ulrc_tty" && ulrc_console=yes
+        ulrc_access=unavailable
+        if [ -c "$ulrc_devnode" ] && [ -r "$ulrc_devnode" ] && [ -w "$ulrc_devnode" ]; then
+            ulrc_access=read-write
+        fi
+        ulrc_owner=$(uart_loopback_device_use_reason "$ulrc_devnode" 2>/dev/null || true)
+        [ -n "$ulrc_owner" ] || ulrc_owner=none
+        ulrc_runtime_pm=$(cat "$ulrc_tty_path/device/power/runtime_status" 2>/dev/null || printf '%s\n' unavailable)
+        ulrc_eligible=yes
+        if [ "$ulrc_console" = yes ]; then
+            ulrc_eligible=no-console
+        elif [ "$ulrc_access" != read-write ]; then
+            ulrc_eligible=no-access
+        elif [ "$ulrc_owner" != none ]; then
+            ulrc_eligible=no-active-owner
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$ulrc_tty" "$ulrc_devnode" "${ulrc_driver:-unbound}" "$ulrc_of_node" \
+            "$ulrc_console" "$ulrc_access" "$ulrc_owner" "$ulrc_runtime_pm" \
+            "$ulrc_eligible" >>"$ulrc_output"
+        log_info "[UART-DISCOVERY] device=$ulrc_devnode driver=${ulrc_driver:-unbound} console=$ulrc_console access=$ulrc_access owner=$ulrc_owner runtime_pm=$ulrc_runtime_pm eligible=$ulrc_eligible of_node=$ulrc_of_node"
+    done
+
+    return 0
+}
+
+# uart_loopback_capture_failure_diagnostics <device> <result-dir> <case-id>
+# Retains bounded UART, Bluetooth-topology, rfkill, and kernel-error evidence.
+uart_loopback_capture_failure_diagnostics() {
+    ulfd_device="$1"
+    ulfd_result_dir="$2"
+    ulfd_case="$3"
+    [ -n "$ulfd_device" ] && [ -n "$ulfd_result_dir" ] && [ -n "$ulfd_case" ] || return 3
+
+    mkdir -p "$ulfd_result_dir" || return 1
+    ulfd_tty=$(basename "$ulfd_device")
+    ulfd_tty_path="${UART_SYS_CLASS_TTY_ROOT:-/sys/class/tty}/$ulfd_tty"
+    ulfd_output="$ulfd_result_dir/uart_failure_${ulfd_case}.log"
+    ulfd_bt_class_root="${UART_SYS_CLASS_BLUETOOTH_ROOT:-/sys/class/bluetooth}"
+    ulfd_rfkill_class_root="${UART_SYS_CLASS_RFKILL_ROOT:-/sys/class/rfkill}"
+    ulfd_sysfs_device=$(readlink -f "$ulfd_tty_path/device" 2>/dev/null || true)
+    ulfd_of_node=$(bus_validation_of_node "$ulfd_tty_path/device" 2>/dev/null || true)
+    ulfd_driver=$(bus_validation_ancestor_driver_name "$ulfd_tty_path/device" 2>/dev/null || true)
+    ulfd_runtime_pm=$(cat "$ulfd_tty_path/device/power/runtime_status" 2>/dev/null || printf '%s\n' unavailable)
+    ulfd_owner=$(uart_loopback_device_use_reason "$ulfd_device" 2>/dev/null || true)
+    [ -n "$ulfd_owner" ] || ulfd_owner=none
+    ulfd_console=no
+    uart_device_is_console "$ulfd_tty" && ulfd_console=yes
+
+    printf 'device=%s\nsysfs_device=%s\ndriver=%s\nof_node=%s\nconsole=%s\nowner=%s\nruntime_pm=%s\n' \
+        "$ulfd_device" "${ulfd_sysfs_device:-unknown}" "${ulfd_driver:-unbound}" \
+        "${ulfd_of_node:-unknown}" "$ulfd_console" "$ulfd_owner" \
+        "$ulfd_runtime_pm" >"$ulfd_output"
+    log_info "[UART-DIAG] device=$ulfd_device driver=${ulfd_driver:-unbound} console=$ulfd_console owner=$ulfd_owner runtime_pm=$ulfd_runtime_pm of_node=${ulfd_of_node:-unknown} artifact=$ulfd_output"
+
+    ulfd_bt_count=0
+    ulfd_bt_related=0
+    for ulfd_hci in "$ulfd_bt_class_root"/hci*; do
+        [ -e "$ulfd_hci/device" ] || continue
+        ulfd_bt_count=$((ulfd_bt_count + 1))
+        ulfd_hci_device=$(readlink -f "$ulfd_hci/device" 2>/dev/null || true)
+        ulfd_hci_node=$(bus_validation_of_node "$ulfd_hci/device" 2>/dev/null || true)
+        ulfd_hci_driver=$(bus_validation_ancestor_driver_name "$ulfd_hci/device" 2>/dev/null || true)
+        ulfd_relation=distinct
+        case "$ulfd_hci_node" in
+            "$ulfd_of_node"|"$ulfd_of_node"/*)
+                if [ -n "$ulfd_of_node" ]; then
+                    ulfd_relation=same-uart-controller
+                    ulfd_bt_related=1
+                fi
+                ;;
+        esac
+        printf 'bluetooth=%s device=%s driver=%s of_node=%s relation=%s\n' \
+            "$(basename "$ulfd_hci")" "${ulfd_hci_device:-unknown}" \
+            "${ulfd_hci_driver:-unbound}" "${ulfd_hci_node:-unknown}" \
+            "$ulfd_relation" >>"$ulfd_output"
+        log_info "[UART-BLUETOOTH] adapter=$(basename "$ulfd_hci") driver=${ulfd_hci_driver:-unbound} relation=$ulfd_relation of_node=${ulfd_hci_node:-unknown}"
+    done
+
+    ulfd_rfkill_count=0
+    for ulfd_rfkill in "$ulfd_rfkill_class_root"/rfkill*; do
+        [ -r "$ulfd_rfkill/type" ] || continue
+        ulfd_rfkill_type=$(tr -d '[:space:]' <"$ulfd_rfkill/type")
+        [ "$ulfd_rfkill_type" = bluetooth ] || continue
+        ulfd_rfkill_count=$((ulfd_rfkill_count + 1))
+        ulfd_rfkill_soft=$(cat "$ulfd_rfkill/soft" 2>/dev/null || printf '%s\n' unavailable)
+        ulfd_rfkill_hard=$(cat "$ulfd_rfkill/hard" 2>/dev/null || printf '%s\n' unavailable)
+        printf 'rfkill=%s soft=%s hard=%s\n' \
+            "$(basename "$ulfd_rfkill")" "$ulfd_rfkill_soft" "$ulfd_rfkill_hard" >>"$ulfd_output"
+        log_info "[UART-BLUETOOTH] rfkill=$(basename "$ulfd_rfkill") soft=$ulfd_rfkill_soft hard=$ulfd_rfkill_hard"
+    done
+
+    if [ "$ulfd_bt_related" -eq 1 ]; then
+        log_warn "[UART-RECOVERY] Bluetooth shares the selected UART controller, automatic disable is refused because the port ownership and restoration contract is not safe"
+    elif [ "$ulfd_bt_count" -gt 0 ] || [ "$ulfd_rfkill_count" -gt 0 ]; then
+        log_info "[UART-RECOVERY] Bluetooth runtime evidence is present on a distinct controller, action=none reason=not-related-to-selected-uart"
+    else
+        log_info "[UART-RECOVERY] Bluetooth runtime evidence is absent, action=none reason=not-applicable"
+    fi
+
+    ulfd_kernel_dir="$ulfd_result_dir/kernel"
+    mkdir -p "$ulfd_kernel_dir" || return 1
+    scan_dmesg_errors \
+        "$ulfd_kernel_dir" \
+        'qcom_geni_serial|msm_serial|uart|serial|tty|hci_uart|bluetooth|btqca|qca' \
+        'dummy regulator|supply [^ ]+ not found|using dummy regulator' || true
+    log_info "[UART-DIAG] kernel evidence retained under $ulfd_kernel_dir"
     return 0
 }
 
@@ -1004,6 +1259,25 @@ UART_LOOPBACK_DEVICE=""
 UART_LOOPBACK_STATE=""
 UART_LOOPBACK_READER_PID=""
 UART_LOOPBACK_WATCHER_PID=""
+UART_LOOPBACK_LOG=""
+
+# uart_loopback_log_payload <direction> <payload-file>
+# Logs bounded payload proof while retaining the complete payload artifact.
+uart_loopback_log_payload() {
+    ullp_direction="$1"
+    ullp_file="$2"
+    [ -n "$ullp_direction" ] && [ -r "$ullp_file" ] || return 3
+
+    ullp_bytes=$(wc -c <"$ullp_file" 2>/dev/null | tr -d '[:space:]')
+    ullp_checksum=$(cksum "$ullp_file" 2>/dev/null | awk '{ print $1 }')
+    ullp_preview=$(od -An -N 32 -v -tx1 "$ullp_file" 2>/dev/null | tr -d ' \n')
+    ullp_preview_bytes="${ullp_bytes:-0}"
+    if [ "$ullp_preview_bytes" -gt 32 ] 2>/dev/null; then
+        ullp_preview_bytes=32
+    fi
+    log_info "[UART-PAYLOAD] direction=$ullp_direction bytes=${ullp_bytes:-0} cksum=${ullp_checksum:-unavailable} preview_hex=${ullp_preview:-empty} preview_bytes=$ullp_preview_bytes artifact=$ullp_file"
+    return 0
+}
 
 # uart_loopback_cleanup
 # Stops an active reader and restores the exact saved termios state.
@@ -1022,27 +1296,41 @@ uart_loopback_cleanup() {
     fi
 
     if [ -n "$UART_LOOPBACK_DEVICE" ] && [ -n "$UART_LOOPBACK_STATE" ]; then
-        if ! stty -F "$UART_LOOPBACK_DEVICE" "$UART_LOOPBACK_STATE" 2>/dev/null; then
-            log_fail "[UART-RESTORE] device=$UART_LOOPBACK_DEVICE expected=saved-termios-state observed=restore-failed"
-            ulc_status=1
-        else
+        if ulc_restore_error=$(stty -F "$UART_LOOPBACK_DEVICE" "$UART_LOOPBACK_STATE" 2>&1); then
             log_info "[UART-RESTORE] device=$UART_LOOPBACK_DEVICE state=restored"
+        else
+            ulc_current_state=$(stty -F "$UART_LOOPBACK_DEVICE" -g 2>/dev/null || true)
+            if [ -n "$UART_LOOPBACK_LOG" ]; then
+                printf '%s\n' "$ulc_restore_error" >>"$UART_LOOPBACK_LOG"
+            fi
+            ulc_restore_error=$(printf '%s' "$ulc_restore_error" | tr '\n' ' ')
+            if [ "$ulc_current_state" = "$UART_LOOPBACK_STATE" ]; then
+                log_warn "[UART-RESTORE] device=$UART_LOOPBACK_DEVICE state=verified-restored stty_status=nonzero stty_error=${ulc_restore_error:-none}"
+            else
+                log_fail "[UART-RESTORE] device=$UART_LOOPBACK_DEVICE expected_state=$UART_LOOPBACK_STATE observed_state=${ulc_current_state:-unavailable} observed=restore-failed stty_error=${ulc_restore_error:-none}"
+                ulc_status=1
+            fi
         fi
     fi
 
     UART_LOOPBACK_DEVICE=""
     UART_LOOPBACK_STATE=""
+    UART_LOOPBACK_LOG=""
     return "$ulc_status"
 }
 
-# uart_loopback_validate <device> <baud> <timeout-seconds> <result-dir> [payload-bytes]
-# Runs exact-payload external loopback on an explicitly selected non-console TTY.
+# uart_loopback_validate <device> <baud> <timeout-seconds> <result-dir> [payload-bytes] [data-bits] [flow-control] [loopback-type] [internal-helper]
+# Runs exact-payload internal or external loopback on a selected non-console TTY.
 uart_loopback_validate() {
     ulv_device="$1"
     ulv_baud="$2"
     ulv_timeout="$3"
     ulv_result_dir="$4"
     ulv_payload_bytes="${5:-4096}"
+    ulv_data_bits="${6:-8}"
+    ulv_flow_control="${7:-none}"
+    ulv_loopback_type="${8:-external}"
+    ulv_internal_helper="${9:-}"
     [ -n "$ulv_device" ] && [ -n "$ulv_baud" ] && [ -n "$ulv_timeout" ] && [ -n "$ulv_result_dir" ] || return 3
 
     case "$ulv_baud:$ulv_timeout:$ulv_payload_bytes" in
@@ -1050,11 +1338,40 @@ uart_loopback_validate() {
             return 3
             ;;
     esac
+    case "$ulv_data_bits" in
+        5|6|7|8)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    case "$ulv_flow_control" in
+        none)
+            ulv_flow_flag="-crtscts"
+            ;;
+        rtscts)
+            ulv_flow_flag="crtscts"
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    case "$ulv_loopback_type" in
+        internal)
+            [ -n "$ulv_internal_helper" ] && [ -r "$ulv_internal_helper" ] || return 3
+            ;;
+        external)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
 
     mkdir -p "$ulv_result_dir" || return 1
-    ulv_log="$ulv_result_dir/uart_loopback_${ulv_baud}.log"
-    ulv_tx="$ulv_result_dir/uart_loopback_${ulv_baud}_tx.bin"
-    ulv_rx="$ulv_result_dir/uart_loopback_${ulv_baud}_rx.bin"
+    ulv_case="${ulv_baud}_${ulv_data_bits}bit_${ulv_flow_control}_${ulv_loopback_type}"
+    ulv_log="$ulv_result_dir/uart_loopback_${ulv_case}.log"
+    ulv_tx="$ulv_result_dir/uart_loopback_${ulv_case}_tx.bin"
+    ulv_rx="$ulv_result_dir/uart_loopback_${ulv_case}_rx.bin"
     ulv_tty=$(basename "$ulv_device")
     : >"$ulv_log"
     rm -f "$ulv_tx" "$ulv_rx"
@@ -1068,108 +1385,198 @@ uart_loopback_validate() {
         return 1
     fi
     if uart_device_is_console "$ulv_tty"; then
-        log_info "[UART-LOOPBACK] device=$ulv_device state=not-runnable reason=kernel-console action=refused artifact=$ulv_log"
+        log_info "[UART-LOOPBACK] device=$ulv_device state=not-runnable reason=kernel-console action=refused"
         return 2
     fi
     ulv_use_reason=$(uart_loopback_device_use_reason "$ulv_device" 2>/dev/null || true)
     if [ -n "$ulv_use_reason" ]; then
-        log_info "[UART-LOOPBACK] device=$ulv_device state=not-runnable reason=active-terminal-or-userspace-owner owner=$ulv_use_reason action=refused artifact=$ulv_log"
+        log_info "[UART-LOOPBACK] device=$ulv_device state=not-runnable reason=active-terminal-or-userspace-owner owner=$ulv_use_reason action=refused"
         return 2
     fi
 
     UART_LOOPBACK_DEVICE="$ulv_device"
+    UART_LOOPBACK_LOG="$ulv_log"
     UART_LOOPBACK_STATE=$(stty -F "$ulv_device" -g 2>/dev/null || true)
     if [ -z "$UART_LOOPBACK_STATE" ]; then
         log_fail "[UART-LOOPBACK] device=$ulv_device expected=readable-termios-state observed=unavailable artifact=$ulv_log"
         UART_LOOPBACK_DEVICE=""
         return 1
     fi
+    log_info "[UART-STATE] device=$ulv_device phase=pre-config termios=snapshot-captured"
 
-    if ! stty -F "$ulv_device" "$ulv_baud" raw -echo cs8 -cstopb -parenb -ixon -ixoff -crtscts 2>>"$ulv_log"; then
-        log_fail "[UART-LOOPBACK] device=$ulv_device expected=baud-$ulv_baud-configuration observed=stty-failed artifact=$ulv_log"
-        uart_loopback_cleanup || true
-        return 1
+    ulv_controller_loopback=not-requested
+    if [ "$ulv_loopback_type" = internal ]; then
+        ulv_controller_loopback=requested
+        log_info "[UART-STATE] device=$ulv_device phase=configuration-pending owner=internal-helper baud=$ulv_baud format=${ulv_data_bits}N1 flow_control=$ulv_flow_control controller_loopback=$ulv_controller_loopback"
+    else
+        if ! stty -F "$ulv_device" "$ulv_baud" raw -echo "cs$ulv_data_bits" \
+            -cstopb -parenb -ixon -ixoff "$ulv_flow_flag" clocal cread 2>>"$ulv_log"; then
+            log_fail "[UART-LOOPBACK] device=$ulv_device expected=termios-configuration observed=stty-failed baud=$ulv_baud data_bits=$ulv_data_bits flow_control=$ulv_flow_control artifact=$ulv_log"
+            uart_loopback_cleanup || true
+            return 1
+        fi
+        log_info "[UART-STATE] device=$ulv_device phase=configured baud=$ulv_baud format=${ulv_data_bits}N1 flow_control=$ulv_flow_control controller_loopback=$ulv_controller_loopback"
     fi
 
-    if ! awk -v bytes="$ulv_payload_bytes" '
-        BEGIN {
-            pattern = "QLI_UART_"
-            for (i = 0; i < bytes; i++) {
-                printf "%s", substr(pattern, (i % length(pattern)) + 1, 1)
+    case "$ulv_data_bits" in
+        5)
+            ulv_character_range=31
+            ;;
+        6)
+            ulv_character_range=63
+            ;;
+        7)
+            ulv_character_range=127
+            ;;
+        8)
+            ulv_character_range=0
+            ;;
+    esac
+    ulv_generation_failed=0
+    if [ "$ulv_character_range" -eq 0 ]; then
+        LC_ALL=C awk -v bytes="$ulv_payload_bytes" '
+            BEGIN {
+                pattern = "QLI_UART_"
+                for (i = 0; i < bytes; i++) {
+                    printf "%s", substr(pattern, (i % length(pattern)) + 1, 1)
+                }
             }
-        }
-    ' >"$ulv_tx"; then
+        ' >"$ulv_tx" || ulv_generation_failed=1
+    else
+        LC_ALL=C awk -v bytes="$ulv_payload_bytes" -v range="$ulv_character_range" '
+            BEGIN {
+                for (i = 0; i < bytes; i++) {
+                    printf "%c", 1 + (i % range)
+                }
+            }
+        ' >"$ulv_tx" || ulv_generation_failed=1
+    fi
+    if [ "$ulv_generation_failed" -ne 0 ]; then
         log_fail "[UART-LOOPBACK] device=$ulv_device expected=generated-$ulv_payload_bytes-byte-payload observed=generation-failed artifact=$ulv_log"
         uart_loopback_cleanup || true
         return 1
     fi
     ulv_length=$(wc -c <"$ulv_tx" | tr -d '[:space:]')
-    printf 'device=%s\nbaud=%s\ntimeout=%s\npayload_bytes=%s\n' \
-        "$ulv_device" "$ulv_baud" "$ulv_timeout" "$ulv_length" >>"$ulv_log"
+    uart_loopback_log_payload tx "$ulv_tx" || true
+    printf 'device=%s\nloopback=%s\nbaud=%s\ndata_bits=%s\nflow_control=%s\ntimeout=%s\npayload_bytes=%s\n' \
+        "$ulv_device" "$ulv_loopback_type" "$ulv_baud" "$ulv_data_bits" "$ulv_flow_control" \
+        "$ulv_timeout" "$ulv_length" >>"$ulv_log"
     stty -F "$ulv_device" -a >>"$ulv_log" 2>&1 || true
 
-    dd if="$ulv_device" of="$ulv_rx" bs=1 count="$ulv_length" >>"$ulv_log" 2>&1 &
-    UART_LOOPBACK_READER_PID=$!
-    (
-        sleep "$ulv_timeout"
-        kill "$UART_LOOPBACK_READER_PID" 2>/dev/null || true
-    ) &
-    UART_LOOPBACK_WATCHER_PID=$!
-    sleep 1
+    if [ "$ulv_loopback_type" = internal ]; then
+        ulv_internal_log="$ulv_result_dir/uart_internal_${ulv_case}.log"
+        ulv_outer_timeout=$((ulv_timeout + 5))
+        log_info "[UART-INTERNAL] device=$ulv_device phase=enable-request ioctl=TIOCM_LOOP timeout=${ulv_timeout}s artifact=$ulv_internal_log"
+        run_with_timeout "$ulv_outer_timeout" \
+            python3 "$ulv_internal_helper" \
+            --device "$ulv_device" \
+            --tx-file "$ulv_tx" \
+            --rx-file "$ulv_rx" \
+            --timeout "$ulv_timeout" \
+            --baud "$ulv_baud" \
+            --data-bits "$ulv_data_bits" \
+            --flow-control "$ulv_flow_control" >"$ulv_internal_log" 2>&1
+        ulv_internal_status=$?
+        log_file_with_label "UART-INTERNAL" "$ulv_internal_log"
+        case "$ulv_internal_status" in
+            0)
+                ;;
+            2)
+                log_info "[UART-LOOPBACK] device=$ulv_device state=not-runnable reason=internal-loopback-unsupported action=skipped artifact=$ulv_internal_log"
+                if ! uart_loopback_cleanup; then
+                    return 1
+                fi
+                return 2
+                ;;
+            *)
+                log_fail "[UART-LOOPBACK] device=$ulv_device expected=verified-TIOCM_LOOP-transfer observed=internal-helper-failed status=$ulv_internal_status artifact=$ulv_internal_log"
+                uart_loopback_cleanup || true
+                return 1
+                ;;
+        esac
+    else
+        dd if="$ulv_device" of="$ulv_rx" bs=1 count="$ulv_length" >>"$ulv_log" 2>&1 &
+        UART_LOOPBACK_READER_PID=$!
+        log_info "[UART-IO] device=$ulv_device phase=reader-started pid=$UART_LOOPBACK_READER_PID expected_bytes=$ulv_length timeout=${ulv_timeout}s"
+        (
+            sleep "$ulv_timeout"
+            kill "$UART_LOOPBACK_READER_PID" 2>/dev/null || true
+        ) &
+        UART_LOOPBACK_WATCHER_PID=$!
+        sleep 1
 
-    # shellcheck disable=SC2016
-    if ! run_with_timeout "$ulv_timeout" sh -c 'dd if="$1" of="$2" bs=4096' sh "$ulv_tx" "$ulv_device" >>"$ulv_log" 2>&1; then
-        log_fail "[UART-LOOPBACK] device=$ulv_device expected=bounded-write observed=write-failed-or-timeout artifact=$ulv_log"
-        uart_loopback_cleanup || true
-        return 1
-    fi
+        # shellcheck disable=SC2016
+        if ! run_with_timeout "$ulv_timeout" sh -c 'dd if="$1" of="$2" bs=4096' sh "$ulv_tx" "$ulv_device" >>"$ulv_log" 2>&1; then
+            uart_loopback_log_payload rx "$ulv_rx" || true
+            log_fail "[UART-LOOPBACK] device=$ulv_device expected=bounded-write observed=write-failed-or-timeout artifact=$ulv_log"
+            uart_loopback_cleanup || true
+            return 1
+        fi
+        log_info "[UART-IO] device=$ulv_device phase=write-complete bytes=$ulv_length"
 
-    if ! wait "$UART_LOOPBACK_READER_PID"; then
+        if ! wait "$UART_LOOPBACK_READER_PID"; then
+            UART_LOOPBACK_READER_PID=""
+            ulv_received_bytes=$(wc -c <"$ulv_rx" 2>/dev/null | tr -d '[:space:]')
+            uart_loopback_log_payload rx "$ulv_rx" || true
+            log_fail "[UART-LOOPBACK] device=$ulv_device expected=${ulv_length}-received-bytes observed=reader-failed-or-timeout received_bytes=${ulv_received_bytes:-0} fixture=external-tx-rx-loopback-not-observed artifact=$ulv_log"
+            uart_loopback_cleanup || true
+            return 1
+        fi
         UART_LOOPBACK_READER_PID=""
-        log_fail "[UART-LOOPBACK] device=$ulv_device expected=$ulv_length-received-bytes observed=reader-failed-or-timeout artifact=$ulv_log"
-        uart_loopback_cleanup || true
-        return 1
+        kill "$UART_LOOPBACK_WATCHER_PID" 2>/dev/null || true
+        wait "$UART_LOOPBACK_WATCHER_PID" 2>/dev/null || true
+        UART_LOOPBACK_WATCHER_PID=""
+        ulv_received_bytes=$(wc -c <"$ulv_rx" 2>/dev/null | tr -d '[:space:]')
+        log_info "[UART-IO] device=$ulv_device phase=read-complete expected_bytes=$ulv_length received_bytes=${ulv_received_bytes:-0}"
     fi
-    UART_LOOPBACK_READER_PID=""
-    kill "$UART_LOOPBACK_WATCHER_PID" 2>/dev/null || true
-    wait "$UART_LOOPBACK_WATCHER_PID" 2>/dev/null || true
-    UART_LOOPBACK_WATCHER_PID=""
+
+    uart_loopback_log_payload rx "$ulv_rx" || true
 
     if ! cmp -s "$ulv_tx" "$ulv_rx"; then
-        ulv_received=$(od -An -v -tx1 "$ulv_rx" 2>/dev/null | tr -d ' \n')
-        ulv_expected=$(od -An -v -tx1 "$ulv_tx" 2>/dev/null | tr -d ' \n')
-        log_fail "[UART-LOOPBACK] device=$ulv_device expected_hex=$ulv_expected observed_hex=${ulv_received:-empty} artifact=$ulv_log"
+        ulv_first_mismatch=$(cmp -l "$ulv_tx" "$ulv_rx" 2>/dev/null | awk 'NR == 1 { printf "offset=%s expected_octal=%s observed_octal=%s", $1, $2, $3; exit }')
+        log_fail "[UART-LOOPBACK] device=$ulv_device expected=byte-for-byte-match observed=mismatch first_difference=${ulv_first_mismatch:-size-or-content-mismatch} tx_artifact=$ulv_tx rx_artifact=$ulv_rx"
         uart_loopback_cleanup || true
         return 1
     fi
+    log_info "[UART-PROOF] device=$ulv_device comparison=byte-for-byte result=match bytes=$ulv_length tx_artifact=$ulv_tx rx_artifact=$ulv_rx"
 
     if ! uart_loopback_cleanup; then
         return 1
     fi
 
-    log_info "[UART-LOOPBACK] device=$ulv_device baud=$ulv_baud bytes=$ulv_length format=8N1 flow_control=off payload=verified artifact=$ulv_log"
+    log_info "[UART-LOOPBACK] device=$ulv_device loopback=$ulv_loopback_type baud=$ulv_baud bytes=$ulv_length format=${ulv_data_bits}N1 flow_control=$ulv_flow_control payload=verified artifact=$ulv_log"
+    return 0
+}
+
+# spi_loopback_list_devices
+# Prints every accessible image-provided spidev character device.
+spi_loopback_list_devices() {
+    slld_dev_root="${SPI_DEV_ROOT:-/dev}"
+    slld_count=0
+
+    for slld_device in "$slld_dev_root"/spidev*; do
+        [ -c "$slld_device" ] || continue
+        if [ ! -r "$slld_device" ] || [ ! -w "$slld_device" ]; then
+            continue
+        fi
+        printf '%s\n' "$slld_device"
+        slld_count=$((slld_count + 1))
+    done
+
+    [ "$slld_count" -gt 0 ] || return 2
     return 0
 }
 
 # spi_loopback_select_device
-# Prints the first accessible image-provided spidev character device.
+# Prints the unique accessible spidev device and rejects ambiguous selection.
 spi_loopback_select_device() {
-    slsd_dev_root="${SPI_DEV_ROOT:-/dev}"
-    slsd_candidate=""
-    slsd_count=0
+    slsd_candidates=$(spi_loopback_list_devices)
+    slsd_status=$?
+    [ "$slsd_status" -eq 0 ] || return "$slsd_status"
 
-    for slsd_device in "$slsd_dev_root"/spidev*; do
-        [ -c "$slsd_device" ] || continue
-        if [ ! -r "$slsd_device" ] || [ ! -w "$slsd_device" ]; then
-            continue
-        fi
-        slsd_candidate="$slsd_device"
-        slsd_count=$((slsd_count + 1))
-    done
-
-    [ "$slsd_count" -eq 0 ] && return 2
+    slsd_count=$(printf '%s\n' "$slsd_candidates" | awk 'NF { count++ } END { print count + 0 }')
     [ "$slsd_count" -eq 1 ] || return 1
-    printf '%s\n' "$slsd_candidate"
+    printf '%s\n' "$slsd_candidates"
     return 0
 }
 
@@ -1352,26 +1759,36 @@ can_internal_loopback_interface_is_ready() {
     return 0
 }
 
-# can_internal_loopback_select_interface <auto|classic|fd>
-# Prints the unique down physical CAN interface that may be configured safely.
-can_internal_loopback_select_interface() {
-    cilsi_mode="$1"
-    cilsi_net_root="${CAN_SYS_CLASS_NET_ROOT:-/sys/class/net}"
-    cilsi_candidate=""
-    cilsi_count=0
-    [ "$cilsi_mode" = "auto" ] || [ "$cilsi_mode" = "classic" ] || [ "$cilsi_mode" = "fd" ] || return 3
-    [ -d "$cilsi_net_root" ] || return 2
+# can_internal_loopback_list_interfaces <auto|classic|fd>
+# Prints every down physical CAN interface that may be configured safely.
+can_internal_loopback_list_interfaces() {
+    cilli_mode="$1"
+    cilli_net_root="${CAN_SYS_CLASS_NET_ROOT:-/sys/class/net}"
+    cilli_count=0
+    [ "$cilli_mode" = "auto" ] || [ "$cilli_mode" = "classic" ] || [ "$cilli_mode" = "fd" ] || return 3
+    [ -d "$cilli_net_root" ] || return 2
 
-    for cilsi_path in "$cilsi_net_root"/*; do
-        cilsi_interface=$(basename "$cilsi_path")
-        can_internal_loopback_interface_is_ready "$cilsi_interface" || continue
-        cilsi_candidate="$cilsi_interface"
-        cilsi_count=$((cilsi_count + 1))
+    for cilli_path in "$cilli_net_root"/*; do
+        cilli_interface=$(basename "$cilli_path")
+        can_internal_loopback_interface_is_ready "$cilli_interface" || continue
+        printf '%s\n' "$cilli_interface"
+        cilli_count=$((cilli_count + 1))
     done
 
-    [ "$cilsi_count" -eq 0 ] && return 2
+    [ "$cilli_count" -gt 0 ] || return 2
+    return 0
+}
+
+# can_internal_loopback_select_interface <auto|classic|fd>
+# Prints the unique eligible CAN interface and rejects ambiguous selection.
+can_internal_loopback_select_interface() {
+    cilsi_candidates=$(can_internal_loopback_list_interfaces "$1")
+    cilsi_status=$?
+    [ "$cilsi_status" -eq 0 ] || return "$cilsi_status"
+
+    cilsi_count=$(printf '%s\n' "$cilsi_candidates" | awk 'NF { count++ } END { print count + 0 }')
     [ "$cilsi_count" -eq 1 ] || return 1
-    printf '%s\n' "$cilsi_candidate"
+    printf '%s\n' "$cilsi_candidates"
     return 0
 }
 

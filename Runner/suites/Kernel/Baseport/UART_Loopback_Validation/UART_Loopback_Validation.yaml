@@ -1,22 +1,31 @@
 metadata:
   name: UART_Loopback_Validation
   format: "Lava-Test Test Definition 1.0"
-  description: "Run bounded exact-payload loopback on an auto-detected or selected safe UART"
+  description: >
+    Run bounded internal or external exact-payload loopback on dynamically
+    selected safe UARTs and retain per-device TX/RX proof and restoration evidence
   os:
     - linux
   scope:
     - functional
 
 params:
+  # Empty tests all eligible UARTs in internal mode and requires a unique UART in external mode.
   UART_DEVICE: ""
+  # Auto uses the portable 115200 default. Jobs may override a target-qualified matrix.
   UART_BAUDS: "auto"
+  UART_DATA_BITS: "8"
+  UART_FLOW_CONTROL: "none"
+  # Internal uses TIOCM_LOOP. External requires UART_LOOPBACK_FIXTURE=1 and a return path.
+  UART_LOOPBACK_TYPE: "external"
   UART_PAYLOAD_BYTES: "4096"
   UART_LOOPBACK_TIMEOUT: "10"
+  # Confirms external TX/RX wiring or a USB-to-UART peer echo. Ignored by internal mode.
   UART_LOOPBACK_FIXTURE: "0"
 
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Kernel/Baseport/UART_Loopback_Validation
-    - UART_DEVICE="${UART_DEVICE}" UART_BAUDS="${UART_BAUDS}" UART_PAYLOAD_BYTES="${UART_PAYLOAD_BYTES}" UART_LOOPBACK_TIMEOUT="${UART_LOOPBACK_TIMEOUT}" UART_LOOPBACK_FIXTURE="${UART_LOOPBACK_FIXTURE}" ./run.sh || true
+    - UART_DEVICE="${UART_DEVICE}" UART_BAUDS="${UART_BAUDS}" UART_DATA_BITS="${UART_DATA_BITS}" UART_FLOW_CONTROL="${UART_FLOW_CONTROL}" UART_LOOPBACK_TYPE="${UART_LOOPBACK_TYPE}" UART_PAYLOAD_BYTES="${UART_PAYLOAD_BYTES}" UART_LOOPBACK_TIMEOUT="${UART_LOOPBACK_TIMEOUT}" UART_LOOPBACK_FIXTURE="${UART_LOOPBACK_FIXTURE}" ./run.sh || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh UART_Loopback_Validation.res

@@ -40,7 +40,7 @@ fi
 TESTNAME="SPI_Loopback_Validation"
 RES_FILE="$SCRIPT_DIR/$TESTNAME.res"
 
-RESULT_DIR="$SCRIPT_DIR/.${TESTNAME}.work.$$"
+RESULT_DIR="$SCRIPT_DIR/results/$TESTNAME/run-$(date '+%Y%m%d-%H%M%S')-$$"
 SPI_DEVICE="${SPI_DEVICE:-}"
 SPI_SPEED_HZ="${SPI_SPEED_HZ:-1000000}"
 SPI_BITS_PER_WORD="${SPI_BITS_PER_WORD:-8}"
@@ -49,10 +49,6 @@ SPI_LOOPBACK_TYPE="${SPI_LOOPBACK_TYPE:-auto}"
 SPI_LOOPBACK_PAYLOAD="${SPI_LOOPBACK_PAYLOAD:-QLI_SPI_LOOPBACK}"
 SPI_LOOPBACK_TIMEOUT="${SPI_LOOPBACK_TIMEOUT:-10}"
 SPI_LOOPBACK_FIXTURE="${SPI_LOOPBACK_FIXTURE:-0}"
-
-cleanup() {
-    rm -rf "$RESULT_DIR"
-}
 
 usage() {
     cat <<EOF
@@ -183,32 +179,43 @@ if ! validate_config; then
 fi
 
 test_result_init "$TESTNAME" "$RES_FILE" || exit 1
-trap cleanup EXIT HUP INT TERM
 
 if ! mkdir -p "$RESULT_DIR"; then
-    test_result_finish "FAIL" "$TESTNAME FAIL: cannot create temporary evidence directory"
+    test_result_finish "FAIL" "$TESTNAME FAIL: cannot create retained evidence directory $RESULT_DIR"
 fi
 
 log_info "--------------------------------------------------------------------------"
 log_info "Starting $TESTNAME"
-if ! bus_validation_require_commands basename cat cmp dirname grep mkdir od readlink rm tr wc; then
+log_info "Evidence directory: $RESULT_DIR"
+if ! bus_validation_require_commands awk basename cat cmp dirname grep mkdir od readlink rm tr wc; then
     test_result_finish "SKIP" "$TESTNAME SKIP: required image-provided SPI loopback utilities are unavailable"
 fi
 
 SPI_SELECTION_SOURCE=override
-if [ -z "$SPI_DEVICE" ]; then
+SPI_SELECTED_DEVICES="$RESULT_DIR/spi_selected_devices.log"
+: >"$SPI_SELECTED_DEVICES"
+if [ -n "$SPI_DEVICE" ]; then
+    printf '%s\n' "$SPI_DEVICE" >"$SPI_SELECTED_DEVICES"
+elif [ "$SPI_LOOPBACK_TYPE" = "internal" ]; then
+    SPI_SELECTION_SOURCE=auto-all
+    spi_loopback_list_devices >"$SPI_SELECTED_DEVICES" 2>/dev/null
+    SPI_SELECTION_STATUS=$?
+else
     SPI_SELECTION_SOURCE=auto
-    SPI_DEVICE=$(spi_loopback_select_device 2>/dev/null)
+    SPI_SELECTED_DEVICE=$(spi_loopback_select_device 2>/dev/null)
     SPI_SELECTION_STATUS=$?
     if [ "$SPI_SELECTION_STATUS" -eq 1 ]; then
         test_result_finish "SKIP" "$TESTNAME SKIP: multiple accessible spidev nodes were detected, select one with --device or SPI_DEVICE"
     fi
+    if [ "$SPI_SELECTION_STATUS" -eq 0 ] && [ -n "$SPI_SELECTED_DEVICE" ]; then
+        printf '%s\n' "$SPI_SELECTED_DEVICE" >"$SPI_SELECTED_DEVICES"
+    fi
 fi
-if [ -z "$SPI_DEVICE" ]; then
+if [ ! -s "$SPI_SELECTED_DEVICES" ]; then
     test_result_finish "SKIP" "$TESTNAME SKIP: no accessible image-provided spidev node was detected"
 fi
 if [ "$SPI_LOOPBACK_TYPE" = "auto" ]; then
-    SPI_LOOPBACK_TYPE=$(spi_loopback_select_type "$SPI_DEVICE")
+    SPI_LOOPBACK_TYPE=$(spi_loopback_select_type auto)
     SPI_LOOPBACK_SELECTION_STATUS=$?
     if [ "$SPI_LOOPBACK_SELECTION_STATUS" -ne 0 ] || [ -z "$SPI_LOOPBACK_TYPE" ]; then
         test_result_finish "SKIP" "$TESTNAME SKIP: the loopback type is not observable at runtime, select --loopback internal or --loopback external"
@@ -224,46 +231,63 @@ esac
 if [ "$SPI_LOOPBACK_TYPE" = "external" ] && ! bus_validation_bool_true "$SPI_LOOPBACK_FIXTURE"; then
     test_result_finish "SKIP" "$TESTNAME SKIP: external SPI loopback fixture was not explicitly enabled, use --fixture or SPI_LOOPBACK_FIXTURE=1"
 fi
-log_info "Configuration: device=$SPI_DEVICE selection=$SPI_SELECTION_SOURCE speed_hz=$SPI_SPEED_HZ bits=$SPI_BITS_PER_WORD modes=$SPI_MODES loopback=$SPI_LOOPBACK_TYPE timeout=${SPI_LOOPBACK_TIMEOUT}s"
+SPI_SELECTED_COUNT=$(awk 'NF { count++ } END { print count + 0 }' "$SPI_SELECTED_DEVICES")
+log_info "SPI selection: source=$SPI_SELECTION_SOURCE selected_devices=$SPI_SELECTED_COUNT list=$SPI_SELECTED_DEVICES"
 
 log_info "SPI loopback: validating exact transfers across the requested CPOL and CPHA mode matrix"
-SPI_REMAINING_MODES=$SPI_MODES
-while [ -n "$SPI_REMAINING_MODES" ]; do
-    case "$SPI_REMAINING_MODES" in
-        *,*)
-            SPI_MODE=${SPI_REMAINING_MODES%%,*}
-            SPI_REMAINING_MODES=${SPI_REMAINING_MODES#*,}
-            ;;
-        *)
-            SPI_MODE=$SPI_REMAINING_MODES
-            SPI_REMAINING_MODES=""
-            ;;
-    esac
-    log_info "---- SPI functional case: device=$SPI_DEVICE mode=$SPI_MODE loopback=$SPI_LOOPBACK_TYPE ----"
-    spi_loopback_validate \
-        "$SPI_DEVICE" \
-        "$SPI_SPEED_HZ" \
-        "$SPI_BITS_PER_WORD" \
-        "$SPI_LOOPBACK_PAYLOAD" \
-        "$SPI_LOOPBACK_TIMEOUT" \
-        "$RESULT_DIR" \
-        "$SPI_MODE" \
-        "$SPI_LOOPBACK_TYPE"
-    loopback_status=$?
-    case "$loopback_status" in
-        0)
-            test_result_record "PASS" "SPI exact transfer passed on $SPI_DEVICE in mode $SPI_MODE with $SPI_LOOPBACK_TYPE loopback"
-            ;;
-        1)
-            test_result_record "FAIL" "SPI loopback failed on $SPI_DEVICE in mode $SPI_MODE, see $RESULT_DIR/spi_loopback_mode${SPI_MODE}_${SPI_LOOPBACK_TYPE}.log"
-            ;;
-        2)
-            test_result_finish "SKIP" "$TESTNAME SKIP: spidev_test is not provided by the image"
-            ;;
-        *)
-            test_result_record "FAIL" "SPI loopback helper returned unexpected status $loopback_status in mode $SPI_MODE"
-            ;;
-    esac
-done
+while IFS= read -r SPI_DEVICE; do
+    [ -n "$SPI_DEVICE" ] || continue
+    SPI_DEVICE_NAME=$(basename "$SPI_DEVICE")
+    SPI_DEVICE_RESULT_DIR="$RESULT_DIR/$SPI_DEVICE_NAME"
+    if ! mkdir -p "$SPI_DEVICE_RESULT_DIR"; then
+        test_result_record "FAIL" "SPI evidence directory could not be created for $SPI_DEVICE at $SPI_DEVICE_RESULT_DIR"
+        continue
+    fi
+    log_info "[SPI-SELECTION] device=$SPI_DEVICE source=$SPI_SELECTION_SOURCE loopback=$SPI_LOOPBACK_TYPE"
+    if [ ! -c "$SPI_DEVICE" ] || [ ! -r "$SPI_DEVICE" ] || [ ! -w "$SPI_DEVICE" ]; then
+        log_fail "[SPI-LOOPBACK] device=$SPI_DEVICE expected=accessible-spidev-character-device observed=missing-wrong-type-or-inaccessible selection=$SPI_SELECTION_SOURCE"
+        test_result_record "FAIL" "Selected SPI loopback device $SPI_DEVICE is not an accessible image-provided spidev node"
+        continue
+    fi
+    log_info "Configuration: device=$SPI_DEVICE selection=$SPI_SELECTION_SOURCE speed_hz=$SPI_SPEED_HZ bits=$SPI_BITS_PER_WORD modes=$SPI_MODES loopback=$SPI_LOOPBACK_TYPE timeout=${SPI_LOOPBACK_TIMEOUT}s evidence=$SPI_DEVICE_RESULT_DIR"
+    SPI_REMAINING_MODES=$SPI_MODES
+    while [ -n "$SPI_REMAINING_MODES" ]; do
+        case "$SPI_REMAINING_MODES" in
+            *,*)
+                SPI_MODE=${SPI_REMAINING_MODES%%,*}
+                SPI_REMAINING_MODES=${SPI_REMAINING_MODES#*,}
+                ;;
+            *)
+                SPI_MODE=$SPI_REMAINING_MODES
+                SPI_REMAINING_MODES=""
+                ;;
+        esac
+        log_info "---- SPI functional case: device=$SPI_DEVICE mode=$SPI_MODE loopback=$SPI_LOOPBACK_TYPE ----"
+        spi_loopback_validate \
+            "$SPI_DEVICE" \
+            "$SPI_SPEED_HZ" \
+            "$SPI_BITS_PER_WORD" \
+            "$SPI_LOOPBACK_PAYLOAD" \
+            "$SPI_LOOPBACK_TIMEOUT" \
+            "$SPI_DEVICE_RESULT_DIR" \
+            "$SPI_MODE" \
+            "$SPI_LOOPBACK_TYPE"
+        loopback_status=$?
+        case "$loopback_status" in
+            0)
+                test_result_record "PASS" "SPI exact transfer passed on $SPI_DEVICE in mode $SPI_MODE with $SPI_LOOPBACK_TYPE loopback"
+                ;;
+            1)
+                test_result_record "FAIL" "SPI loopback failed on $SPI_DEVICE in mode $SPI_MODE, see $SPI_DEVICE_RESULT_DIR/spi_loopback_mode${SPI_MODE}_${SPI_LOOPBACK_TYPE}.log"
+                ;;
+            2)
+                test_result_finish "SKIP" "$TESTNAME SKIP: spidev_test is not provided by the image"
+                ;;
+            *)
+                test_result_record "FAIL" "SPI loopback helper returned unexpected status $loopback_status in mode $SPI_MODE"
+                ;;
+        esac
+    done
+done <"$SPI_SELECTED_DEVICES"
 
 test_result_finish

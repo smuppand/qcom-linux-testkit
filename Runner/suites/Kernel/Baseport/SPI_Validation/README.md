@@ -29,7 +29,7 @@ cd Runner/suites/Kernel/Baseport/SPI_Validation
 ## Diagnostics
 
 The suite emits bounded per-object binding and kernel-health diagnostics to
-stdout. Temporary evidence is removed when the run finishes.
+stdout. Evidence is retained under `results/SPI_Validation/run-*/`.
 
 The suite never creates `spidev` nodes, changes DT configuration, probes
 arbitrary chip-selects, or installs diagnostic utilities. Fixture-controlled

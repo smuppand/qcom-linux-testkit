@@ -28,6 +28,6 @@ cd Runner/suites/Kernel/Baseport/I3C_Validation
 ## Diagnostics
 
 The suite emits bounded direct-I3C and indirect remoteproc evidence to stdout.
-Temporary evidence is removed when the run finishes.
+Evidence is retained under `results/I3C_Validation/run-*/`.
 
 Reference: [Qualcomm Linux I3C guide](https://docs.qualcomm.com/doc/80-70023-8/topic/i3c.html)

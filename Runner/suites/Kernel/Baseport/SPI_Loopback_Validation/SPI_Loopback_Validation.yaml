@@ -1,7 +1,7 @@
 metadata:
   name: SPI_Loopback_Validation
   format: "Lava-Test Test Definition 1.0"
-  description: "Run bounded exact-byte loopback on an auto-detected or selected spidev fixture"
+  description: "Run bounded exact-byte loopback on safe auto-detected or selected spidev devices"
   os:
     - linux
   scope:

@@ -9,9 +9,9 @@ supports it. External mode requires a MOSI-to-MISO loopback fixture.
 The suite validates command status and compares the exact requested, TX, and RX
 byte sequences across SPI modes 0, 1, 2, and 3 by default. It never creates
 spidev nodes, changes DT configuration, installs tools, or takes control of a
-production SPI client. A unique accessible
-`spidev` node is selected automatically. Multiple nodes require an explicit
-override so the suite does not guess which device has the loopback fixture.
+production SPI client. Internal mode selects every accessible `spidev` node.
+External mode requires a unique node or an explicit override so the suite does
+not guess which device has the loopback fixture.
 When the running kernel exposes standard SPI device statistics, the suite also
 requires the transfer not to increment the `errors` or `timedout` counters.
 
@@ -32,11 +32,15 @@ Optional settings:
 ./run.sh --device /dev/spidev0.0 --speed 5000000 --bits 8 --modes 0,1,2,3 --loopback external --fixture --timeout 15
 ```
 
-Use `--device` or `SPI_DEVICE` to override automatic discovery. `SPI_MODES`,
-`SPI_LOOPBACK_TYPE`, and `SPI_LOOPBACK_FIXTURE` control the functional matrix.
-CLI options take precedence over environment variables.
+Use `--device` or `SPI_DEVICE` to override automatic discovery. Internal mode
+sequentially validates every accessible spidev node when no override is given.
+External mode requires a unique node because runtime discovery cannot infer
+which device has the fixture return path. `SPI_MODES`, `SPI_LOOPBACK_TYPE`, and
+`SPI_LOOPBACK_FIXTURE` control the functional matrix. CLI options take
+precedence over environment variables.
 
-Temporary transfer evidence is removed when the run finishes. The live log
+Transfer evidence is retained under
+`results/SPI_Loopback_Validation/run-*/<spidev-name>/`. The live log
 retains the bounded per-case failure analysis.
 
 ## Result policy
@@ -46,7 +50,8 @@ retains the bounded per-case failure analysis.
 - `FAIL`: the selected node is invalid, the command fails or times out, output
   cannot be validated, the received bytes differ, or an exposed SPI error or
   timeout counter increases during the transfer.
-- `SKIP`: no unique accessible `spidev` node is discovered and no override is
-  provided, or `spidev_test` is not provided by the image.
+- `SKIP`: no accessible `spidev` node is discovered, external mode finds an
+  ambiguous set without an override, or `spidev_test` is not provided by the
+  image.
 
 Reference: [Qualcomm Linux SPI guide](https://docs.qualcomm.com/doc/80-70023-8/topic/spi.html)
