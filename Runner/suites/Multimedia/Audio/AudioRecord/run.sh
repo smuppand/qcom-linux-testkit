@@ -96,7 +96,8 @@ SRC_CHOICE="${SRC_CHOICE:-mic}" # mic|null
 DURATIONS="" # Will be set to default only if using legacy mode
 RECORD_SECONDS="${RECORD_SECONDS:-30s}" # DEFAULT: 30s; 'auto' maps short/med/long
 LOOPS="${LOOPS:-1}"
-TIMEOUT="${TIMEOUT:-0}" # 0 = no watchdog
+TIMEOUT="${TIMEOUT:-0}" # 0 = automatic duration-based watchdog
+AUDIO_RECORD_START_GRACE="${AUDIO_RECORD_START_GRACE:-5}"
 STRICT="${STRICT:-0}"
 DMESG_SCAN="${DMESG_SCAN:-1}"
 VERBOSE=0
@@ -147,7 +148,8 @@ Usage: $0 [options]
                       # false = never bootstrap manually
   --runtime-dir PATH # Override XDG_RUNTIME_DIR for minimal ramdisk mode
   --loops N
-  --timeout SECS
+  --timeout SECS         Override the automatic duration-based watchdog
+  --start-grace SECS     Recorder startup headroom, default: 5
   --strict [0|1]
   --no-dmesg
   --junit FILE.xml
@@ -295,6 +297,10 @@ while [ $# -gt 0 ]; do
       ;;
     --timeout)
       TIMEOUT="$2"
+      shift 2
+      ;;
+    --start-grace)
+      AUDIO_RECORD_START_GRACE="$2"
       shift 2
       ;;
     --strict)
@@ -539,7 +545,7 @@ if [ -n "$CONFIG_NAMES" ] && [ -n "$CONFIG_FILTER" ]; then
   CONFIG_FILTER=""
 fi
 
-log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE overlay=$AUDIO_OVERLAY_REQUESTED loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT strict=$STRICT signal_strict=$AUDIO_RECORD_STRICT_SIGNAL dmesg=$DMESG_SCAN bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
+log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE overlay=$AUDIO_OVERLAY_REQUESTED loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT start_grace=${AUDIO_RECORD_START_GRACE:-5} strict=$STRICT signal_strict=$AUDIO_RECORD_STRICT_SIGNAL dmesg=$DMESG_SCAN bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
 
 # Resolve backend (allow minimal-build ALSA capture fallback)
 if [ -z "$AUDIO_BACKEND" ]; then
@@ -909,9 +915,9 @@ esac
 dur_s="$(duration_to_secs "$TIMEOUT" 2>/dev/null || echo 0)"
 [ -z "$dur_s" ] && dur_s=0
 if [ "$dur_s" -gt 0 ] 2>/dev/null; then
-  log_info "Watchdog/timeout: ${TIMEOUT}"
+  log_info "Watchdog/timeout: explicit override=${TIMEOUT}"
 else
-  log_info "Watchdog/timeout: disabled (no timeout)"
+  log_info "Watchdog/timeout: automatic per case, requested duration plus start_grace=${AUDIO_RECORD_START_GRACE}s"
 fi
 
 # JUnit init (optional)
@@ -1079,7 +1085,7 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
     while [ "$i" -le "$LOOPS" ]; do
       iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      effective_timeout="$secs"
+      effective_timeout="$(audio_record_timeout_with_grace "$secs")"
       if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" != "0" ]; then
         effective_timeout="$TIMEOUT"
       fi
@@ -1099,7 +1105,8 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
       audio_record_set_capture_paths "$case_name"
       audio_record_reset_capture_output
-      start_s="$(date +%s 2>/dev/null || echo 0)"
+      start_mono="$(get_monotonic_seconds)"
+      start_wall="$(date +%s 2>/dev/null || echo 0)"
       validation_rate="$rate"
       validation_channels="$channels"
 
@@ -1287,9 +1294,21 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
         bytes=0
       fi
 
-      end_s="$(date +%s 2>/dev/null || echo 0)"
-      last_elapsed=$((end_s - start_s))
+      end_mono="$(get_monotonic_seconds)"
+      end_wall="$(date +%s 2>/dev/null || echo 0)"
+      last_elapsed=$((end_mono - start_mono))
       [ "$last_elapsed" -lt 0 ] && last_elapsed=0
+
+      clock_step="$(
+        clock_step_seconds \
+          "$start_mono" \
+          "$start_wall" \
+          "$end_mono" \
+          "$end_wall"
+      )"
+      if [ "$clock_step" -gt 1 ] 2>/dev/null; then
+        log_warn "[$case_name] [AUDIO-CLOCK] wall-clock correction detected step=${clock_step}s, watchdog and elapsed accounting used monotonic time"
+      fi
 
       audio_record_validate_final_output
 
@@ -1384,7 +1403,7 @@ else
 
     while [ "$i" -le "$LOOPS" ]; do
       iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      effective_timeout="$secs"
+      effective_timeout="$(audio_record_timeout_with_grace "$secs")"
       if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" != "0" ]; then
         effective_timeout="$TIMEOUT"
       fi
@@ -1404,7 +1423,8 @@ else
 
       audio_record_set_capture_paths "$case_name"
       audio_record_reset_capture_output
-      start_s="$(date +%s 2>/dev/null || echo 0)"
+      start_mono="$(get_monotonic_seconds)"
+      start_wall="$(date +%s 2>/dev/null || echo 0)"
       validation_rate=0
       validation_channels=0
 
@@ -1578,9 +1598,21 @@ else
         bytes=0
       fi
 
-      end_s="$(date +%s 2>/dev/null || echo 0)"
-      last_elapsed=$((end_s - start_s))
+      end_mono="$(get_monotonic_seconds)"
+      end_wall="$(date +%s 2>/dev/null || echo 0)"
+      last_elapsed=$((end_mono - start_mono))
       [ "$last_elapsed" -lt 0 ] && last_elapsed=0
+
+      clock_step="$(
+        clock_step_seconds \
+          "$start_mono" \
+          "$start_wall" \
+          "$end_mono" \
+          "$end_wall"
+      )"
+      if [ "$clock_step" -gt 1 ] 2>/dev/null; then
+        log_warn "[$case_name] [AUDIO-CLOCK] wall-clock correction detected step=${clock_step}s, watchdog and elapsed accounting used monotonic time"
+      fi
 
       audio_record_validate_final_output
 

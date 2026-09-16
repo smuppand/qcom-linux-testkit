@@ -14,11 +14,12 @@ params:
   SOURCE: "mic"
   LOOPS: "1"
   TIMEOUT: "0"
+  AUDIO_RECORD_START_GRACE: "5"
   RECORD_SECONDS: "30s"
 
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Multimedia/Audio/AudioRecord/
-    - ./run.sh --backend "${BACKEND}" --source "${SOURCE}" --loops "${LOOPS}" --timeout "${TIMEOUT}" --record-seconds "${RECORD_SECONDS}" --audio-bootstrap false || true
+    - ./run.sh --backend "${BACKEND}" --source "${SOURCE}" --loops "${LOOPS}" --timeout "${TIMEOUT}" --start-grace "${AUDIO_RECORD_START_GRACE}" --record-seconds "${RECORD_SECONDS}" --audio-bootstrap false || true
     - ./send-to-lava.sh AudioRecord.res
