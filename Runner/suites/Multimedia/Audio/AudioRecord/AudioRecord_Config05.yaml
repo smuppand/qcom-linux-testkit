@@ -15,7 +15,8 @@ params:
   DURATIONS: ""  # Recording durations: short, medium, long (legacy mode only, not used in config discovery mode), default: unset
   RECORD_SECONDS: "5s"  # Recording duration with unit suffix (e.g., "5s", "10s", "30s"), default: 5s
   LOOPS: 1  # Number of recording loops, default: 1
-  TIMEOUT: 0  # Recording timeout per loop (e.g., 15s, 0=none), default: 0
+  TIMEOUT: 0  # Explicit timeout override per loop (e.g., 15s, 0=automatic), default: 0
+  AUDIO_RECORD_START_GRACE: 5  # Startup headroom added to the automatic recorder watchdog, default: 5s
   STRICT: 0  # Enable strict mode (fail on any error), default: 0
   DMESG_SCAN: 1  # Scan dmesg for errors after recording, default: 1
   VERBOSE: 0  # Enable verbose logging, default: 0
@@ -25,5 +26,5 @@ run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Multimedia/Audio/AudioRecord/
-    - ./run.sh --backend "${AUDIO_BACKEND}" --source "${SOURCE_CHOICE}" --config-name "${CONFIG_NAMES}" --config-filter "${CONFIG_FILTER}" --record-seconds "${RECORD_SECONDS}" --loops "${LOOPS}" --timeout "${TIMEOUT}" --strict "${STRICT}" --res-suffix "${RES_SUFFIX}" || true
+    - ./run.sh --backend "${AUDIO_BACKEND}" --source "${SOURCE_CHOICE}" --config-name "${CONFIG_NAMES}" --config-filter "${CONFIG_FILTER}" --record-seconds "${RECORD_SECONDS}" --loops "${LOOPS}" --timeout "${TIMEOUT}" --start-grace "${AUDIO_RECORD_START_GRACE}" --strict "${STRICT}" --res-suffix "${RES_SUFFIX}" || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh AudioRecord${RES_SUFFIX:+_${RES_SUFFIX}}.res

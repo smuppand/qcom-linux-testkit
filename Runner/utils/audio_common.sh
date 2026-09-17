@@ -597,7 +597,7 @@ audio_scratch_dir() {
 audio_restart_pipewire_service() {
   aprs_label="${1:-1/1}"
   aprs_timeout="${PIPEWIRE_SYSTEMCTL_TIMEOUT:-180}"
-  aprs_start_s="$(date +%s 2>/dev/null || echo 0)"
+  aprs_start_s="$(get_monotonic_seconds)"
   aprs_next_log=10
   aprs_scope="system"
   aprs_exec_text="systemctl restart pipewire"
@@ -710,7 +710,7 @@ audio_restart_pipewire_service() {
   rm -f "$aprs_output_file"
  
   while :; do
-    aprs_now_s="$(date +%s 2>/dev/null || echo 0)"
+    aprs_now_s="$(get_monotonic_seconds)"
     aprs_elapsed=$((aprs_now_s - aprs_start_s))
  
     if [ "$aprs_elapsed" -lt 0 ]; then
@@ -1414,7 +1414,30 @@ audio_parse_secs() {
   esac
 }
 
+# Add startup headroom to an AudioRecord capture watchdog.
+# PipeWire and PulseAudio recorders do not take a duration on these paths, so
+# the watchdog starts before the stream is ready. Preserve the requested WAV
+# duration by adding configurable startup grace to the watchdog only.
+audio_record_timeout_with_grace() {
+  artg_requested="$(audio_parse_secs "$1" 2>/dev/null || echo 0)"
+  artg_grace="${AUDIO_RECORD_START_GRACE:-5}"
+
+  if ! is_unsigned_number "$artg_grace"; then
+    artg_grace=5
+  fi
+
+  if [ "${artg_requested:-0}" -gt 0 ] 2>/dev/null &&
+     [ "$artg_grace" -gt 0 ] 2>/dev/null; then
+    printf '%ss\n' "$((artg_requested + artg_grace))"
+    return 0
+  fi
+
+  printf '%s\n' "$1"
+}
+
 # Run a command with a bounded timeout.
+# Timeout accounting uses monotonic uptime so an RTC or NTP correction cannot
+# prematurely terminate the child.
 #
 # Return:
 # child status - command exited before the timeout
@@ -1449,19 +1472,13 @@ audio_exec_with_timeout() {
   "$@" &
   aewt_pid=$!
 
-  aewt_start="$(
-    date +%s 2>/dev/null ||
-      echo 0
-  )"
+  aewt_start="$(get_monotonic_seconds)"
 
   aewt_deadline=$((aewt_start + aewt_dur_norm))
   aewt_timed_out=0
 
   while kill -0 "$aewt_pid" 2>/dev/null; do
-    aewt_now="$(
-      date +%s 2>/dev/null ||
-        echo 0
-    )"
+    aewt_now="$(get_monotonic_seconds)"
 
     if [ "$aewt_now" -ge "$aewt_deadline" ] 2>/dev/null; then
       aewt_timed_out=1
@@ -1502,11 +1519,11 @@ audio_exec_with_timeout() {
 audio_wait_audio_ready() {
   max_s="${1:-${PIPEWIRE_READY_TIMEOUT:-120}}"
   backend_name="${2:-auto}"
-  start_s="$(date +%s 2>/dev/null || echo 0)"
+  start_s="$(get_monotonic_seconds)"
   next_log=10
 
   while :; do
-    now_s="$(date +%s 2>/dev/null || echo 0)"
+    now_s="$(get_monotonic_seconds)"
     elapsed=$((now_s - start_s))
     if [ "$elapsed" -lt 0 ]; then
       elapsed=0

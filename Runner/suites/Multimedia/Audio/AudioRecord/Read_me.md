@@ -201,7 +201,8 @@ CONFIG_FILTER     Filter configs by pattern (e.g., "48KHz" or "2ch")            
 DURATIONS	      Recording durations: short, medium, long (legacy mode only)     ""
 RECORD_SECONDS	  Number of seconds to record (e.g., 5s, 10s)                     30s
 LOOPS	          Number of recording loops	                                      1
-TIMEOUT	          Recording timeout per loop (e.g., 15s, 0=none)                  0
+TIMEOUT	          Explicit timeout override (e.g., 15s, 0=automatic)              0
+AUDIO_RECORD_START_GRACE Startup headroom added to the automatic watchdog       5
 STRICT	          Strict mode (0=disabled, 1=enabled, fail on any error)	      0
 DMESG_SCAN	      Scan dmesg for errors after recording	                          1
 VERBOSE	          Enable verbose logging	                                      0
@@ -219,7 +220,8 @@ Option	                      Description
 --record-seconds <duration>   Number of seconds to record (e.g., 5s, 10s)
 --durations	                  Recording durations: short, medium, long (legacy mode only)
 --loops	                      Number of recording loops
---timeout	                  Recording timeout per loop (e.g., 15s)
+--timeout <duration>          Override the automatic duration-based watchdog
+--start-grace <seconds>      Recorder startup headroom, default: 5
 --strict [0|1]                Enable strict mode (0=disabled, 1=enabled)
 --no-dmesg	                  Disable dmesg scan
 --res-suffix <suffix>         Suffix for unique result file and log directory (e.g., "Config01" generates AudioRecord_Config01.res and results/AudioRecord_Config01/)
@@ -229,6 +231,28 @@ Option	                      Description
 --help	                      Show usage instructions
 ```
 
+### Recording watchdog and clock handling
+
+When `TIMEOUT=0`, AudioRecord uses an automatic watchdog for recorder commands.
+The watchdog duration is the requested recording duration plus
+`AUDIO_RECORD_START_GRACE`, which defaults to five seconds. The additional time
+allows PipeWire or PulseAudio to establish the stream without reducing the WAV
+duration being validated. An explicit `--timeout` value overrides the automatic
+watchdog and does not receive startup grace.
+
+Watchdog deadlines and elapsed-time reporting use monotonic uptime rather than
+the system wall clock. RTC or NTP corrections during recording therefore do not
+terminate the recorder early or produce an invalid elapsed time. When the wall
+clock changes materially during a case, stdout includes a diagnostic such as:
+
+```text
+[WARN] ... [record_8KHz_1ch] [AUDIO-CLOCK] wall-clock correction detected step=4581451s, watchdog and elapsed accounting used monotonic time
+```
+
+The requested recording duration remains the WAV validation target. Startup
+grace affects only when the recorder is stopped, so a valid recording may be
+longer than the requested minimum.
+
 Sample Output:
 
 **Example 1: Testing specific config using config naming**
@@ -237,11 +261,11 @@ sh-5.3# ./run.sh --config-name "record_config1"
 [INFO] 2026-01-02 12:00:46 - Base build detected (no audioreach modules), skipping overlay setup
 [INFO] 2026-01-02 12:00:46 - ---------------- Starting AudioRecord ----------------
 [INFO] 2026-01-02 12:00:46 - Platform Details: machine='Qualcomm Technologies, Inc. Robotics RB3gen2' target='Kodiak' kernel='6.18.0-00393-g27507852413b' arch='aarch64'
-[INFO] 2026-01-02 12:00:46 - Args: backend=auto source=mic loops=1 durations='short' record_seconds=30s timeout=0 strict=0 dmesg=1
+[INFO] 2026-01-02 12:00:46 - Args: backend=auto source=mic overlay=0 loops=1 durations='' record_seconds=30s timeout=0 start_grace=5 strict=0 signal_strict=0 dmesg=1 bootstrap=auto runtime_dir=auto
 [INFO] 2026-01-02 12:00:46 - Backend fallback chain: pipewire pulseaudio alsa
 [INFO] 2026-01-02 12:00:46 - Using backend: pipewire
 [INFO] 2026-01-02 12:00:46 - Routing to source: id/name=45 label='Built-in Audio internal Mic' choice=mic
-[INFO] 2026-01-02 12:00:46 - Watchdog/timeout: disabled (no timeout)
+[INFO] 2026-01-02 12:00:46 - Watchdog/timeout: automatic per case, requested duration plus start_grace=5s
 [INFO] 2026-01-02 12:00:46 - Using config discovery mode
 [INFO] 2026-01-02 12:00:46 - Discovered 1 configs to test
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] Using config: record_config1 (rate=8000Hz channels=1)
