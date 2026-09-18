@@ -1,0 +1,28 @@
+metadata:
+  name: Thermal_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Dynamically validate thermal policy and optionally exercise controlled-load response"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  THERMAL_LOAD_ENABLE: "1"
+  THERMAL_LOAD_SECONDS: "15"
+  THERMAL_LOAD_WORKERS: "1"
+  THERMAL_RECOVERY_SECONDS: "5"
+  THERMAL_MIN_RISE_MC: "1000"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/Thermal_Validation
+    - >-
+      ./run.sh
+      --load-enable "${THERMAL_LOAD_ENABLE}"
+      --load-seconds "${THERMAL_LOAD_SECONDS}"
+      --load-workers "${THERMAL_LOAD_WORKERS}"
+      --recovery-seconds "${THERMAL_RECOVERY_SECONDS}"
+      --min-rise-mc "${THERMAL_MIN_RISE_MC}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Thermal_Validation.res
