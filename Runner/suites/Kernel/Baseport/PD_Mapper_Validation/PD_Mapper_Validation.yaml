@@ -1,0 +1,19 @@
+metadata:
+  name: PD_Mapper_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Dynamically validate kernel or userspace PD Mapper readiness, registry data, QRTR advertisement, and a QMI domain lookup"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  PD_MAPPER_TIMEOUT: "10"
+  PD_MAPPER_SERVICE: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/PD_Mapper_Validation
+    - ./run.sh --timeout "${PD_MAPPER_TIMEOUT}" --service "${PD_MAPPER_SERVICE}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh PD_Mapper_Validation.res
