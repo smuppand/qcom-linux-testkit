@@ -2890,10 +2890,13 @@ run_with_timeout_log() {
     run_with_timeout "$rwtl_timeout" "$@" > "$rwtl_log_file" 2>&1
 }
 
-# Purpose: Replay every line from a file through the common information logger.
+# Purpose: Replay a bounded number of lines from a file through the common
+# information logger.
 # Arguments:
 #   $1 - Label prepended to each logged line.
 #   $2 - Log-file path to replay.
+#   $3 - Optional maximum lines. Empty or zero preserves the historical full
+#        replay behavior.
 # Output:
 #   Sends each readable input line through log_info().
 # Returns:
@@ -2901,11 +2904,37 @@ run_with_timeout_log() {
 log_file_with_label() {
     lfwl_label="$1"
     lfwl_file="$2"
+    lfwl_max_lines="${3:-0}"
+    lfwl_total=0
+    lfwl_emitted=0
 
     [ -r "$lfwl_file" ] || return 0
+    case "$lfwl_max_lines" in
+        ''|*[!0-9]*)
+            lfwl_max_lines=0
+            ;;
+    esac
+
+    lfwl_total=$(wc -l <"$lfwl_file" 2>/dev/null | tr -d '[:space:]')
+    case "$lfwl_total" in
+        ''|*[!0-9]*)
+            lfwl_total=0
+            ;;
+    esac
+
     while IFS= read -r lfwl_line || [ -n "$lfwl_line" ]; do
+        if [ "$lfwl_max_lines" -gt 0 ] &&
+           [ "$lfwl_emitted" -ge "$lfwl_max_lines" ]; then
+            break
+        fi
         log_info "[$lfwl_label] $lfwl_line"
+        lfwl_emitted=$((lfwl_emitted + 1))
     done < "$lfwl_file"
+
+    if [ "$lfwl_max_lines" -gt 0 ] &&
+       [ "$lfwl_total" -gt "$lfwl_emitted" ]; then
+        log_info "[$lfwl_label] omitted=$((lfwl_total - lfwl_emitted)) total=$lfwl_total artifact=$lfwl_file"
+    fi
 
     return 0
 }
@@ -7069,14 +7098,16 @@ detect_ufs_partition_block() {
     return 1
 }
 
-###############################################################################
-# scan_dmesg_errors
-#
-# Only scans *new* dmesg lines for true error patterns (since last test run).
-# Keeps a timestamped error log history for each run.
-# Handles dmesg with/without timestamps. Cleans up markers/logs if test dir is gone.
-# Usage: scan_dmesg_errors "$SCRIPT_DIR" [optional_extra_keywords...]
-###############################################################################
+# scan_dmesg_errors OUTPUT_DIR MODULE_REGEX [EXCLUDE_REGEX]
+# Capture the kernel log once and report non-benign errors for selected modules.
+# Inputs: retained output directory, extended module regex, and optional exclusion
+# regex. Set KERNEL_LOG_JOURNAL_FALLBACK=1 to permit journalctl fallback.
+# Outputs: retained snapshot, filtered errors, access diagnostics, timestamped
+# history, and exported DMESG_ACCESS_STATUS, DMESG_ACCESS_RC,
+# DMESG_ACCESS_PROVIDER, and DMESG_ACCESS_LOG values.
+# Returns: 0 when matching errors are found and 1 for a clean or unavailable
+# capture. Callers must inspect DMESG_ACCESS_STATUS to distinguish those cases.
+# Side effects: replaces kernel-log artifacts below OUTPUT_DIR and emits logs.
 scan_dmesg_errors() {
     prefix="$1"
     module_regex="$2"   # e.g. 'qcom_camss|camss|isp'
@@ -7087,14 +7118,117 @@ scan_dmesg_errors() {
 
     DMESG_SNAPSHOT="$prefix/dmesg_snapshot.log"
     DMESG_ERRORS="$prefix/dmesg_errors.log"
+    DMESG_ACCESS_LOG="$prefix/dmesg_access.log"
+    DMESG_JOURNAL_RAW="$prefix/journalctl_kernel.log"
     DATE_STAMP=$(date +%Y%m%d-%H%M%S)
     DMESG_HISTORY="$prefix/dmesg_errors_$DATE_STAMP.log"
 
     # Error patterns (edit as needed for your test coverage)
     err_patterns='Unknown symbol|probe failed|fail(ed)?|error|timed out|not found|invalid|corrupt|abort|panic|oops|unhandled|can.t (start|init|open|allocate|find|register)'
 
-    rm -f "$DMESG_SNAPSHOT" "$DMESG_ERRORS"
-    dmesg > "$DMESG_SNAPSHOT" 2>/dev/null
+    DMESG_ACCESS_STATUS="unknown"
+    DMESG_ACCESS_RC="unknown"
+    DMESG_ACCESS_PROVIDER="none"
+    export DMESG_ACCESS_STATUS DMESG_ACCESS_RC DMESG_ACCESS_PROVIDER
+    export DMESG_ACCESS_LOG
+
+    rm -f \
+        "$DMESG_SNAPSHOT" \
+        "$DMESG_ERRORS" \
+        "$DMESG_ACCESS_LOG" \
+        "$DMESG_JOURNAL_RAW"
+    : >"$DMESG_SNAPSHOT"
+    : >"$DMESG_ERRORS"
+    : >"$DMESG_ACCESS_LOG"
+
+    sde_dmesg_command=$(command -v dmesg 2>/dev/null || true)
+    if [ -n "$sde_dmesg_command" ]; then
+        "$sde_dmesg_command" >"$DMESG_SNAPSHOT" 2>"$DMESG_ACCESS_LOG"
+        DMESG_ACCESS_RC=$?
+        DMESG_ACCESS_PROVIDER="dmesg"
+    else
+        DMESG_ACCESS_RC=127
+        DMESG_ACCESS_PROVIDER="dmesg"
+        printf 'provider=dmesg status=command-not-found rc=127\n' \
+            >>"$DMESG_ACCESS_LOG"
+    fi
+
+    sde_snapshot_bytes=$(wc -c <"$DMESG_SNAPSHOT" 2>/dev/null | tr -d '[:space:]')
+    {
+        printf 'capture=direct rc=%s command=%s snapshot_bytes=%s uid=%s\n' \
+            "$DMESG_ACCESS_RC" \
+            "${sde_dmesg_command:-not-found}" \
+            "${sde_snapshot_bytes:-0}" \
+            "$(id -u 2>/dev/null || printf 'unknown')"
+        if [ -r /proc/sys/kernel/dmesg_restrict ]; then
+            printf 'dmesg_restrict=%s\n' \
+                "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)"
+        fi
+        if [ -r /proc/self/status ]; then
+            grep '^CapEff:' /proc/self/status 2>/dev/null || true
+        fi
+    } >>"$DMESG_ACCESS_LOG"
+
+    # A few target images have returned success with no redirected output even
+    # though an interactive dmesg invocation is readable. Retry through command
+    # substitution so the shell, rather than dmesg, writes the retained file.
+    if [ "$DMESG_ACCESS_RC" -eq 0 ] && [ ! -s "$DMESG_SNAPSHOT" ]; then
+        sde_retry_output=$("$sde_dmesg_command" 2>>"$DMESG_ACCESS_LOG")
+        sde_retry_rc=$?
+        if [ "$sde_retry_rc" -eq 0 ] && [ -n "$sde_retry_output" ]; then
+            printf '%s\n' "$sde_retry_output" >"$DMESG_SNAPSHOT"
+        fi
+        sde_retry_bytes=$(wc -c <"$DMESG_SNAPSHOT" 2>/dev/null | tr -d '[:space:]')
+        printf 'capture=shell-buffer-retry rc=%s snapshot_bytes=%s\n' \
+            "$sde_retry_rc" \
+            "${sde_retry_bytes:-0}" >>"$DMESG_ACCESS_LOG"
+        DMESG_ACCESS_RC=$sde_retry_rc
+    fi
+
+    if [ "$DMESG_ACCESS_RC" -ne 0 ] || [ ! -s "$DMESG_SNAPSHOT" ]; then
+        : >"$DMESG_SNAPSHOT"
+        if [ "${KERNEL_LOG_JOURNAL_FALLBACK:-0}" = "1" ] &&
+           command -v journalctl >/dev/null 2>&1; then
+            sde_journal_command=$(command -v journalctl 2>/dev/null || true)
+            journalctl -k -b --no-pager -o cat \
+                >"$DMESG_JOURNAL_RAW" 2>>"$DMESG_ACCESS_LOG"
+            sde_journal_rc=$?
+            sde_journal_bytes=$(wc -c <"$DMESG_JOURNAL_RAW" 2>/dev/null | tr -d '[:space:]')
+            printf 'provider=journalctl rc=%s snapshot_bytes=%s command=%s\n' \
+                "$sde_journal_rc" \
+                "${sde_journal_bytes:-0}" \
+                "${sde_journal_command:-not-found}" >>"$DMESG_ACCESS_LOG"
+            DMESG_ACCESS_RC=$sde_journal_rc
+            DMESG_ACCESS_PROVIDER="journalctl"
+            if [ "$sde_journal_rc" -eq 0 ] && [ -s "$DMESG_JOURNAL_RAW" ]; then
+                sed 's/^/[journal] /' \
+                    "$DMESG_JOURNAL_RAW" >"$DMESG_SNAPSHOT"
+                DMESG_ACCESS_RC=0
+            fi
+        elif [ "${KERNEL_LOG_JOURNAL_FALLBACK:-0}" = "1" ]; then
+            DMESG_ACCESS_RC=127
+            DMESG_ACCESS_PROVIDER="journalctl"
+            printf 'provider=journalctl status=command-not-found rc=127\n' \
+                >>"$DMESG_ACCESS_LOG"
+        else
+            printf 'provider=journalctl status=disabled\n' \
+                >>"$DMESG_ACCESS_LOG"
+        fi
+    fi
+
+    if [ ! -s "$DMESG_SNAPSHOT" ]; then
+        DMESG_ACCESS_STATUS="unavailable"
+        export DMESG_ACCESS_STATUS DMESG_ACCESS_RC DMESG_ACCESS_PROVIDER
+        cp "$DMESG_ERRORS" "$DMESG_HISTORY"
+        log_warn "[DMESG-ACCESS] status=$DMESG_ACCESS_STATUS provider=$DMESG_ACCESS_PROVIDER rc=$DMESG_ACCESS_RC snapshot_bytes=0 artifact=$DMESG_ACCESS_LOG"
+        log_file_with_label "DMESG-ACCESS" "$DMESG_ACCESS_LOG" 12
+        return 1
+    fi
+    DMESG_ACCESS_STATUS="available"
+    export DMESG_ACCESS_STATUS DMESG_ACCESS_RC DMESG_ACCESS_PROVIDER
+    if [ "${KERNEL_LOG_JOURNAL_FALLBACK:-0}" = "1" ]; then
+        log_info "[DMESG-ACCESS] status=$DMESG_ACCESS_STATUS provider=$DMESG_ACCESS_PROVIDER snapshot_bytes=$(wc -c <"$DMESG_SNAPSHOT" | tr -d '[:space:]') artifact=$DMESG_ACCESS_LOG"
+    fi
 
     # 1. Match lines with correct module and error pattern
     # 2. Exclude lines with harmless patterns (using dummy regulator etc)
@@ -7104,13 +7238,21 @@ scan_dmesg_errors() {
     cp "$DMESG_ERRORS" "$DMESG_HISTORY"
 
     if [ -s "$DMESG_ERRORS" ]; then
-        log_info "dmesg scan: found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        if [ "$DMESG_ACCESS_PROVIDER" = "dmesg" ]; then
+            log_info "dmesg scan: found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        else
+            log_info "Kernel-log scan found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        fi
         while IFS= read -r line; do
             log_info "[dmesg] $line"
         done < "$DMESG_ERRORS"
         return 0
     fi
-    log_info "No relevant, non-benign errors for modules [$module_regex] in recent dmesg."
+    if [ "$DMESG_ACCESS_PROVIDER" = "dmesg" ]; then
+        log_info "No relevant, non-benign errors for modules [$module_regex] in recent dmesg."
+    else
+        log_info "No relevant, non-benign errors for modules [$module_regex] in the captured kernel log."
+    fi
     return 1
 }
 
@@ -7347,13 +7489,18 @@ qrtr_runtime_present() {
 }
 
 # qrtr_capture_topology <output-file> [timeout-seconds]
-# Runs one bounded, read-only qrtr-lookup inventory and validates its tabular
-# header. Returns 0 for a valid snapshot, 1 for a broken query, 2 when QRTR or
-# qrtr-lookup is unavailable, and 3 for invalid arguments.
+# Runs one bounded, read-only QRTR control lookup and validates its tabular
+# header. The image-provided qrtr-lookup is preferred, with the bundled public
+# AF_QIPCRTR client as a fallback. Returns 0 for a valid snapshot, 1 for a
+# broken query, 2 when QRTR or both providers are unavailable, and 3 for
+# invalid arguments.
 qrtr_capture_topology() {
     qct_output_file="$1"
     qct_timeout="${2:-${QRTR_LOOKUP_TIMEOUT:-10}}"
     qct_lookup_bin="${QRTR_LOOKUP_BIN:-qrtr-lookup}"
+    qct_fallback_bin="${QRTR_LOOKUP_FALLBACK_BIN:-$TOOLS/qrtr_lookup.py}"
+    QRTR_LOOKUP_PROVIDER="none"
+    QRTR_LOOKUP_COMMAND=""
 
     [ -n "$qct_output_file" ] || return 3
     case "$qct_timeout" in
@@ -7363,17 +7510,36 @@ qrtr_capture_topology() {
     esac
 
     qrtr_runtime_present || return 2
-    command -v "$qct_lookup_bin" >/dev/null 2>&1 || return 2
+    if command -v "$qct_lookup_bin" >/dev/null 2>&1; then
+        QRTR_LOOKUP_PROVIDER="native-qrtr-lookup"
+        QRTR_LOOKUP_COMMAND=$(command -v "$qct_lookup_bin")
+    elif command -v python3 >/dev/null 2>&1 && [ -r "$qct_fallback_bin" ]; then
+        QRTR_LOOKUP_PROVIDER="bundled-python-af-qipcrtr"
+        QRTR_LOOKUP_COMMAND="$qct_fallback_bin"
+    else
+        export QRTR_LOOKUP_PROVIDER QRTR_LOOKUP_COMMAND
+        return 2
+    fi
+    export QRTR_LOOKUP_PROVIDER QRTR_LOOKUP_COMMAND
 
     qct_output_dir=$(dirname "$qct_output_file")
     mkdir -p "$qct_output_dir" || return 1
     rm -f "$qct_output_file"
 
-    if ! run_with_timeout_log \
-        "$qct_timeout" \
-        "$qct_output_file" \
-        "$qct_lookup_bin"; then
-        return 1
+    if [ "$QRTR_LOOKUP_PROVIDER" = "native-qrtr-lookup" ]; then
+        if ! run_with_timeout_log \
+            "$qct_timeout" \
+            "$qct_output_file" \
+            "$QRTR_LOOKUP_COMMAND"; then
+            return 1
+        fi
+    else
+        if ! run_with_timeout_log \
+            "$((qct_timeout + 2))" \
+            "$qct_output_file" \
+            python3 "$QRTR_LOOKUP_COMMAND" --timeout "$qct_timeout"; then
+            return 1
+        fi
     fi
 
     if ! awk '
