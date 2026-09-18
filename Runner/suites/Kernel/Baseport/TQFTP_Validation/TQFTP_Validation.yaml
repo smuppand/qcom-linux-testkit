@@ -1,0 +1,20 @@
+metadata:
+  name: TQFTP_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Dynamically validate TQFTP readiness, QRTR advertisement, and an exact local-host QRTR transfer"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  TQFTP_TIMEOUT: "10"
+  TQFTP_STATE_DIR: "/var/lib/tqftpserv"
+  TQFTP_E2E_ENABLE: "1"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/TQFTP_Validation
+    - ./run.sh --timeout "${TQFTP_TIMEOUT}" --state-dir "${TQFTP_STATE_DIR}" --e2e "${TQFTP_E2E_ENABLE}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh TQFTP_Validation.res
