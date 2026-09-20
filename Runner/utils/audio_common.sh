@@ -94,17 +94,65 @@ resolve_clip() {
   esac
 }
 
+# audio_ensure_download_client
+# Ensures that curl or wget is available. Takes no arguments and emits no
+# machine-readable stdout. It may install the mapped audio-download package set
+# on Debian, Ubuntu, or CentOS and writes diagnostics through log_* helpers.
+# Returns 0 when a downloader is available and 1 otherwise. Image-managed
+# distributions are never modified.
+audio_ensure_download_client() {
+  if command -v curl >/dev/null 2>&1 ||
+     command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if command -v pkg_ensure_host_distro_package_set_present >/dev/null 2>&1; then
+    log_info "Audio asset download requires curl or wget, attempting mapped package recovery"
+    pkg_ensure_host_distro_package_set_present audio-download
+    aedc_recovery_rc=$?
+
+    case "$aedc_recovery_rc" in
+      0)
+        ;;
+      2)
+        log_warn "Audio downloader package recovery is not enabled for this image-managed OS"
+        ;;
+      *)
+        log_error "Failed to recover the audio-download package set"
+        ;;
+    esac
+  fi
+
+  if command -v curl >/dev/null 2>&1 ||
+     command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log_error "No downloader is available, install curl or wget"
+  return 1
+}
+
 # audio_download_with_any <url> <outfile>
+# Downloads the non-empty URL to the output path using an available curl or
+# wget client. It may recover the OS-specific audio-download package set and
+# writes downloader output to stdout and stderr. Returns the downloader status,
+# or 1 when neither client is available. The caller owns output-file cleanup.
 audio_download_with_any() {
-    url="$1"; out="$2"
-    if command -v wget >/dev/null 2>&1; then
-        wget -O "$out" "$url"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -L --fail -o "$out" "$url"
-    else
-        log_error "No downloader (wget/curl) available to fetch $url"
-        return 1
-    fi
+  url="$1"
+  out="$2"
+
+  if [ -z "$url" ] || [ -z "$out" ]; then
+    log_error "audio_download_with_any requires a URL and output path"
+    return 1
+  fi
+
+  audio_ensure_download_client || return 1
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -O "$out" "$url"
+  else
+    curl -L --fail -o "$out" "$url"
+  fi
 }
 
 audio_has_runnable_discovery_clips() {
@@ -135,7 +183,12 @@ audio_has_runnable_discovery_clips() {
 }
 
 # audio_fetch_assets_from_url <url>
-# Prefer functestlib's extract_tar_from_url; otherwise download + extract.
+# Downloads and extracts the audio archive URL into AUDIO_CLIPS_BASE_DIR. The
+# URL must be non-empty. The function writes diagnostic logs and temporary
+# archive files, installs the mapped audio-download package set on supported
+# host distributions only when neither curl nor wget exists, and emits no
+# machine-readable stdout. Returns 0 when runnable clips are ready and 1 when
+# downloader recovery, download, extraction, or validation fails.
 audio_fetch_assets_from_url() {
   url="$1"
   clips_dir="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
@@ -168,6 +221,8 @@ audio_fetch_assets_from_url() {
     fi
     log_warn "Extraction marker present but runnable clips not found, continuing with download/re-extract path"
   fi
+
+  audio_ensure_download_client || return 1
 
   while [ "$fetch_attempt" -le "$fetch_attempts" ]; do
     rm -f "$archive_path" >/dev/null 2>&1 || true
