@@ -138,6 +138,395 @@ system_require_grep_in_file() {
     return 1
 }
 
+# system_select_rtc_device [requested-device]
+# Selects a usable RTC character device from an optional absolute /dev path.
+# Prints exactly one resolved device path on success and no diagnostics.
+# Returns 0 when a readable and writable wakealarm is found, 1 when no device
+# is eligible, and has no side effects. An explicitly disabled wakeup state is
+# rejected, while an unavailable state remains eligible because some RTC
+# drivers do not expose device/power/wakeup.
+system_select_rtc_device() {
+    ssrd_requested="${1:-}"
+
+    if [ -n "$ssrd_requested" ]; then
+        [ -c "$ssrd_requested" ] || return 1
+        ssrd_resolved=$(readlink -f "$ssrd_requested") || return 1
+        ssrd_name=${ssrd_resolved##*/}
+        ssrd_alarm="/sys/class/rtc/$ssrd_name/wakealarm"
+        ssrd_wakeup=$(cat "/sys/class/rtc/$ssrd_name/device/power/wakeup" 2>/dev/null || true)
+        [ -r "$ssrd_alarm" ] && [ -w "$ssrd_alarm" ] || return 1
+        [ "$ssrd_wakeup" != "disabled" ] || return 1
+        printf '%s\n' "$ssrd_resolved"
+        return 0
+    fi
+
+    for ssrd_device in /dev/rtc[0-9]*; do
+        [ -c "$ssrd_device" ] || continue
+        ssrd_name=${ssrd_device##*/}
+        ssrd_alarm="/sys/class/rtc/$ssrd_name/wakealarm"
+        ssrd_wakeup=$(cat "/sys/class/rtc/$ssrd_name/device/power/wakeup" 2>/dev/null || true)
+        if [ -r "$ssrd_alarm" ] &&
+           [ -w "$ssrd_alarm" ] &&
+           [ "$ssrd_wakeup" != "disabled" ]; then
+            printf '%s\n' "$ssrd_device"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# system_capture_rtc_inventory <output-file> [requested-device]
+# Records every RTC candidate and its wakealarm eligibility in a TSV file.
+# The output path is required and the optional requested device is an absolute
+# /dev path. Produces no stdout, returns 0 on capture, 1 on file failure, or 3
+# for invalid arguments, and only creates or replaces the requested artifact.
+system_capture_rtc_inventory() {
+    scri_output_file="$1"
+    scri_requested="${2:-}"
+
+    [ -n "$scri_output_file" ] || return 3
+    : >"$scri_output_file" || return 1
+    printf 'device\tcharacter\twakealarm\treadable\twritable\twakeup\tselection\treason\n' >"$scri_output_file"
+
+    for scri_device in /dev/rtc[0-9]*; do
+        [ -e "$scri_device" ] || continue
+        scri_name=${scri_device##*/}
+        scri_alarm="/sys/class/rtc/$scri_name/wakealarm"
+        scri_character=0
+        scri_alarm_present=0
+        scri_readable=0
+        scri_writable=0
+        scri_wakeup=$(cat "/sys/class/rtc/$scri_name/device/power/wakeup" 2>/dev/null || true)
+        scri_selection="candidate"
+        scri_reason="eligible"
+        [ -c "$scri_device" ] && scri_character=1
+        [ -e "$scri_alarm" ] && scri_alarm_present=1
+        [ -r "$scri_alarm" ] && scri_readable=1
+        [ -w "$scri_alarm" ] && scri_writable=1
+        if [ -n "$scri_requested" ]; then
+            if [ "$(readlink -f "$scri_device" 2>/dev/null || true)" = \
+                 "$(readlink -f "$scri_requested" 2>/dev/null || true)" ]; then
+                scri_selection="requested"
+            else
+                scri_selection="not-requested"
+            fi
+        fi
+        if [ "$scri_character" -ne 1 ]; then
+            scri_reason="not-character-device"
+        elif [ "$scri_alarm_present" -ne 1 ]; then
+            scri_reason="wakealarm-absent"
+        elif [ "$scri_readable" -ne 1 ] || [ "$scri_writable" -ne 1 ]; then
+            scri_reason="wakealarm-not-read-write"
+        elif [ "$scri_wakeup" = "disabled" ]; then
+            scri_reason="device-wakeup-disabled"
+        elif [ -z "$scri_wakeup" ]; then
+            scri_reason="eligible-wakeup-unreported"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$scri_device" \
+            "$scri_character" \
+            "$scri_alarm_present" \
+            "$scri_readable" \
+            "$scri_writable" \
+            "${scri_wakeup:-unavailable}" \
+            "$scri_selection" \
+            "$scri_reason" >>"$scri_output_file"
+    done
+}
+
+# system_log_rtc_inventory <inventory-file> [max-devices]
+# Replays a bounded RTC inventory through log_info with named fields.
+# The TSV path is required and max-devices is an optional unsigned count.
+# Produces logs but no machine-readable stdout, returns 0 on success or 1 for
+# unreadable input, and does not modify the inventory.
+system_log_rtc_inventory() {
+    slri_inventory_file="$1"
+    slri_max_devices="${2:-16}"
+    slri_total=0
+    slri_emitted=0
+
+    [ -r "$slri_inventory_file" ] || return 1
+    case "$slri_max_devices" in
+        ''|*[!0-9]*)
+            return 3
+            ;;
+    esac
+    slri_total=$(awk 'NR > 1 { count++ } END { print count + 0 }' "$slri_inventory_file")
+    while IFS="$(printf '\t')" read -r slri_device slri_character slri_alarm slri_readable slri_writable slri_wakeup slri_selection slri_reason; do
+        [ "$slri_device" = "device" ] && continue
+        if [ "$slri_emitted" -ge "$slri_max_devices" ]; then
+            break
+        fi
+        log_info "[SUSPEND-RTC-CANDIDATE] device=$slri_device character=$slri_character wakealarm=$slri_alarm readable=$slri_readable writable=$slri_writable wakeup=$slri_wakeup selection=$slri_selection reason=$slri_reason"
+        slri_emitted=$((slri_emitted + 1))
+    done <"$slri_inventory_file"
+    if [ "$slri_total" -gt "$slri_emitted" ]; then
+        log_info "[SUSPEND-RTC-CANDIDATE] omitted=$((slri_total - slri_emitted)) total=$slri_total artifact=$slri_inventory_file"
+    fi
+}
+
+# system_arm_rtc_alarm <wakealarm-path> <seconds> <log-file>
+# Arms and verifies a relative one-shot alarm through the RTC sysfs ABI.
+# Inputs are a readable and writable wakealarm path, a positive integer number
+# of seconds, and an artifact path. Produces no stdout, returns 0 on verified
+# arm, 1 on access or verification failure, or 3 for invalid arguments, and
+# changes the selected RTC alarm while retaining operation evidence.
+system_arm_rtc_alarm() {
+    sara_wakealarm_path="$1"
+    sara_seconds="$2"
+    sara_log_file="$3"
+
+    [ -w "$sara_wakealarm_path" ] && [ -r "$sara_wakealarm_path" ] || return 1
+    case "$sara_seconds" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+    [ -n "$sara_log_file" ] || return 3
+
+    : >"$sara_log_file" || return 1
+    if ! printf '0\n' >"$sara_wakealarm_path" 2>>"$sara_log_file"; then
+        printf 'phase=clear status=failed\n' >>"$sara_log_file"
+        return 1
+    fi
+    if ! printf '+%s\n' "$sara_seconds" >"$sara_wakealarm_path" 2>>"$sara_log_file"; then
+        printf 'phase=arm requested_seconds=%s status=failed\n' \
+            "$sara_seconds" >>"$sara_log_file"
+        return 1
+    fi
+    if ! sara_observed=$(cat "$sara_wakealarm_path" 2>>"$sara_log_file"); then
+        printf 'phase=verify requested_seconds=%s status=read-failed\n' \
+            "$sara_seconds" >>"$sara_log_file"
+        return 1
+    fi
+    printf 'phase=verify requested_seconds=%s observed_alarm=%s\n' \
+        "$sara_seconds" \
+        "${sara_observed:-empty}" >>"$sara_log_file"
+    case "$sara_observed" in
+        ''|0|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# system_clear_rtc_alarm <wakealarm-path> <log-file>
+# Clears and verifies a test-owned RTC wake alarm.
+# Inputs are the wakealarm path and an artifact path. Produces no stdout,
+# returns 0 when the alarm reads empty or zero and 1 on failure, changes only
+# the selected RTC alarm, and retains write diagnostics.
+system_clear_rtc_alarm() {
+    scra_wakealarm_path="$1"
+    scra_log_file="$2"
+
+    [ -r "$scra_wakealarm_path" ] &&
+        [ -w "$scra_wakealarm_path" ] &&
+        [ -n "$scra_log_file" ] || return 1
+
+    if ! printf '0\n' >"$scra_wakealarm_path" 2>"$scra_log_file"; then
+        return 1
+    fi
+
+    if ! scra_observed=$(cat "$scra_wakealarm_path" 2>>"$scra_log_file"); then
+        printf 'phase=verify status=read-failed\n' >>"$scra_log_file"
+        return 1
+    fi
+    [ -z "$scra_observed" ] || [ "$scra_observed" = "0" ]
+}
+
+# system_capture_bound_devices <output-file>
+# Captures stable device, driver, and firmware-node tuples across common buses.
+# The output path is required. Produces no stdout, returns 0 on success, 1 on
+# file failure, or 3 for invalid arguments, and creates a sorted TSV snapshot
+# without changing device state.
+system_capture_bound_devices() {
+    scbd_output_file="$1"
+
+    [ -n "$scbd_output_file" ] || return 3
+    : >"$scbd_output_file" || return 1
+
+    for scbd_bus in platform pci i2c spi auxiliary usb mmc amba; do
+        [ -d "/sys/bus/$scbd_bus/devices" ] || continue
+        for scbd_device in "/sys/bus/$scbd_bus/devices"/*; do
+            [ -e "$scbd_device" ] || continue
+            [ -L "$scbd_device/driver" ] || continue
+            scbd_driver=$(basename "$(readlink -f "$scbd_device/driver")")
+            scbd_of_node=""
+            if [ -L "$scbd_device/of_node" ]; then
+                scbd_of_node=$(readlink -f "$scbd_device/of_node")
+            fi
+            printf '%s\t%s\t%s\t%s\n' \
+                "$scbd_bus" \
+                "${scbd_device##*/}" \
+                "$scbd_driver" \
+                "${scbd_of_node:-none}" >>"$scbd_output_file"
+        done
+    done
+
+    sort -u "$scbd_output_file" -o "$scbd_output_file"
+}
+
+# system_capture_remoteproc_states <output-file>
+# Captures remote processor name, firmware, and runtime state.
+# The output path is required. Produces no stdout, returns 0 on success, 1 on
+# file failure, or 3 for invalid arguments, and creates a sorted TSV snapshot
+# without changing remote processor state.
+system_capture_remoteproc_states() {
+    scrs_output_file="$1"
+
+    [ -n "$scrs_output_file" ] || return 3
+    : >"$scrs_output_file" || return 1
+
+    for scrs_remoteproc in /sys/class/remoteproc/remoteproc*; do
+        [ -d "$scrs_remoteproc" ] || continue
+        scrs_name=$(cat "$scrs_remoteproc/name" 2>/dev/null || true)
+        scrs_firmware=$(cat "$scrs_remoteproc/firmware" 2>/dev/null || true)
+        scrs_state=$(cat "$scrs_remoteproc/state" 2>/dev/null || true)
+        printf '%s\tname=%s\tfirmware=%s\tstate=%s\n' \
+            "${scrs_remoteproc##*/}" \
+            "${scrs_name:-unknown}" \
+            "${scrs_firmware:-unknown}" \
+            "${scrs_state:-unknown}" >>"$scrs_output_file"
+    done
+
+    sort -u "$scrs_output_file" -o "$scrs_output_file"
+}
+
+# system_compare_snapshot_records <before-file> <after-file> <missing-file>
+# Reports exact pre-operation records that are absent from a later snapshot.
+# Inputs are two readable line-oriented files and an output artifact path.
+# Produces no stdout, returns 0 when every record remains, 1 when records are
+# missing, or 3 for unreadable input, and replaces the missing-record artifact.
+system_compare_snapshot_records() {
+    scsr_before_file="$1"
+    scsr_after_file="$2"
+    scsr_missing_file="$3"
+
+    [ -r "$scsr_before_file" ] && [ -r "$scsr_after_file" ] || return 3
+
+    awk '
+        NR == FNR {
+            after[$0]=1
+            next
+        }
+        !($0 in after) {
+            print
+            missing=1
+        }
+        END {
+            exit missing
+        }
+    ' "$scsr_after_file" "$scsr_before_file" >"$scsr_missing_file"
+}
+
+# system_wait_for_bound_devices <before-file> <after-file> <missing-file> <timeout>
+# Polls until all pre-suspend bindings return or the bounded timeout expires.
+# Inputs are the baseline, refreshed snapshot, missing-record artifact, and an
+# unsigned timeout in seconds. Produces no stdout, returns 0 on recovery, 1 on
+# capture failure or timeout, or 3 for invalid input, and refreshes artifacts.
+system_wait_for_bound_devices() {
+    swbd_before_file="$1"
+    swbd_after_file="$2"
+    swbd_missing_file="$3"
+    swbd_timeout="$4"
+    swbd_elapsed=0
+
+    [ -r "$swbd_before_file" ] || return 3
+    case "$swbd_timeout" in
+        ''|*[!0-9]*)
+            return 3
+            ;;
+    esac
+
+    while [ "$swbd_elapsed" -le "$swbd_timeout" ]; do
+        system_capture_bound_devices "$swbd_after_file" || return 1
+        if system_compare_snapshot_records \
+            "$swbd_before_file" \
+            "$swbd_after_file" \
+            "$swbd_missing_file"; then
+            return 0
+        fi
+        if [ "$swbd_elapsed" -eq "$swbd_timeout" ]; then
+            break
+        fi
+        sleep 1
+        swbd_elapsed=$((swbd_elapsed + 1))
+    done
+
+    return 1
+}
+
+# system_wait_for_remoteproc_states <before-file> <after-file> <changed-file> <timeout>
+# Polls until all pre-suspend remoteproc records return or timeout expires.
+# Inputs are the baseline, refreshed snapshot, changed-record artifact, and an
+# unsigned timeout in seconds. Produces no stdout, returns 0 on recovery, 1 on
+# capture failure or timeout, or 3 for invalid input, and refreshes artifacts.
+system_wait_for_remoteproc_states() {
+    swrs_before_file="$1"
+    swrs_after_file="$2"
+    swrs_changed_file="$3"
+    swrs_timeout="$4"
+    swrs_elapsed=0
+
+    [ -r "$swrs_before_file" ] || return 3
+    case "$swrs_timeout" in
+        ''|*[!0-9]*)
+            return 3
+            ;;
+    esac
+
+    while [ "$swrs_elapsed" -le "$swrs_timeout" ]; do
+        system_capture_remoteproc_states "$swrs_after_file" || return 1
+        if system_compare_snapshot_records \
+            "$swrs_before_file" \
+            "$swrs_after_file" \
+            "$swrs_changed_file"; then
+            return 0
+        fi
+        if [ "$swrs_elapsed" -eq "$swrs_timeout" ]; then
+            break
+        fi
+        sleep 1
+        swrs_elapsed=$((swrs_elapsed + 1))
+    done
+
+    return 1
+}
+
+# system_capture_wakeup_sources <output-file>
+# Captures the best available read-only wake-source evidence.
+# The output path is required. Produces no stdout, returns 0 when evidence is
+# available, 1 when none can be read, or 3 for invalid arguments, and creates
+# or replaces the requested artifact without changing wake-source state.
+system_capture_wakeup_sources() {
+    scws_output_file="$1"
+
+    [ -n "$scws_output_file" ] || return 3
+    : >"$scws_output_file" || return 1
+
+    if [ -r /sys/kernel/debug/wakeup_sources ]; then
+        cat /sys/kernel/debug/wakeup_sources >"$scws_output_file"
+        return 0
+    fi
+
+    for scws_wakeup in /sys/class/wakeup/wakeup*; do
+        [ -d "$scws_wakeup" ] || continue
+        scws_name=$(cat "$scws_wakeup/name" 2>/dev/null || true)
+        scws_active=$(cat "$scws_wakeup/active_count" 2>/dev/null || true)
+        scws_events=$(cat "$scws_wakeup/event_count" 2>/dev/null || true)
+        scws_wakeup_count=$(cat "$scws_wakeup/wakeup_count" 2>/dev/null || true)
+        printf '%s\tname=%s\tactive_count=%s\tevent_count=%s\twakeup_count=%s\n' \
+            "${scws_wakeup##*/}" \
+            "${scws_name:-unknown}" \
+            "${scws_active:-unknown}" \
+            "${scws_events:-unknown}" \
+            "${scws_wakeup_count:-unknown}" >>"$scws_output_file"
+    done
+
+    [ -s "$scws_output_file" ]
+}
+
 # ---------------------------------------------------------------------------
 # EFI variable validation helpers
 # ---------------------------------------------------------------------------
