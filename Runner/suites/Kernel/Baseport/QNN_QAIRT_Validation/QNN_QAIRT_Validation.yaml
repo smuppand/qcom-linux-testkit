@@ -1,0 +1,20 @@
+metadata:
+  name: QNN_QAIRT_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Run deterministic ONNX Runtime inference through the QNN HTP execution-provider plugin with CPU fallback disabled"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  QNN_TIMEOUT: "60"
+  QNN_ORT_LIBRARY: ""
+  QNN_PLUGIN_LIBRARY: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/QNN_QAIRT_Validation
+    - ./run.sh --timeout "${QNN_TIMEOUT}" --ort-library "${QNN_ORT_LIBRARY}" --qnn-plugin "${QNN_PLUGIN_LIBRARY}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh QNN_QAIRT_Validation.res
