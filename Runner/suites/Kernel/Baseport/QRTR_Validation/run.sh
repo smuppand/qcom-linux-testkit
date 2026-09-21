@@ -145,6 +145,8 @@ if qrtr_analyze_topology \
     "$RAW_TOPOLOGY" \
     "$NORMALIZED_TOPOLOGY" \
     "$TOPOLOGY_SUMMARY"; then
+    log_info "[QRTR-FUNCTIONAL] operation=control-lookup provider=$QRTR_LOOKUP_PROVIDER command=$QRTR_LOOKUP_COMMAND response_rows=$QRTR_TOPOLOGY_ROW_COUNT status=verified"
+    test_result_record "PASS" "QRTR completed a control-port service lookup through $QRTR_LOOKUP_PROVIDER and returned $QRTR_TOPOLOGY_ROW_COUNT validated response row(s)"
     log_info "[QRTR-TOPOLOGY] rows=$QRTR_TOPOLOGY_ROW_COUNT services=$QRTR_TOPOLOGY_SERVICE_COUNT nodes=$QRTR_TOPOLOGY_NODE_COUNT normalized=$NORMALIZED_TOPOLOGY"
     qrtr_log_topology "$NORMALIZED_TOPOLOGY" 64 "QRTR-SERVICE"
     test_result_record "PASS" "QRTR topology is structurally valid with $QRTR_TOPOLOGY_SERVICE_COUNT service tuple(s) across $QRTR_TOPOLOGY_NODE_COUNT node(s)"

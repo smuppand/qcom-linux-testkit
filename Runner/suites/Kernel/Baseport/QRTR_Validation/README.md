@@ -79,14 +79,15 @@ target-specific requirements.
 
 ## Results and log markers
 
-- `PASS`: the topology is valid and all explicitly requested services exist.
+- `PASS`: a QRTR control-port lookup returns validated response rows, the
+  topology is structurally valid, and all explicitly requested services exist.
 - `FAIL`: lookup fails, output is malformed or duplicated, a requested service
   is absent, or persistent QRTR kernel errors are found.
 - `SKIP`: QRTR is not applicable, neither lookup provider is runnable, or
   kernel logs alone are inaccessible.
 
 Look for `[QRTR-POLICY]`, `[QRTR-RUNTIME]`, `[QRTR-DISCOVERY]`,
-`[QRTR-TOPOLOGY]`, and
+`[QRTR-FUNCTIONAL]`, `[QRTR-TOPOLOGY]`, and
 `[QRTR-SERVICE]` in stdout. Each `[QRTR-SERVICE]` line identifies the service,
 version, instance, node, and port that passed structural validation. Up to 64
 endpoint rows are printed. Larger topologies report the omitted count and the
