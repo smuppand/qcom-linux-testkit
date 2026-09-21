@@ -1,0 +1,28 @@
+metadata:
+  name: System_Suspend_Resume_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Opt-in suspend and resume validation with dynamic RTC and device-state discovery"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  SYSTEM_SUSPEND_ENABLE: "0"
+  SYSTEM_SUSPEND_SECONDS: "30"
+  SYSTEM_SUSPEND_MODE: "mem"
+  SYSTEM_RTC_DEVICE: ""
+  SYSTEM_RESUME_TIMEOUT: "30"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/System_Suspend_Resume_Validation
+    - >-
+      ./run.sh
+      --enable "${SYSTEM_SUSPEND_ENABLE}"
+      --suspend-seconds "${SYSTEM_SUSPEND_SECONDS}"
+      --suspend-mode "${SYSTEM_SUSPEND_MODE}"
+      --rtc-device "${SYSTEM_RTC_DEVICE}"
+      --resume-timeout "${SYSTEM_RESUME_TIMEOUT}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh System_Suspend_Resume_Validation.res
