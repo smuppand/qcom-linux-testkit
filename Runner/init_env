@@ -1,5 +1,4 @@
 #!/bin/sh
-
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # Idempotency guard: only initialize ONCE per shell session
@@ -66,17 +65,33 @@ fi
 # - Writes the capture file into the CURRENT DIRECTORY (usually the test dir).
 # - No global logs/stdout directory is created/used.
 ###############################################################################
-_runner_stdout_cleanup() {
-    st=$?
-    # restore original fds (if they were saved)
-    exec 1>&3 2>&4
-    if [ -n "${__TEE_PID:-}" ]; then
-        kill "$__TEE_PID" 2>/dev/null
+# runner_stdout_cleanup [exit-status]
+# Restores the original stdout and stderr descriptors, stops the optional tee
+# process, removes the owned FIFO, and exits with the supplied nonnegative
+# status. When no argument is supplied, it preserves the status that triggered
+# the trap. Output: none. Side effects: terminates capture and exits the shell.
+runner_stdout_cleanup() {
+    runner_cleanup_status="${1:-$?}"
+    case "$runner_cleanup_status" in
+        ''|*[!0-9]*)
+            runner_cleanup_status=1
+            ;;
+    esac
+
+    trap - EXIT INT TERM
+    if [ -n "${__RUN_STDOUT_ACTIVE:-}" ]; then
+        # Restore original fds only when capture saved them.
+        exec 1>&3 2>&4
+        if [ -n "${__TEE_PID:-}" ]; then
+            # Keep the established non-blocking shutdown behavior. Waiting for
+            # tee can hang when another process inherited the FIFO writer.
+            kill "$__TEE_PID" 2>/dev/null || true
+        fi
+        if [ -n "${PIPE:-}" ]; then
+            rm -f "$PIPE" 2>/dev/null
+        fi
     fi
-    if [ -n "${PIPE:-}" ]; then
-        rm -f "$PIPE" 2>/dev/null
-    fi
-    exit "$st"
+    exit "$runner_cleanup_status"
 }
 
 if [ "${RUN_STDOUT_ENABLE:-1}" -eq 1 ] && [ -z "${__RUN_STDOUT_ACTIVE:-}" ]; then
@@ -95,17 +110,17 @@ if [ "${RUN_STDOUT_ENABLE:-1}" -eq 1 ] && [ -z "${__RUN_STDOUT_ACTIVE:-}" ]; the
             __TEE_PID=$!
             exec > "$PIPE" 2>&1
             __RUN_STDOUT_ACTIVE=1
-            trap _runner_stdout_cleanup EXIT INT TERM
+            trap runner_stdout_cleanup EXIT INT TERM
         else
             # Fallback: file-only capture
             exec >> "$RUN_STDOUT_FILE" 2>&1
             __RUN_STDOUT_ACTIVE=1
-            trap _runner_stdout_cleanup EXIT INT TERM
+            trap runner_stdout_cleanup EXIT INT TERM
         fi
     else
         # Fallback: file-only capture
         exec >> "$RUN_STDOUT_FILE" 2>&1
         __RUN_STDOUT_ACTIVE=1
-        trap _runner_stdout_cleanup EXIT INT TERM
+        trap runner_stdout_cleanup EXIT INT TERM
     fi
 fi

@@ -52,15 +52,15 @@ TQFTP_TEST_SOURCE=""
 # cleanup
 # Remove only the temporary TQFTP source created by this run and close stdout capture.
 # Inputs: trap status and TQFTP_TEST_SOURCE. Output: logs only.
-# Returns: exits through _runner_stdout_cleanup. Side effects: removes the staged file.
+# Returns through runner_stdout_cleanup with the incoming trap status.
+# Side effects: removes the staged file.
 cleanup() {
     cleanup_status=$?
     if [ -n "$TQFTP_TEST_SOURCE" ] && [ -f "$TQFTP_TEST_SOURCE" ]; then
         log_warn "[TQFTP-E2E] phase=cleanup action=remove-temporary-source path=$TQFTP_TEST_SOURCE trigger=exit-or-signal"
         rm -f "$TQFTP_TEST_SOURCE" || true
     fi
-    [ "$cleanup_status" -eq 0 ]
-    _runner_stdout_cleanup
+    runner_stdout_cleanup "$cleanup_status"
 }
 
 # usage

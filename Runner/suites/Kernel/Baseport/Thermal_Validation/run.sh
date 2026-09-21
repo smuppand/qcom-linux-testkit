@@ -54,11 +54,11 @@ DT_ROOT=""
 # Takes no arguments and produces no stdout. Stops only the controlled-load
 # process started by this suite, preserves retained evidence, and restores the
 # runner stdout capture when the script exits or receives a handled signal.
+# Returns through runner_stdout_cleanup with the incoming trap status.
 cleanup() {
     cleanup_status=$?
     thermal_stop_controlled_load >/dev/null 2>&1 || true
-    [ "$cleanup_status" -eq 0 ]
-    _runner_stdout_cleanup
+    runner_stdout_cleanup "$cleanup_status"
 }
 
 # usage
