@@ -1,0 +1,19 @@
+metadata:
+  name: QRTR_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate the live QRTR node and service topology"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  QRTR_TIMEOUT: "10"
+  QRTR_EXPECT_SERVICES: ""
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/QRTR_Validation
+    - ./run.sh --timeout "${QRTR_TIMEOUT}" --expect-services "${QRTR_EXPECT_SERVICES}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh QRTR_Validation.res
