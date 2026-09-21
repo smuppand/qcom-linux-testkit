@@ -2872,6 +2872,141 @@ run_with_timeout() {
     return $status
 }
 
+# Purpose: Opt-in managed timeout runner with explicit watcher lifecycle cleanup.
+#
+# This intentionally does not change run_with_timeout(), which has existing
+# callers and historical behavior. Suites that need stronger lifecycle handling
+# can opt in to this helper without affecting existing users.
+#
+# Usage:
+#   run_with_managed_timeout TIMEOUT_SECS TEMP_DIR LABEL COMMAND [ARG...]
+#
+# Arguments:
+#   TIMEOUT_SECS - positive integer to enable timeout enforcement. Empty, zero,
+#                  or non-numeric values run COMMAND directly without a watcher.
+#   TEMP_DIR     - directory for temporary watcher PID and timeout marker files;
+#                  /tmp is used when empty.
+#   LABEL        - caller-provided label for temp-file names. Callers should use
+#                  a simple filename-safe value.
+#   COMMAND...   - command and arguments to execute.
+#
+# Optional caller-provided hook:
+#   MANAGED_TIMEOUT_PRE_EXEC_HOOK - function/command invoked in the child command
+#                                   and watcher before they do work.
+#
+# State exposed while the command is running, for caller cleanup traps:
+#   MANAGED_TIMEOUT_CMD_PID
+#   MANAGED_TIMEOUT_WATCHER_PID
+#   MANAGED_TIMEOUT_WATCHER_SLEEP_PID
+#   MANAGED_TIMEOUT_SLEEP_PID_FILE
+#   MANAGED_TIMEOUT_MARKER_FILE
+#
+# Return:
+#   COMMAND status on normal completion; 124 when this helper's watcher expires.
+run_with_managed_timeout() {
+    mt_timeout_secs="$1"
+    mt_temp_dir="$2"
+    mt_label="$3"
+    shift 3
+    mt_command_display="$*"
+    mt_pre_exec_hook="${MANAGED_TIMEOUT_PRE_EXEC_HOOK:-}"
+
+    mt_run_pre_exec_hook() {
+        [ -n "$mt_pre_exec_hook" ] || return 0
+        "$mt_pre_exec_hook"
+    }
+
+    MANAGED_TIMEOUT_CMD_PID=""
+    MANAGED_TIMEOUT_WATCHER_PID=""
+    MANAGED_TIMEOUT_WATCHER_SLEEP_PID=""
+    MANAGED_TIMEOUT_SLEEP_PID_FILE=""
+    MANAGED_TIMEOUT_MARKER_FILE=""
+
+    case "$mt_timeout_secs" in
+        ''|*[!0-9]*|0)
+            (
+                mt_run_pre_exec_hook
+                exec "$@"
+            )
+            return $?
+            ;;
+    esac
+
+    [ -n "$mt_temp_dir" ] || mt_temp_dir="/tmp"
+    [ -n "$mt_label" ] || mt_label="managed-timeout"
+
+    (
+        mt_run_pre_exec_hook
+        exec "$@"
+    ) &
+    mt_cmd_pid=$!
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_CMD_PID="$mt_cmd_pid"
+
+    mt_sleep_pid_file="$mt_temp_dir/.${mt_label}.timeout-sleep.$$.$mt_cmd_pid"
+    mt_timeout_marker_file="$mt_temp_dir/.${mt_label}.timeout-expired.$$.$mt_cmd_pid"
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_SLEEP_PID_FILE="$mt_sleep_pid_file"
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_MARKER_FILE="$mt_timeout_marker_file"
+
+    (
+        mt_run_pre_exec_hook
+        sleep "$mt_timeout_secs" &
+        mt_sleep_pid=$!
+        printf '%s\n' "$mt_sleep_pid" >"$mt_sleep_pid_file" 2>/dev/null || true
+        trap 'kill "$mt_sleep_pid" >/dev/null 2>&1 || true; wait "$mt_sleep_pid" 2>/dev/null || true; rm -f "$mt_sleep_pid_file" 2>/dev/null || true; exit 0' INT TERM
+        wait "$mt_sleep_pid" 2>/dev/null
+        mt_sleep_rc=$?
+        trap - INT TERM
+        rm -f "$mt_sleep_pid_file" 2>/dev/null || true
+        if [ "$mt_sleep_rc" -eq 0 ]; then
+            printf 'timeout after %ss: %s\n' "$mt_timeout_secs" "$mt_command_display" >"$mt_timeout_marker_file" 2>/dev/null || true
+            echo "[TIMEOUT] command exceeded ${mt_timeout_secs}s: $mt_command_display" >&2
+            kill "$mt_cmd_pid" >/dev/null 2>&1 || true
+            sleep 2
+            kill -KILL "$mt_cmd_pid" >/dev/null 2>&1 || true
+        fi
+    ) &
+    mt_watcher_pid=$!
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_WATCHER_PID="$mt_watcher_pid"
+
+    wait "$mt_cmd_pid" 2>/dev/null
+    mt_status=$?
+
+    if [ -r "$mt_timeout_marker_file" ]; then
+        mt_status=124
+    fi
+
+    if [ -r "$mt_sleep_pid_file" ]; then
+        MANAGED_TIMEOUT_WATCHER_SLEEP_PID="$(cat "$mt_sleep_pid_file" 2>/dev/null || true)"
+    fi
+
+    kill "$mt_watcher_pid" >/dev/null 2>&1 || true
+    wait "$mt_watcher_pid" 2>/dev/null || true
+
+    if [ -n "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" ]; then
+        kill "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" >/dev/null 2>&1 || true
+        wait "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" 2>/dev/null || true
+    fi
+
+    rm -f "$mt_sleep_pid_file" "$mt_timeout_marker_file" 2>/dev/null || true
+
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_CMD_PID=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_WATCHER_PID=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_WATCHER_SLEEP_PID=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_SLEEP_PID_FILE=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_MARKER_FILE=""
+
+    return "$mt_status"
+}
+
 # Purpose: Run a command with a timeout and capture stdout and stderr.
 # Arguments:
 #   $1 - Timeout in seconds.

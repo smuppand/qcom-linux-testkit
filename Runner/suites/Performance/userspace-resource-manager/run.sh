@@ -43,6 +43,18 @@ TESTNAME="userspace-resource-manager"
 test_path="$(find_test_case_by_name "$TESTNAME")"
 cd "$test_path" || exit 1
 RES_FILE="./${TESTNAME}.res"
+# Clear any stale result from a previous invocation before any early exit path.
+# LAVA publishes this file regardless of the runner process status, so leaving
+# an old PASS behind would make interrupted/failed runs look successful.
+if command -v test_result_init >/dev/null 2>&1; then
+    test_result_init "$TESTNAME" "$RES_FILE"
+else
+    rm -f "$RES_FILE" 2>/dev/null || true
+fi
+
+write_result() {
+    printf '%s %s\n' "$TESTNAME" "$1" >"$RES_FILE"
+}
 
 # Optional generic package-set recovery.
 # This must be a clean no-op when no package-set mapping exists for the active OS/provider.
@@ -52,36 +64,156 @@ if [ -f "$TOOLS/lib_pkg_provider.sh" ]; then
 fi
 
 log_info "=== Checking Dependencies ==="
-if ! check_dependencies awk grep pgrep date printf; then
+if ! check_dependencies awk grep date printf; then
     log_skip "$TESTNAME SKIP – base tools missing"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
+    write_result SKIP
     exit 0
 fi
 
 # ---------- Lock (avoid concurrent runs on same host) ----------
 LOCKFILE="/tmp/${TESTNAME}.lock"
 LOCKDIR="/tmp/${TESTNAME}.lockdir"
+lock_flock=0
+cleanup_done=0
+nodes_tmp_base=""
+MANAGED_TIMEOUT_CMD_PID=""
+MANAGED_TIMEOUT_WATCHER_PID=""
+MANAGED_TIMEOUT_WATCHER_SLEEP_PID=""
+MANAGED_TIMEOUT_SLEEP_PID_FILE=""
+MANAGED_TIMEOUT_MARKER_FILE=""
+MANAGED_TIMEOUT_PRE_EXEC_HOOK=""
+
+# Emit targeted lock diagnostics when flock acquisition fails.  Avoid broad
+# process-name matching such as "run.sh" because it can report the newly
+# started invocation rather than the actual lock holder; prefer kernel/file
+# descriptor views when the platform provides them.
+log_lock_diagnostics() {
+    log_info "Lock file: $LOCKFILE"
+
+    if command -v lslocks >/dev/null 2>&1; then
+        if lslocks 2>/dev/null | grep -F "$LOCKFILE" >/dev/null 2>&1; then
+            log_info "lslocks entries for $LOCKFILE:"
+            lslocks 2>/dev/null | grep -F "$LOCKFILE" | while IFS= read -r line; do
+                log_info " [lslocks] $line"
+            done
+        else
+            log_info "No lslocks entry found for $LOCKFILE"
+        fi
+    fi
+
+    if command -v fuser >/dev/null 2>&1; then
+        fuser_output="$(fuser "$LOCKFILE" 2>/dev/null || true)"
+        if [ -n "$fuser_output" ]; then
+            log_info "Processes with lock file open from fuser (not necessarily lock owners): $fuser_output"
+        fi
+    fi
+
+    if [ -d /proc ] && command -v readlink >/dev/null 2>&1; then
+        proc_found=0
+        for fd in /proc/[0-9]*/fd/*; do
+            [ -e "$fd" ] || continue
+            fd_target="$(readlink "$fd" 2>/dev/null || true)"
+            [ "$fd_target" = "$LOCKFILE" ] || continue
+            pid="${fd#/proc/}"
+            pid="${pid%%/*}"
+            [ "$pid" = "$$" ] && continue
+            cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+            log_info " [proc-fd] pid=$pid fd=${fd##*/} cmd=${cmd:-<unavailable>}"
+            proc_found=1
+        done
+        if [ "$proc_found" -eq 0 ]; then
+            log_info "No other /proc/*/fd references found for $LOCKFILE"
+        fi
+    fi
+}
+
+# Single cleanup path for normal exit, INT and TERM.
+# Keep lock release, timeout-process cleanup and node-staging cleanup together
+# so later setup code does not overwrite the lock trap.  The managed timeout
+# helper exposes command and watcher/sleep process state so interrupted runs can
+# tear down the whole timeout process tree before releasing the suite lock.
+# shellcheck disable=SC2317  # Invoked indirectly by trap handlers.
+cleanup() {
+    [ "$cleanup_done" -eq 0 ] || return 0
+    cleanup_done=1
+
+    if [ -z "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" ] && [ -n "$MANAGED_TIMEOUT_SLEEP_PID_FILE" ] && [ -r "$MANAGED_TIMEOUT_SLEEP_PID_FILE" ]; then
+        MANAGED_TIMEOUT_WATCHER_SLEEP_PID="$(cat "$MANAGED_TIMEOUT_SLEEP_PID_FILE" 2>/dev/null || true)"
+    fi
+
+    if [ -n "$MANAGED_TIMEOUT_WATCHER_PID" ]; then
+        kill "$MANAGED_TIMEOUT_WATCHER_PID" >/dev/null 2>&1 || true
+        wait "$MANAGED_TIMEOUT_WATCHER_PID" 2>/dev/null || true
+        MANAGED_TIMEOUT_WATCHER_PID=""
+    fi
+
+    if [ -n "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" ]; then
+        kill "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" >/dev/null 2>&1 || true
+        wait "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" 2>/dev/null || true
+        MANAGED_TIMEOUT_WATCHER_SLEEP_PID=""
+    fi
+
+    if [ -n "$MANAGED_TIMEOUT_SLEEP_PID_FILE" ]; then
+        rm -f "$MANAGED_TIMEOUT_SLEEP_PID_FILE" 2>/dev/null || true
+        MANAGED_TIMEOUT_SLEEP_PID_FILE=""
+    fi
+
+    if [ -n "$MANAGED_TIMEOUT_MARKER_FILE" ]; then
+        rm -f "$MANAGED_TIMEOUT_MARKER_FILE" 2>/dev/null || true
+        MANAGED_TIMEOUT_MARKER_FILE=""
+    fi
+
+    if [ -n "$MANAGED_TIMEOUT_CMD_PID" ]; then
+        kill "$MANAGED_TIMEOUT_CMD_PID" >/dev/null 2>&1 || true
+        wait "$MANAGED_TIMEOUT_CMD_PID" 2>/dev/null || true
+        MANAGED_TIMEOUT_CMD_PID=""
+    fi
+
+    if [ "$lock_flock" -eq 1 ]; then
+        flock -u 9 >/dev/null 2>&1 || true
+        exec 9>&- || true
+        lock_flock=0
+    else
+        rmdir "$LOCKDIR" 2>/dev/null || true
+    fi
+
+    if [ -n "$nodes_tmp_base" ]; then
+        rm -rf "$nodes_tmp_base" 2>/dev/null || true
+        nodes_tmp_base=""
+    fi
+}
+
+# shellcheck disable=SC2317  # Invoked indirectly by INT/TERM traps.
+cleanup_signal() {
+    signal_status="$1"
+    log_fail "$TESTNAME interrupted or terminated; writing FAIL result before cleanup"
+    write_result FAIL
+    cleanup
+    trap - EXIT INT TERM
+    exit "$signal_status"
+}
 
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"$LOCKFILE"
-  if ! flock -n 9; then
-    log_warn "Another ${TESTNAME} run is active; skipping"
-    log_info "Active URM-related processes:"
-    pgrep -af 'userspace-resource-manager|Urm(Component|Integration)Tests|run.sh' || true
-    echo "$TESTNAME SKIP" >"$RES_FILE"
-    exit 0
-  fi
-  lock_flock=1
-  trap 'exec 9>&-' EXIT INT TERM
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        exec 9>&- || true
+        log_warn "Another ${TESTNAME} run is active; skipping"
+        log_lock_diagnostics
+        write_result SKIP
+        exit 0
+    fi
+    lock_flock=1
 else
-  if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    log_warn "Another ${TESTNAME} run is active or stale fallback lockdir exists: $LOCKDIR"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
-    exit 0
-  fi
-  lock_flock=0
-  trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+    if ! mkdir "$LOCKDIR" 2>/dev/null; then
+        log_warn "Another ${TESTNAME} run is active or stale fallback lockdir exists: $LOCKDIR"
+        write_result SKIP
+        exit 0
+    fi
+    lock_flock=0
 fi
+trap cleanup EXIT
+trap 'cleanup_signal 130' INT
+trap 'cleanup_signal 143' TERM
 
 # ---------- Approved list (pinned whitelist) ----------
 APPROVED_TESTS="
@@ -97,7 +229,7 @@ print_usage() {
     cat <<EOF
 Usage: $0 [--all] [--bin <name|absolute>] [--list] [--timeout SECS]
 Policy:
-  - Service INACTIVE => overall SKIP (end early)
+  - Service absent/non-applicable => overall SKIP; active but unrestartable => overall FAIL
   - Base configs: suites require common/, tests/configs and tests/nodes (skip if any of them are missing)
   - Any test FAIL => overall FAIL
   - No FAIL & PASS>0 => overall PASS
@@ -107,7 +239,7 @@ Options:
   --all Run all approved tests (default)
   --bin NAME|PATH Run only one approved test
   --list Print approved set and coverage and exit
-  --timeout SECS Per-binary timeout if run_with_timeout() exists (default: 1200)
+  --timeout SECS Per-binary timeout in seconds (default: 1200)
 EOF
 }
 RUN_MODE="all"
@@ -178,7 +310,7 @@ elif [ "$RUN_MODE" = "one" ]; then
         pkg_recovery_needed=1
     else
         log_error "[PKG] --bin value '${ONE_BIN}' is not in the approved set; aborting"
-        echo "$TESTNAME FAIL" >"$RES_FILE"
+        write_result FAIL
         exit 1
     fi
 fi
@@ -188,7 +320,7 @@ if [ "$pkg_recovery_needed" -eq 1 ]; then
         if pkg_lookup_package_set urm >/dev/null 2>&1; then
             if ! pkg_ensure_required_package_set_present urm; then
                 log_skip "$TESTNAME SKIP - failed to ensure required package set: urm"
-                echo "$TESTNAME SKIP" >"$RES_FILE"
+                write_result SKIP
                 exit 0
             fi
         else
@@ -222,15 +354,110 @@ per_suite_timeout() {
             ;;
     esac
 }
+# Child processes must not inherit the flock FD.  Otherwise a completed
+# parent shell can release/close its copy while a test binary or timeout helper
+# still keeps FD 9 open, causing the next run to see a stale active flock.
+# Only close FD 9 when this script actually acquired the flock path; the
+# mkdir fallback does not use FD 9.
+# shellcheck disable=SC2317  # Invoked indirectly through MANAGED_TIMEOUT_PRE_EXEC_HOOK.
+close_lock_fd_in_child() {
+    if [ "$lock_flock" -eq 1 ]; then
+        exec 9>&-
+    fi
+}
+
+# URM keeps only suite-specific timeout behavior here: close inherited lock FD
+# in child processes and let cleanup() consume managed-timeout state on signals.
+# The generic timeout lifecycle lives in functestlib.sh as an opt-in helper.
+run_cmd_with_timeout_no_lock_fd() {
+    timeout_secs="$1"
+    shift
+
+    if ! command -v run_with_managed_timeout >/dev/null 2>&1; then
+        log_fail "[TIMEOUT] run_with_managed_timeout helper is unavailable"
+        return 1
+    fi
+
+    # shellcheck disable=SC2034  # Consumed indirectly by run_with_managed_timeout().
+    MANAGED_TIMEOUT_PRE_EXEC_HOOK=close_lock_fd_in_child
+    run_with_managed_timeout "$timeout_secs" "${LOGDIR:-/tmp}" "$TESTNAME" "$@"
+    timeout_status=$?
+    # shellcheck disable=SC2034  # Clear hook state after indirect consumption.
+    MANAGED_TIMEOUT_PRE_EXEC_HOOK=""
+    return "$timeout_status"
+}
+
 run_cmd_maybe_timeout() {
     bin="$1"
     shift
     secs="$(per_suite_timeout "$(basename "$bin")")"
-    if command -v run_with_timeout >/dev/null 2>&1; then
-        run_with_timeout "$secs" "$bin" "$@"
-    else
-        "$bin" "$@"
+    run_cmd_with_timeout_no_lock_fd "$secs" "$bin" "$@"
+}
+
+# Use explicit systemd predicates for this suite. Some shared service helpers
+# intentionally treat missing systemctl or missing units as non-fatal, which is
+# not precise enough here because a real/applicable URM service must be started
+# and later restarted before runnable suites execute.
+if ! command -v systemd_service_exists >/dev/null 2>&1; then
+    systemd_service_exists() {
+        svc="$1"
+        [ -n "$svc" ] || return 1
+        command -v systemctl >/dev/null 2>&1 || return 1
+        systemctl list-unit-files "$svc" --no-legend --no-pager 2>/dev/null |
+            awk -v unit="$svc" '$1 == unit { found=1 } END { exit !found }'
+    }
+fi
+
+if ! command -v systemd_service_is_active >/dev/null 2>&1; then
+    systemd_service_is_active() {
+        svc="$1"
+        [ -n "$svc" ] || return 1
+        command -v systemctl >/dev/null 2>&1 || return 1
+        systemctl is-active --quiet "$svc"
+    }
+fi
+
+service_restarted=0
+ensure_service_restarted() {
+    [ "$service_restarted" -eq 0 ] || return 0
+
+    if ! systemd_service_exists "$SERVICE_NAME"; then
+        log_fail "[SERVICE] $SERVICE_NAME no longer exists before required restart"
+        return 1
     fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_fail "[SERVICE] systemctl not available; cannot perform required restart for $SERVICE_NAME"
+        return 1
+    fi
+
+    log_info "[SERVICE] Restarting $SERVICE_NAME before first runnable suite"
+    if ! systemctl restart "$SERVICE_NAME" >"$LOGDIR/service_restart.log" 2>&1; then
+        log_fail "[SERVICE] $SERVICE_NAME required restart failed"
+        systemctl status "$SERVICE_NAME" --no-pager -l >"$LOGDIR/service_restart_status.log" 2>&1 || true
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl -u "$SERVICE_NAME" -n 100 --no-pager >"$LOGDIR/service_restart_journal.log" 2>&1 || true
+        fi
+        return 1
+    fi
+
+    attempt=1
+    while [ "$attempt" -le 10 ]; do
+        if systemd_service_is_active "$SERVICE_NAME"; then
+            log_pass "[SERVICE] $SERVICE_NAME is active after required restart (attempt $attempt)"
+            service_restarted=1
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt+1))
+    done
+
+    log_fail "[SERVICE] $SERVICE_NAME not active after required restart"
+    systemctl status "$SERVICE_NAME" --no-pager -l >"$LOGDIR/service_restart_status.log" 2>&1 || true
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u "$SERVICE_NAME" -n 100 --no-pager >"$LOGDIR/service_restart_journal.log" 2>&1 || true
+    fi
+    return 1
 }
 
 # ---------- Banner & deps ----------
@@ -250,29 +477,38 @@ if command -v log_soc_info >/dev/null 2>&1; then
     log_soc_info
 fi
 
-# ---------- Service gate (use repo helper) ----------
+# ---------- Service gate ----------
 SERVICE_NAME="${SERVICE_NAME:-urm.service}"
-log_info "[SERVICE] Checking $SERVICE_NAME via check_systemd_services()"
-if check_systemd_services "$SERVICE_NAME"; then
+log_info "[SERVICE] Checking $SERVICE_NAME with explicit systemd predicates"
+if ! systemd_service_exists "$SERVICE_NAME"; then
+    log_skip "[SERVICE] $SERVICE_NAME not found/non-applicable — overall SKIP"
+    write_result SKIP
+    exit 0
+fi
+
+if systemd_service_is_active "$SERVICE_NAME"; then
     log_pass "[SERVICE] $SERVICE_NAME is active"
 else
-    log_warn "[SERVICE] $SERVICE_NAME not active — attempting enable/start"
+    log_warn "[SERVICE] $SERVICE_NAME exists but is not active — attempting start"
 
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable urm >/dev/null 2>&1 || true
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
         systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl start urm >/dev/null 2>&1 || true
-        systemctl status urm --no-pager -l >/dev/null 2>&1 || true
+        systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl status "$SERVICE_NAME" --no-pager -l >"$LOGDIR/service_initial_status.log" 2>&1 || true
     else
-        log_warn "[SERVICE] systemctl not available; cannot auto-start $SERVICE_NAME"
+        log_fail "[SERVICE] systemctl not available for applicable service $SERVICE_NAME"
+        write_result FAIL
+        exit 1
     fi
 
-    if check_systemd_services "$SERVICE_NAME"; then
+    if systemd_service_is_active "$SERVICE_NAME"; then
         log_pass "[SERVICE] $SERVICE_NAME is active after start attempt"
     else
-        log_skip "[SERVICE] $SERVICE_NAME not active — overall SKIP"
-        echo "$TESTNAME SKIP" >"$RES_FILE"
-        exit 0
+        log_fail "[SERVICE] $SERVICE_NAME not active after start attempt"
+        systemctl status "$SERVICE_NAME" --no-pager -l >"$LOGDIR/service_initial_status.log" 2>&1 || true
+        write_result FAIL
+        exit 1
     fi
 fi
 
@@ -435,7 +671,7 @@ else
 fi
 if [ -z "$TESTS" ]; then
     log_skip "$TESTNAME SKIP – approved list empty"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
+    write_result SKIP
     exit 0
 fi
 
@@ -445,8 +681,8 @@ fi
 # read-only node files under /usr/share/urm/tests/nodes (or /var/lib/urm),
 # so we copy them into a mktemp-owned directory before running the tests.
 # mktemp -d guarantees a fresh unique base exclusively owned by this run;
-# the trap registered immediately after removes only that base directory
-# on exit, interrupt, or termination.
+# the common cleanup trap removes this directory together with the lock on
+# exit, interrupt, or termination.
 RUNTIME_NODES_DIR=""
 if [ "$TEST_NODES_OK" -eq 1 ]; then
     nodes_tmp_base="$(mktemp -d)"
@@ -454,11 +690,6 @@ if [ "$TEST_NODES_OK" -eq 1 ]; then
         log_warn "[NODES] mktemp -d failed — suites requiring nodes will SKIP"
         TEST_NODES_OK=0
     else
-        if [ "$lock_flock" -eq 1 ]; then
-            trap 'rm -rf "$nodes_tmp_base"; exec 9>&-' EXIT INT TERM
-        else
-            trap 'rm -rf "$nodes_tmp_base"; rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
-        fi
         RUNTIME_NODES_DIR="$nodes_tmp_base/urm/tests/nodes"
         if ! mkdir -p "$RUNTIME_NODES_DIR"; then
             log_warn "[NODES] Failed to create staging directory $RUNTIME_NODES_DIR — suites requiring nodes will SKIP"
@@ -513,6 +744,12 @@ run_one() {
         return 2
     fi
 
+    if ! ensure_service_restarted; then
+        echo "FAIL" >"$tres"
+        echo "[FAIL] $name – required $SERVICE_NAME restart failed" >>"$LOGDIR/summary.txt"
+        return 1
+    fi
+
     log_info "--- Running $bin ---"
     log_info "[CI] Logging to $tlog"
     run_cmd_maybe_timeout "$bin" --npath "$RUNTIME_NODES_DIR" >"$tlog" 2>&1
@@ -531,6 +768,12 @@ run_one() {
             echo "[FAIL] $name (rc=$rc)" >>"$LOGDIR/summary.txt"
             return 1
             ;;
+        124)
+            log_fail "[TEST] $name TIMEOUT"
+            echo "FAIL" >"$tres"
+            echo "[FAIL] $name (timeout)" >>"$LOGDIR/summary.txt"
+            return 1
+            ;;
         *)
             log_fail "[TEST] $name UNKNOWN RC=$rc"
             echo "FAIL" >"$tres"
@@ -540,6 +783,7 @@ run_one() {
     esac
 }
 
+log_info "Proceeding with test-cases"
 for t in $TESTS; do
     run_one "$t"
     rc=$?
@@ -582,13 +826,13 @@ log_info "Overall counts: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 # - Else if PASS>0 -> overall PASS
 # - Else -> overall SKIP (everything skipped)
 if [ "$FAIL" -gt 0 ]; then
-  echo "$TESTNAME FAIL" >"$RES_FILE"
+  write_result FAIL
   exit 1
 fi
 if [ "$PASS" -gt 0 ]; then
-  echo "$TESTNAME PASS" >"$RES_FILE"
+  write_result PASS
   exit 0
 fi
 
-echo "$TESTNAME SKIP" >"$RES_FILE"
+write_result SKIP
 exit 0
