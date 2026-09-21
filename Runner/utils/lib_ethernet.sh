@@ -581,6 +581,22 @@ ethv_qps615_collect_runtime() {
     [ -z "$QPS615_FAILURE_REASON" ]
 }
 
+# ethv_qps615_list_netdevs <qps615-runtime-tsv>
+#   Read a QPS615 runtime TSV and print unique correlated netdev names.
+#   stdout: one netdev name per line in first-observed inventory order.
+#   return: 0 when the readable inventory is parsed, 1 when it is unavailable,
+#   or a nonzero awk status. Side effects: none.
+ethv_qps615_list_netdevs() {
+    ethv_qln_inventory="$1"
+
+    [ -r "$ethv_qln_inventory" ] || return 1
+    awk -F '\t' '
+        $1 == "netdev" && $3 != "" && !seen[$3]++ {
+            print $3
+        }
+    ' "$ethv_qln_inventory"
+}
+
 # ethv_get_driver <interface>
 #   Query the bound network driver through ethtool or the sysfs driver link.
 #   stdout: driver name, or an empty line when unavailable.
@@ -709,16 +725,11 @@ ethv_get_ipv4() {
 }
 
 # ethv_valid_ipv4 <address>
-#   Validate an IPv4 address and reject unspecified and link-local addresses.
-#   stdout: none.
-#   return: 0 for a usable IPv4 address, nonzero otherwise.
+#   Validate one dotted-decimal IPv4 address and reject unspecified and
+#   link-local addresses. stdout: none. return: 0 for a usable IPv4 address,
+#   nonzero otherwise. Side effects: none.
 ethv_valid_ipv4() {
     ethv_vi_addr="${1:-}"
-
-    if command -v is_valid_ipv4 >/dev/null 2>&1; then
-        is_valid_ipv4 "$ethv_vi_addr"
-        return $?
-    fi
 
     case "$ethv_vi_addr" in
         ""|0.0.0.0|169.254.*)
@@ -739,6 +750,21 @@ ethv_valid_ipv4() {
             }
         }
     '
+}
+
+# ethv_valid_unicast_ipv4 <address>
+#   Validate one dotted-decimal IPv4 peer address suitable for unicast traffic.
+#   Rejects unspecified, link-local, loopback, multicast, and 240/4 addresses.
+#   stdout: none. return: 0 for a usable unicast peer, nonzero otherwise.
+#   Side effects: none.
+ethv_valid_unicast_ipv4() {
+    ethv_vui_addr="${1:-}"
+
+    ethv_valid_ipv4 "$ethv_vui_addr" || return 1
+    ethv_vui_first_octet=${ethv_vui_addr%%.*}
+    [ "$ethv_vui_first_octet" -ge 1 ] &&
+        [ "$ethv_vui_first_octet" -ne 127 ] &&
+        [ "$ethv_vui_first_octet" -lt 224 ]
 }
 
 # ethv_get_carrier <interface>
@@ -1005,6 +1031,48 @@ ethv_get_counter() {
     fi
 
     printf '%s\n' 0
+}
+
+# ethv_counter_available <interface> <statistics-counter>
+#   Verify that a standard network counter is readable and contains an
+#   unsigned decimal value. stdout: none. return: 0 when usable and 1 when the
+#   interface, counter, or value is unavailable. Side effects: none.
+ethv_counter_available() {
+    ethv_ca_iface="${1:-}"
+    ethv_ca_counter="${2:-}"
+    ethv_ca_file="/sys/class/net/$ethv_ca_iface/statistics/$ethv_ca_counter"
+
+    [ -n "$ethv_ca_iface" ] && [ -n "$ethv_ca_counter" ] || return 1
+    [ -r "$ethv_ca_file" ] || return 1
+    if ! ethv_ca_value=$(ethv_read_first_line "$ethv_ca_file" 2>/dev/null); then
+        return 1
+    fi
+    ethv_is_uint "$ethv_ca_value"
+}
+
+# ethv_counters_available <interface> <statistics-counter>...
+#   Verify a required set of standard network counters without emitting
+#   stdout. return: 0 when every counter is usable, 1 when any counter is
+#   unavailable, or 3 when no counter is supplied. Side effects: exports
+#   ETHV_COUNTER_FAILURE with the first unavailable counter name.
+ethv_counters_available() {
+    ETHV_COUNTER_FAILURE=""
+    export ETHV_COUNTER_FAILURE
+    [ "$#" -gt 0 ] || return 3
+    ethv_cas_iface="${1:-}"
+    shift
+
+    [ -n "$ethv_cas_iface" ] && [ "$#" -gt 0 ] || return 3
+    for ethv_cas_counter in "$@"; do
+        if ! ethv_counter_available "$ethv_cas_iface" "$ethv_cas_counter"; then
+            ETHV_COUNTER_FAILURE="$ethv_cas_counter"
+            export ETHV_COUNTER_FAILURE
+            return 1
+        fi
+    done
+
+    export ETHV_COUNTER_FAILURE
+    return 0
 }
 
 # ethv_counter_delta <before> <after>
