@@ -63,13 +63,17 @@ the Yocto package flow.
 - PipeWire: `pw-play`, `wpctl`
 - PulseAudio: `paplay`, `pactl`
 - ALSA: `aplay`, `amixer`, `alsaucm` when UCM is available
-- Common tools: `pgrep`, `timeout`, `grep`, `wget`, `tar`
+- Common tools: `pgrep`, `timeout`, `grep`, `tar`, and either `curl` or `wget`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
 ### Ubuntu package preparation
 
 When run as root, the suite uses the shared package provider to install missing
 Ubuntu audio packages. It does not run a blanket distribution upgrade.
+When network download is enabled and neither `curl` nor `wget` is present, the
+same provider installs the OS-specific `audio-download` package set on Debian,
+Ubuntu, or CentOS. Image-managed Yocto targets remain non-installing and skip
+the download when neither tool is provided by the image.
 
 - `auto` is the default profile. It selects `desktop` when `graphical.target`
   is active and otherwise selects `server`.
