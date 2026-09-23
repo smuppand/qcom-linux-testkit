@@ -10,7 +10,7 @@ metadata:
 params:
   DURATION: "30s"
   WAIT_SECS: "10"
-  REQUIRE_FPS: "0"
+  REQUIRE_FPS: "1"
   TIME_SYNC_WAIT: "20"
   CLOCK_STEP_TOLERANCE: "2"
 
