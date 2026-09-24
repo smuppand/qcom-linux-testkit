@@ -2,7 +2,7 @@
 
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
-# BT_ON_OFF - Basic Bluetooth power toggle validation (non-expect version)
+# BT_ON_OFF - Basic Bluetooth power toggle validation
 
 # ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
@@ -241,18 +241,9 @@ log_info "Initial Powered = $initial_power"
 log_info "Powering OFF..."
 if ! btpower "$ADAPTER" off; then
     btloghcidiag "$ADAPTER" failure "$testpath" || true
-    test_result_finish "FAIL" "btpower($ADAPTER, off) failed at command level"
+    test_result_finish "FAIL" "btpower($ADAPTER, off) did not confirm stable Powered=no"
 fi
-
-after_off="$(btgetpower "$ADAPTER" 2>/dev/null || true)"
-[ -z "$after_off" ] && after_off="unknown"
-
-if [ "$after_off" = "no" ]; then
-    test_result_record "PASS" "Post-OFF verification reported Powered=no"
-else
-    btloghcidiag "$ADAPTER" failure "$testpath" || true
-    test_result_finish "FAIL" "Post-OFF verification failed with Powered=$after_off"
-fi
+test_result_record "PASS" "Power OFF completed with consecutive Powered=no confirmations"
 
 # ---- Power ON test ----
 log_info "Waiting ${BT_POWER_CYCLE_DELAY}s before Powering ON..."
@@ -266,15 +257,8 @@ while [ "$on_attempt" -le "$BT_POWER_ON_ATTEMPTS" ]; do
     log_info "Power ON attempt $on_attempt/$BT_POWER_ON_ATTEMPTS"
 
     if btpower "$ADAPTER" on; then
-        after_on="$(btgetpower "$ADAPTER" 2>/dev/null || true)"
-        [ -z "$after_on" ] && after_on="unknown"
-
-        if [ "$after_on" = "yes" ]; then
-            on_success=1
-            break
-        fi
-
-        log_warn "Power ON command returned success, but post-check Powered=$after_on"
+        on_success=1
+        break
     else
         log_warn "btpower($ADAPTER, on) failed on attempt $on_attempt"
     fi
@@ -309,7 +293,7 @@ if [ "$on_success" -eq 1 ]; then
 
     btwarniflistempty "$ADAPTER" || true
 
-    test_result_record "PASS" "Post-ON verification reported Powered=yes"
+    test_result_record "PASS" "Power ON completed with consecutive Powered=yes confirmations"
     test_result_finish
 fi
 
@@ -317,4 +301,4 @@ after_on="$(btgetpower "$ADAPTER" 2>/dev/null || true)"
 [ -z "$after_on" ] && after_on="unknown"
 
 btloghcidiag "$ADAPTER" failure "$testpath" || true
-test_result_finish "FAIL" "Post-ON verification failed after $BT_POWER_ON_ATTEMPTS attempts with Powered=$after_on"
+test_result_finish "FAIL" "Stable Powered=yes was not confirmed after $BT_POWER_ON_ATTEMPTS attempts, final observation=$after_on"

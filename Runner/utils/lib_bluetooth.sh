@@ -3036,17 +3036,23 @@ btgetpower() {
  
     return 2
 }
-# Usage: btpower hci0 on|off
-# Returns:
-#   0 = requested state achieved (including when already in that state)
-#   1 = requested state not achieved
-#   2 = no controller / state unknown
+# btpower ADAPTER on|off
+# Request a BlueZ controller power transition and require two consecutive exact
+# Powered=yes/no observations before reporting success.
+# Inputs: adapter identifier and target state. Output: diagnostic logs only.
+# Returns: 0 when the requested state is stable, 1 when it is not achieved, and
+# 2 when no controller state can be read. Side effects: may issue bounded
+# bluetoothctl power requests and wait between verification samples.
 btpower() {
     dev="${1:-}"
     want="${2:-}"
  
     case "$want" in
-        on|off)
+        on)
+            target_state=yes
+            ;;
+        off)
+            target_state=no
             ;;
         *)
             log_warn "btpower: invalid target state '$want'"
@@ -3056,15 +3062,16 @@ btpower() {
  
     cur_state="$(btgetpower "$dev" 2>/dev/null || true)"
     [ -z "$cur_state" ] && cur_state="unknown"
- 
-    if [ "$want" = "on" ] && [ "$cur_state" = "yes" ]; then
-        log_info "btpower: $dev already Powered=yes; skipping 'power on'."
-        return 0
-    fi
- 
-    if [ "$want" = "off" ] && [ "$cur_state" = "no" ]; then
-        log_info "btpower: $dev already Powered=no; skipping 'power off'."
-        return 0
+
+    if [ "$cur_state" = "$target_state" ]; then
+        log_info "btpower: $dev already Powered=$target_state, confirming stable state."
+        sleep 1
+        confirm_state="$(btgetpower "$dev" 2>/dev/null || true)"
+        if [ "$confirm_state" = "$target_state" ]; then
+            log_info "btpower: $dev Powered=$target_state confirmed stable without a new request."
+            return 0
+        fi
+        log_warn "btpower: $dev initial Powered=$target_state observation was not stable, observed=${confirm_state:-unknown} on confirmation"
     fi
  
     log_info "btpower: requesting '$want' on $dev (current=$cur_state)"
@@ -3072,6 +3079,7 @@ btpower() {
     request_attempts="${BT_POWER_REQUEST_ATTEMPTS:-3}"
     verify_attempts="${BT_POWER_VERIFY_ATTEMPTS:-10}"
     retry_delay="${BT_POWER_REQUEST_RETRY_DELAY:-2}"
+    required_confirmations=2
 
     case "$request_attempts" in
         ""|*[!0-9]*) request_attempts=3 ;;
@@ -3089,8 +3097,11 @@ btpower() {
     if [ "$verify_attempts" -lt 1 ] 2>/dev/null; then
         verify_attempts=1
     fi
+    if [ "$verify_attempts" -lt "$required_confirmations" ] 2>/dev/null; then
+        verify_attempts="$required_confirmations"
+    fi
 
-    log_info "btpower: request attempts=$request_attempts verify attempts=$verify_attempts retry delay=${retry_delay}s"
+    log_info "btpower: request attempts=$request_attempts verify attempts=$verify_attempts stable confirmations=$required_confirmations retry delay=${retry_delay}s"
     if command -v expect >/dev/null 2>&1; then
         log_info "btpower: using an expect PTY for interactive bluetoothctl power requests"
     else
@@ -3110,17 +3121,23 @@ btpower() {
         fi
 
         verify_attempt=1
+        stable_confirmations=0
         while [ "$verify_attempt" -le "$verify_attempts" ]; do
             state="$(btgetpower "$dev" 2>/dev/null || true)"
 
-            if [ "$want" = "on" ] && [ "$state" = "yes" ]; then
-                log_info "btpower: $dev Powered=yes after request attempt $request_attempt."
+            if [ "$state" = "$target_state" ]; then
+                stable_confirmations=$((stable_confirmations + 1))
+            else
+                stable_confirmations=0
+            fi
+
+            if [ "$stable_confirmations" -ge "$required_confirmations" ]; then
+                log_info "btpower: $dev Powered=$state confirmed stable after request attempt $request_attempt."
                 return 0
             fi
 
-            if [ "$want" = "off" ] && [ "$state" = "no" ]; then
-                log_info "btpower: $dev Powered=no after request attempt $request_attempt."
-                return 0
+            if [ "$stable_confirmations" -gt 0 ]; then
+                log_info "btpower: $dev Powered=$state confirmation $stable_confirmations/$required_confirmations"
             fi
 
             sleep 1
