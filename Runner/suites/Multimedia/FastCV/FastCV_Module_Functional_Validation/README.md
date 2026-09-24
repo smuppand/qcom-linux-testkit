@@ -72,7 +72,9 @@ configuration fails rather than being overwritten. Package preparation failure
 is reported as a suite failure. The RPM path also verifies that the `epel`
 repository is enabled after installing `epel-release`. Automatic repository
 creation is rejected on other CentOS or Red Hat major versions because the
-configured repository URLs are specific to version 10.
+configured repository URLs are specific to version 10. When the complete
+FastCV package set is already installed, the suite skips repository setup and
+package-manager network operations.
 
 These packages provide the FastCV runtime dependencies, but they do not provide
 the `fastcv_test` module runner or its matching test data. Sideload both fixture
@@ -136,7 +138,9 @@ separate bounded invocation.
 ## Focused module coverage
 
 Use `--modules` with one module or a comma-separated module list. Each selected
-module runs separately with `-m` and must report its exact module PASS marker.
+module runs separately with `-m`. The runner accepts the two output dialects
+observed from supported `fastcv_test` builds while retaining fail-closed
+validation.
 
 ```sh
 ./run.sh \
@@ -147,13 +151,25 @@ module runs separately with `-m` and must report its exact module PASS marker.
     --modules COLORYUV,SCALE,ARITHM,BLUR,TRNS
 ```
 
-For example, the `SCALE` invocation must report all three markers:
+The full output dialect reports all three summary markers:
 
 ```text
 FASTCV_TEST, SCALE=>PASS
 FIT:(FeatureName=>FASTCV, Overall=>PASS)
 FASTCV_PROFILE, FIT:(FeatureName=>FASTCV, Overall=>PASS)
 ```
+
+Some host-distribution builds emit only profiling records. For that dialect,
+the runner requires at least one function-level profile PASS plus the final
+profile FIT PASS:
+
+```text
+FASTCV_PROFILE, fcvScaleDownBy2u8 :: PASS, ...
+FASTCV_PROFILE, FIT:(FeatureName=>FASTCV, Overall=>PASS)
+```
+
+Both dialects also require exit status zero and no function, module, profile,
+or FIT failure marker. A profile FIT summary by itself is not sufficient.
 
 Module names are validated as alphanumeric identifiers with `_`, `+`, or `-`
 characters. The suite does not impose a static allowlist because the
@@ -273,10 +289,11 @@ matrices in an appropriate scheduled job and divide them across executions.
 
 ## Results
 
-- **PASS**: every requested invocation exits zero, reports the required module
-  and overall FIT PASS markers, reports the profile FIT marker unless unit-only
-  mode was requested, verifies selected function or without-operation-mode
-  markers when applicable, and reports no official FAIL marker.
+- **PASS**: every requested invocation exits zero and reports either the full
+  module/FIT marker set or function-level profiling PASS evidence with the
+  profile FIT summary. Unit-only mode requires the full non-profile marker set.
+  Selected function and without-operation-mode evidence is required when
+  applicable, and any official FAIL marker fails the invocation.
 - **FAIL**: the explicit fixture is incomplete or invalid, configuration is
   malformed, required host-distribution package recovery fails, execution
   fails or times out, a FAIL marker is present, or required PASS markers are

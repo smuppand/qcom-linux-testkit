@@ -384,8 +384,10 @@ run_fastcv_test_case() {
         -l "$FASTCV_TEST_LOOPS"
     if [ "$rftc_module" = "ALL" ]; then
         set -- "$@" -L "$FASTCV_TEST_LEVEL"
+        rftc_level_applied="$FASTCV_TEST_LEVEL"
     else
         set -- "$@" -m "$rftc_module"
+        rftc_level_applied="not-applied"
     fi
 
     if [ -n "$FASTCV_TEST_FUNCTION" ]; then
@@ -442,7 +444,7 @@ run_fastcv_test_case() {
         return 1
     fi
 
-    log_info "[FASTCV-CASE] phase=start target=$rftc_target target_name=$rftc_target_name module=$rftc_module loops=$FASTCV_TEST_LOOPS level=$FASTCV_TEST_LEVEL function=${FASTCV_TEST_FUNCTION:-all} operation_mode=${FASTCV_TEST_OPERATION_MODE:-default} operation_tables_only=$FASTCV_TEST_OPERATION_TABLES_ONLY seed=${FASTCV_TEST_SEED:-default} no_buffer_pool=$FASTCV_TEST_NO_BUFFER_POOL prealloc_bytes=${FASTCV_TEST_PREALLOC_BYTES:-none} opencv=$FASTCV_TEST_OPENCV unit_only=$FASTCV_TEST_UNIT_ONLY profile_only=$FASTCV_TEST_PROFILE_ONLY exhaustive=$FASTCV_TEST_EXHAUSTIVE resolution=${FASTCV_TEST_RESOLUTION:-default} qdsp_heap=$FASTCV_TEST_QDSP_HEAP element_alignment=$FASTCV_TEST_ELEMENT_ALIGNMENT cache_flush=$FASTCV_TEST_CACHE_FLUSH without_operation_mode=$FASTCV_TEST_WITHOUT_OPERATION_MODE argc=$rftc_argc timeout=${FASTCV_TEST_TIMEOUT}s"
+    log_info "[FASTCV-CASE] phase=start target=$rftc_target target_name=$rftc_target_name module=$rftc_module loops=$FASTCV_TEST_LOOPS level=$rftc_level_applied function=${FASTCV_TEST_FUNCTION:-all} operation_mode=${FASTCV_TEST_OPERATION_MODE:-default} operation_tables_only=$FASTCV_TEST_OPERATION_TABLES_ONLY seed=${FASTCV_TEST_SEED:-default} no_buffer_pool=$FASTCV_TEST_NO_BUFFER_POOL prealloc_bytes=${FASTCV_TEST_PREALLOC_BYTES:-none} opencv=$FASTCV_TEST_OPENCV unit_only=$FASTCV_TEST_UNIT_ONLY profile_only=$FASTCV_TEST_PROFILE_ONLY exhaustive=$FASTCV_TEST_EXHAUSTIVE resolution=${FASTCV_TEST_RESOLUTION:-default} qdsp_heap=$FASTCV_TEST_QDSP_HEAP element_alignment=$FASTCV_TEST_ELEMENT_ALIGNMENT cache_flush=$FASTCV_TEST_CACHE_FLUSH without_operation_mode=$FASTCV_TEST_WITHOUT_OPERATION_MODE argc=$rftc_argc timeout=${FASTCV_TEST_TIMEOUT}s"
     run_with_timeout_log \
         "$FASTCV_TEST_TIMEOUT" \
         "$rftc_log" \
@@ -450,38 +452,42 @@ run_fastcv_test_case() {
     rftc_rc=$?
 
     log_file_with_label "FASTCV-TEST-$rftc_target-$rftc_module" "$rftc_log" 120
-    rftc_failure_count=$(grep -E -c 'FASTCV_TEST, .*=>FAIL|FIT:\(FeatureName=>FASTCV, Overall=>FAIL\)' "$rftc_log" 2>/dev/null || true)
-    rftc_fit_count=$(grep -E -c '^FIT:\(FeatureName=>FASTCV, Overall=>PASS\)[[:space:]]*$' "$rftc_log" 2>/dev/null || true)
-    rftc_profile_count=$(grep -E -c '^FASTCV_PROFILE, FIT:\(FeatureName=>FASTCV, Overall=>PASS\)[[:space:]]*$' "$rftc_log" 2>/dev/null || true)
-    if [ "$FASTCV_TEST_WITHOUT_OPERATION_MODE" -eq 1 ]; then
-        rftc_without_mode_count=$(grep -F -c \
-            'Running fastCV API without calling setOperationMode is pass' \
-            "$rftc_log" 2>/dev/null || true)
-    else
-        rftc_without_mode_count=0
+    if ! fastcv_collect_test_markers \
+        "$rftc_log" \
+        "$rftc_module" \
+        "$FASTCV_TEST_FUNCTION" \
+        "$FASTCV_TEST_WITHOUT_OPERATION_MODE"; then
+        test_result_record \
+            "FAIL" \
+            "Could not parse fastcv_test evidence, target=$rftc_target module=$rftc_module artifact=$rftc_log"
+        return 1
     fi
-    if [ -n "$FASTCV_TEST_FUNCTION" ]; then
-        rftc_function_count=$(grep -F -c "Function chosen: $FASTCV_TEST_FUNCTION" "$rftc_log" 2>/dev/null || true)
-    else
-        rftc_function_count=0
-    fi
-    if [ "$rftc_module" = "ALL" ]; then
-        rftc_module_count=$(grep -E -c '^FASTCV_TEST, [^=]+=>PASS[[:space:]]*$' "$rftc_log" 2>/dev/null || true)
-    else
-        rftc_module_count=$(grep -F -c "FASTCV_TEST, $rftc_module=>PASS" "$rftc_log" 2>/dev/null || true)
-    fi
+    rftc_failure_count="$FASTCV_MARKER_FAILURE_COUNT"
+    rftc_fit_count="$FASTCV_MARKER_FIT_COUNT"
+    rftc_profile_count="$FASTCV_MARKER_PROFILE_SUMMARY_COUNT"
+    rftc_profile_case_count="$FASTCV_MARKER_PROFILE_CASE_PASS_COUNT"
+    rftc_module_count="$FASTCV_MARKER_MODULE_COUNT"
+    rftc_function_count="$FASTCV_MARKER_FUNCTION_COUNT"
+    rftc_without_mode_count="$FASTCV_MARKER_WITHOUT_MODE_COUNT"
     rftc_output_bytes=$(wc -c <"$rftc_log" 2>/dev/null | tr -d '[:space:]')
 
     rftc_profile_required=1
     if [ "$FASTCV_TEST_UNIT_ONLY" -eq 1 ]; then
         rftc_profile_required=0
     fi
-    rftc_marker_missing=0
-    if [ "$rftc_module_count" -eq 0 ] || [ "$rftc_fit_count" -eq 0 ]; then
-        rftc_marker_missing=1
-    fi
-    if [ "$rftc_profile_required" -eq 1 ] && [ "$rftc_profile_count" -eq 0 ]; then
-        rftc_marker_missing=1
+    rftc_marker_dialect="none"
+    rftc_marker_missing=1
+    if [ "$rftc_module_count" -gt 0 ] &&
+       [ "$rftc_fit_count" -gt 0 ] &&
+       { [ "$rftc_profile_required" -eq 0 ] ||
+         [ "$rftc_profile_count" -gt 0 ]; }; then
+        rftc_marker_dialect="test-and-profile"
+        rftc_marker_missing=0
+    elif [ "$rftc_profile_required" -eq 1 ] &&
+         [ "$rftc_profile_case_count" -gt 0 ] &&
+         [ "$rftc_profile_count" -gt 0 ]; then
+        rftc_marker_dialect="profile-only"
+        rftc_marker_missing=0
     fi
     if [ -n "$FASTCV_TEST_FUNCTION" ] && [ "$rftc_function_count" -eq 0 ]; then
         rftc_marker_missing=1
@@ -491,7 +497,7 @@ run_fastcv_test_case() {
         rftc_marker_missing=1
     fi
 
-    log_info "[FASTCV-CASE] phase=complete target=$rftc_target target_name=$rftc_target_name module=$rftc_module rc=$rftc_rc module_pass_markers=$rftc_module_count fit_pass_markers=$rftc_fit_count profile_pass_markers=$rftc_profile_count profile_required=$rftc_profile_required function_markers=$rftc_function_count without_operation_mode_markers=$rftc_without_mode_count failure_markers=$rftc_failure_count output_bytes=${rftc_output_bytes:-0} artifact=$rftc_log"
+    log_info "[FASTCV-CASE] phase=complete target=$rftc_target target_name=$rftc_target_name module=$rftc_module rc=$rftc_rc marker_dialect=$rftc_marker_dialect module_pass_markers=$rftc_module_count fit_pass_markers=$rftc_fit_count profile_case_pass_markers=$rftc_profile_case_count profile_pass_markers=$rftc_profile_count profile_required=$rftc_profile_required function_markers=$rftc_function_count without_operation_mode_markers=$rftc_without_mode_count failure_markers=$rftc_failure_count output_bytes=${rftc_output_bytes:-0} artifact=$rftc_log"
 
     if [ "$rftc_rc" -ne 0 ]; then
         test_result_record \
@@ -508,13 +514,13 @@ run_fastcv_test_case() {
     if [ "$rftc_marker_missing" -eq 1 ]; then
         test_result_record \
             "FAIL" \
-            "fastcv_test omitted required PASS evidence, target=$rftc_target module=$rftc_module module_markers=$rftc_module_count fit_markers=$rftc_fit_count profile_markers=$rftc_profile_count profile_required=$rftc_profile_required function_markers=$rftc_function_count without_operation_mode_markers=$rftc_without_mode_count artifact=$rftc_log"
+            "fastcv_test omitted required PASS evidence, target=$rftc_target module=$rftc_module marker_dialect=$rftc_marker_dialect module_markers=$rftc_module_count fit_markers=$rftc_fit_count profile_case_markers=$rftc_profile_case_count profile_markers=$rftc_profile_count profile_required=$rftc_profile_required function_markers=$rftc_function_count without_operation_mode_markers=$rftc_without_mode_count artifact=$rftc_log"
         return 1
     fi
 
     test_result_record \
         "PASS" \
-        "fastcv_test completed functional module validation, target=$rftc_target target_name=$rftc_target_name module=$rftc_module module_pass_markers=$rftc_module_count artifact=$rftc_log"
+        "fastcv_test completed functional module validation, target=$rftc_target target_name=$rftc_target_name module=$rftc_module marker_dialect=$rftc_marker_dialect module_pass_markers=$rftc_module_count profile_case_pass_markers=$rftc_profile_case_count artifact=$rftc_log"
     return 0
 }
 
@@ -759,7 +765,7 @@ fi
 } >"$BINARY_REPORT"
 log_info "[FASTCV-FIXTURE] binary=$FASTCV_TEST_BINARY executable=1 data_dir=$FASTCV_TEST_DATA_DIR control_table=$CONTROL_TABLE control_table_readable=1 data_files=$data_file_count binary_artifact=$BINARY_REPORT data_artifact=$DATA_REPORT"
 log_file_with_label "FASTCV-BINARY" "$BINARY_REPORT" 10
-log_file_with_label "FASTCV-DATA" "$DATA_REPORT" 40
+log_file_with_label "FASTCV-DATA" "$DATA_REPORT" 12
 
 if ! prepare_target_list "$FASTCV_TEST_TARGETS" "$TARGET_LIST"; then
     test_result_record \
