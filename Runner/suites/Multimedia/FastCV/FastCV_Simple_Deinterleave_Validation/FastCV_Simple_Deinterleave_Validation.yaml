@@ -1,0 +1,19 @@
+metadata:
+  name: FastCV_Simple_Deinterleave_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Run fastcv_simple_test64 and validate its deinterleave data-integrity result"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  FASTCV_BINARY: ""
+  FASTCV_TIMEOUT: "60"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/FastCV/FastCV_Simple_Deinterleave_Validation
+    - ./run.sh --binary "${FASTCV_BINARY}" --timeout "${FASTCV_TIMEOUT}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh FastCV_Simple_Deinterleave_Validation.res
