@@ -59,6 +59,9 @@ PKG_APT_AUTH_PASSWORD_FILE="/run/qcom-testkit/secrets/debusine_api_token"
 PKG_RPM_UPDATED_MARK="/tmp/qcom_testkit_rpm_updated"
 PKG_RPM_UPGRADED_MARK="/tmp/qcom_testkit_rpm_upgraded"
 PKG_RPM_BEST_EFFORT_CLEAN="1"
+PKG_QCOM_RPM_REPO_FILE="${PKG_QCOM_RPM_REPO_FILE:-/etc/yum.repos.d/qualcomm-linux.repo}"
+PKG_QCOM_RPM_AARCH64_BASEURL="${PKG_QCOM_RPM_AARCH64_BASEURL:-https://softwarecenter.qualcomm.com/nexus/rpm/centos/10/os/aarch64/}"
+PKG_QCOM_RPM_NOARCH_BASEURL="${PKG_QCOM_RPM_NOARCH_BASEURL:-https://softwarecenter.qualcomm.com/nexus/rpm/centos/10/os/noarch/}"
 
 PKG_OPKG_UPDATED_MARK="/tmp/qcom_testkit_opkg_updated"
 
@@ -526,7 +529,7 @@ pkg_package_recovery_supported_os() {
     recovery_os_id="$1"
 
     case "$recovery_os_id" in
-        debian|ubuntu|centos)
+        debian|ubuntu|centos|rhel)
             return 0
             ;;
         *)
@@ -1634,6 +1637,174 @@ pkg_rpm_tool() {
     fi
 
     return 1
+}
+
+# pkg_rpm_repository_enabled REPOSITORY_ID
+# Check whether one exact RPM repository ID is enabled.
+# Inputs: one repository ID containing letters, digits, `.`, `_`, or `-`, and
+# not beginning with `-`. Output: no stdout contract.
+# Returns: 0 when enabled, and 1 when the ID, RPM tool, or repository listing
+# is unavailable. Side effects: invokes a read-only dnf/yum repository query.
+pkg_rpm_repository_enabled() {
+    prre_repo_id="$1"
+    prre_tool="$(pkg_rpm_tool || true)"
+
+    case "$prre_repo_id" in
+        ''|-*|*[!A-Za-z0-9._-]*)
+            return 1
+            ;;
+    esac
+    [ -n "$prre_tool" ] || return 1
+
+    if ! prre_repo_list="$($prre_tool repolist enabled 2>/dev/null)"; then
+        return 1
+    fi
+
+    printf '%s\n' "$prre_repo_list" |
+        awk '{print $1}' |
+        grep -Fxq "$prre_repo_id"
+}
+
+# pkg_ensure_qualcomm_rpm_repository
+# Configure the Qualcomm CentOS 10 aarch64 and noarch RPM repositories.
+# Inputs: none. Output: no machine-readable stdout contract.
+# Returns: 0 when both repositories are already enabled or configured, and
+# 1 when the RPM provider, privileges, architecture, OS version, or
+# configuration fails.
+# Side effects: may create PKG_QCOM_RPM_REPO_FILE and invalidate the RPM
+# metadata-update marker. Existing repository definitions are not overwritten.
+pkg_ensure_qualcomm_rpm_repository() {
+    qrr_os_id="$(pkg_detect_os_id)"
+    qrr_os_version="$(pkg_os_release_value VERSION_ID || true)"
+    qrr_provider="$(pkg_active_provider)"
+    qrr_arch="$(uname -m 2>/dev/null || true)"
+    qrr_tool="$(pkg_rpm_tool || true)"
+
+    case "$qrr_os_id" in
+        centos|rhel)
+            ;;
+        *)
+            pkg_log_info "Qualcomm RPM repository setup is not applicable, os=$qrr_os_id"
+            return 0
+            ;;
+    esac
+
+    if [ "$qrr_provider" != "rpm" ] || [ -z "$qrr_tool" ]; then
+        pkg_log_fail "Qualcomm RPM repository setup requires dnf or yum, os=$qrr_os_id provider=$qrr_provider"
+        return 1
+    fi
+
+    if [ "$qrr_arch" != "aarch64" ]; then
+        pkg_log_fail "Qualcomm RPM repository is available only for aarch64 targets, architecture=${qrr_arch:-unknown}"
+        return 1
+    fi
+
+    if ! qrr_repo_list="$($qrr_tool repolist enabled 2>/dev/null)"; then
+        pkg_log_fail "Could not inspect enabled RPM repositories, tool=$qrr_tool"
+        return 1
+    fi
+    qrr_aarch64_present=0
+    qrr_noarch_present=0
+    if printf '%s\n' "$qrr_repo_list" |
+       awk '{print $1}' |
+       grep -Fxq "qualcomm-linux-aarch64"; then
+        qrr_aarch64_present=1
+    fi
+    if printf '%s\n' "$qrr_repo_list" |
+       awk '{print $1}' |
+       grep -Fxq "qualcomm-linux-noarch"; then
+        qrr_noarch_present=1
+    fi
+
+    if [ "$qrr_aarch64_present" -eq 1 ] &&
+       [ "$qrr_noarch_present" -eq 1 ]; then
+        pkg_log_pass "Qualcomm RPM repositories are already configured"
+        return 0
+    fi
+
+    if [ "$qrr_aarch64_present" -ne "$qrr_noarch_present" ]; then
+        pkg_log_fail "Qualcomm RPM repository configuration is incomplete, aarch64=$qrr_aarch64_present noarch=$qrr_noarch_present"
+        return 1
+    fi
+
+    qrr_os_major=${qrr_os_version%%.*}
+    if [ "$qrr_os_major" != "10" ]; then
+        pkg_log_fail "Automatic Qualcomm RPM repository setup supports CentOS/RHEL major version 10, os=$qrr_os_id version=${qrr_os_version:-unknown}"
+        return 1
+    fi
+
+    if [ -e "$PKG_QCOM_RPM_REPO_FILE" ]; then
+        pkg_log_fail "Qualcomm RPM repository file already exists without both enabled repository IDs, path=$PKG_QCOM_RPM_REPO_FILE"
+        return 1
+    fi
+
+    if ! pkg_can_install; then
+        pkg_log_fail "Qualcomm RPM repository configuration requires root and package auto-install support"
+        return 1
+    fi
+
+    case "$PKG_QCOM_RPM_REPO_FILE" in
+        */*)
+            qrr_repo_dir=${PKG_QCOM_RPM_REPO_FILE%/*}
+            ;;
+        *)
+            qrr_repo_dir=.
+            ;;
+    esac
+    qrr_temp_file="$(mktemp "${TMPDIR:-/tmp}/qcom-linux-fastcv-repo.XXXXXX")" || {
+        pkg_log_fail "Could not allocate a temporary Qualcomm RPM repository file"
+        return 1
+    }
+
+    if ! mkdir -p "$qrr_repo_dir"; then
+        pkg_log_fail "Could not create RPM repository directory, path=$qrr_repo_dir"
+        rm -f "$qrr_temp_file"
+        return 1
+    fi
+
+    {
+        printf '%s\n' \
+            '[qualcomm-linux-aarch64]' \
+            'name=Qualcomm Linux RPM Repository - CentOS Stream 10 (aarch64)' \
+            "baseurl=$PKG_QCOM_RPM_AARCH64_BASEURL" \
+            'enabled=1' \
+            'gpgcheck=0' \
+            'priority=10' \
+            '' \
+            '[qualcomm-linux-noarch]' \
+            'name=Qualcomm Linux RPM Repository - CentOS Stream 10 (noarch)' \
+            "baseurl=$PKG_QCOM_RPM_NOARCH_BASEURL" \
+            'enabled=1' \
+            'gpgcheck=0' \
+            'priority=10'
+    } >"$qrr_temp_file"
+
+    if ! install -m 0644 "$qrr_temp_file" "$PKG_QCOM_RPM_REPO_FILE"; then
+        pkg_log_fail "Could not install Qualcomm RPM repository configuration, path=$PKG_QCOM_RPM_REPO_FILE"
+        rm -f "$qrr_temp_file"
+        return 1
+    fi
+    rm -f "$qrr_temp_file"
+    rm -f "$PKG_RPM_UPDATED_MARK" 2>/dev/null || true
+
+    if ! qrr_repo_list="$($qrr_tool repolist enabled 2>/dev/null)"; then
+        pkg_log_fail "Could not verify enabled Qualcomm RPM repositories, tool=$qrr_tool file=$PKG_QCOM_RPM_REPO_FILE"
+        rm -f "$PKG_QCOM_RPM_REPO_FILE"
+        return 1
+    fi
+    if ! printf '%s\n' "$qrr_repo_list" |
+       awk '{print $1}' |
+       grep -Fxq "qualcomm-linux-aarch64" ||
+       ! printf '%s\n' "$qrr_repo_list" |
+       awk '{print $1}' |
+       grep -Fxq "qualcomm-linux-noarch"; then
+        pkg_log_fail "Qualcomm RPM repository file was created but both repository IDs are not enabled, path=$PKG_QCOM_RPM_REPO_FILE"
+        rm -f "$PKG_QCOM_RPM_REPO_FILE"
+        return 1
+    fi
+
+    pkg_log_pass "Configured Qualcomm RPM repositories, file=$PKG_QCOM_RPM_REPO_FILE"
+    return 0
 }
 
 # Refresh rpm metadata.

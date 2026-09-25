@@ -1,0 +1,40 @@
+metadata:
+  name: FastCV_Module_Functional_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Run a user-sideloaded fastcv_test binary with its matching data folder and validate module results"
+  os:
+    - linux
+  scope:
+    - functional
+    - external-fixture
+
+params:
+  FASTCV_TEST_BINARY: ""
+  FASTCV_TEST_DATA_DIR: ""
+  FASTCV_TEST_TARGETS: "6"
+  FASTCV_TEST_MODULES: "COLORYUV,SCALE,ARITHM,BLUR,TRNS"
+  FASTCV_TEST_LOOPS: "10"
+  FASTCV_TEST_LEVEL: "10"
+  FASTCV_TEST_TIMEOUT: "300"
+  FASTCV_TEST_FUNCTION: ""
+  FASTCV_TEST_OPERATION_MODE: ""
+  FASTCV_TEST_OPERATION_TABLES_ONLY: "0"
+  FASTCV_TEST_SEED: ""
+  FASTCV_TEST_NO_BUFFER_POOL: "0"
+  FASTCV_TEST_PREALLOC_BYTES: ""
+  FASTCV_TEST_OPENCV: "0"
+  FASTCV_TEST_UNIT_ONLY: "0"
+  FASTCV_TEST_PROFILE_ONLY: "0"
+  FASTCV_TEST_EXHAUSTIVE: "0"
+  FASTCV_TEST_RESOLUTION: ""
+  FASTCV_TEST_QDSP_HEAP: "0"
+  FASTCV_TEST_ELEMENT_ALIGNMENT: "0"
+  FASTCV_TEST_CACHE_FLUSH: "0"
+  FASTCV_TEST_WITHOUT_OPERATION_MODE: "0"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/FastCV/FastCV_Module_Functional_Validation
+    - ./run.sh --binary "${FASTCV_TEST_BINARY}" --data-dir "${FASTCV_TEST_DATA_DIR}" --targets "${FASTCV_TEST_TARGETS}" --modules "${FASTCV_TEST_MODULES}" --loops "${FASTCV_TEST_LOOPS}" --level "${FASTCV_TEST_LEVEL}" --timeout "${FASTCV_TEST_TIMEOUT}" --function "${FASTCV_TEST_FUNCTION}" --operation-mode "${FASTCV_TEST_OPERATION_MODE}" --operation-tables-only "${FASTCV_TEST_OPERATION_TABLES_ONLY}" --seed "${FASTCV_TEST_SEED}" --no-buffer-pool "${FASTCV_TEST_NO_BUFFER_POOL}" --prealloc-bytes "${FASTCV_TEST_PREALLOC_BYTES}" --opencv "${FASTCV_TEST_OPENCV}" --unit-only "${FASTCV_TEST_UNIT_ONLY}" --profile-only "${FASTCV_TEST_PROFILE_ONLY}" --exhaustive "${FASTCV_TEST_EXHAUSTIVE}" --resolution "${FASTCV_TEST_RESOLUTION}" --qdsp-heap "${FASTCV_TEST_QDSP_HEAP}" --element-alignment "${FASTCV_TEST_ELEMENT_ALIGNMENT}" --cache-flush "${FASTCV_TEST_CACHE_FLUSH}" --without-operation-mode "${FASTCV_TEST_WITHOUT_OPERATION_MODE}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh FastCV_Module_Functional_Validation.res
