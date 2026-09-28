@@ -6093,6 +6093,143 @@ list_remoteproc_instances() {
 }
 
 ###############################################################################
+# discover_soccp_dt_nodes <output-file>
+# Writes enabled runtime DT node paths whose name, compatible, or firmware-name
+# identifies SOCCP. Returns 0 when at least one unique node is found, otherwise 1.
+###############################################################################
+discover_soccp_dt_nodes() {
+    dsdn_output="$1"
+    dsdn_candidates="$(dirname "$dsdn_output")/soccp_dt_candidates.log"
+    dsdn_previous_root=""
+    dsdn_found=0
+
+    : >"$dsdn_output"
+    : >"$dsdn_candidates"
+
+    for dsdn_root in /proc/device-tree /sys/firmware/devicetree/base; do
+        if [ ! -d "$dsdn_root" ]; then
+            continue
+        fi
+        dsdn_resolved_root=$(readlink -f "$dsdn_root" 2>/dev/null || true)
+        if [ -z "$dsdn_resolved_root" ]; then
+            dsdn_resolved_root="$dsdn_root"
+        fi
+        if [ "$dsdn_resolved_root" = "$dsdn_previous_root" ]; then
+            continue
+        fi
+        dsdn_previous_root="$dsdn_resolved_root"
+
+        find "$dsdn_resolved_root" -type d -iname '*soccp*' \
+            >>"$dsdn_candidates" 2>/dev/null || true
+        find "$dsdn_resolved_root" -type f \
+            \( -name compatible -o -name firmware-name \) \
+            >>"$dsdn_candidates" 2>/dev/null || true
+    done
+
+    while IFS= read -r dsdn_candidate; do
+        if [ -z "$dsdn_candidate" ]; then
+            continue
+        fi
+        if [ -d "$dsdn_candidate" ]; then
+            dsdn_node="$dsdn_candidate"
+            dsdn_identity=$(basename "$dsdn_node")
+        else
+            dsdn_node=$(dirname "$dsdn_candidate")
+            dsdn_identity=$(
+                dt_property_text \
+                    "$dsdn_node" \
+                    "$(basename "$dsdn_candidate")" \
+                    2>/dev/null || true
+            )
+        fi
+
+        if ! printf '%s\n' "$dsdn_identity" | grep -qi 'soccp'; then
+            continue
+        fi
+        dsdn_status=$(dt_property_text "$dsdn_node" status 2>/dev/null || true)
+        case "$dsdn_status" in
+            disabled|fail|failed)
+                continue
+                ;;
+        esac
+        if grep -Fqx "$dsdn_node" "$dsdn_output" 2>/dev/null; then
+            continue
+        fi
+        printf '%s\n' "$dsdn_node" >>"$dsdn_output"
+        dsdn_found=1
+    done <"$dsdn_candidates"
+
+    [ "$dsdn_found" -eq 1 ]
+}
+
+###############################################################################
+# discover_soccp_remoteprocs <inventory-file> <output-file>
+# Filters list_remoteproc_instances output by case-insensitive SOCCP identity.
+# Returns 0 when at least one runtime instance is found, otherwise 1.
+###############################################################################
+discover_soccp_remoteprocs() {
+    dsr_inventory="$1"
+    dsr_output="$2"
+    dsr_found=0
+
+    : >"$dsr_inventory"
+    : >"$dsr_output"
+    list_remoteproc_instances "$dsr_inventory" || true
+
+    while IFS='|' read -r dsr_path dsr_name dsr_firmware dsr_state; do
+        if [ -z "$dsr_path" ]; then
+            continue
+        fi
+        dsr_identity=$(
+            printf '%s %s\n' "$dsr_name" "$dsr_firmware" |
+                tr '[:upper:]' '[:lower:]'
+        )
+        case "$dsr_identity" in
+            *soccp*)
+                printf '%s|%s|%s|%s\n' \
+                    "$dsr_path" \
+                    "$dsr_name" \
+                    "$dsr_firmware" \
+                    "$dsr_state" \
+                    >>"$dsr_output"
+                dsr_found=1
+                ;;
+        esac
+    done <"$dsr_inventory"
+
+    [ "$dsr_found" -eq 1 ]
+}
+
+###############################################################################
+# remoteproc_driver_name <remoteproc-path>
+# Prints the first bound driver found from the class device through its sysfs
+# ancestors. Returns 0 on a match and 1 when no driver link is exposed.
+###############################################################################
+remoteproc_driver_name() {
+    rdn_path="$1"
+    rdn_current=$(readlink -f "$rdn_path/device" 2>/dev/null || true)
+    if [ -z "$rdn_current" ]; then
+        rdn_current=$(readlink -f "$rdn_path" 2>/dev/null || true)
+    fi
+
+    while [ -n "$rdn_current" ] && [ "$rdn_current" != "/" ]; do
+        if [ -e "$rdn_current/driver" ]; then
+            basename "$(readlink -f "$rdn_current/driver")"
+            return 0
+        fi
+        case "$rdn_current" in
+            /sys/devices/*)
+                rdn_current=$(dirname "$rdn_current")
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    return 1
+}
+
+###############################################################################
 # find_image_firmware <firmware-name>
 # Prints the first matching image-provided firmware path under the standard or
 # running-kernel firmware roots, accepting uncompressed, .xz, and .zst files.
