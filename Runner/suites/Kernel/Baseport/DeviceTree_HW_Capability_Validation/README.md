@@ -25,7 +25,7 @@ attached peripherals.
 | `pcie` | Enabled PCIe controller binding plus optional endpoint enumeration evidence |
 | `network` | Enabled Ethernet controller binding, non-virtual network-runtime evidence, and separate Wi-Fi/Bluetooth DT inventory without requiring an external module or link |
 | `multimedia` | Display and GPU binding, audio and camera DT inventory, and optional DRM and ALSA runtime evidence |
-| `remoteproc` | Enabled Qualcomm remoteproc inventory, memory-region and firmware-name evidence, firmware provisioning status, and runtime instance correlation |
+| `remoteproc` | Enabled Qualcomm remoteproc inventory, including SOCCP, memory-region and firmware-name evidence, firmware provisioning status, and runtime instance correlation |
 | `security` | OP-TEE, SCM, TPM, and KVM EL2 DT inventory with optional TEE, TPM, and KVM runtime evidence, distinguishing a likely Qualcomm TEE flow from declared OP-TEE |
 | `health` | Captured relevant DT and controller probe failures plus capability-gated thermal-zone readings and cooling-device exposure. Optional or aggregate zones without a current temperature are reported separately when other readable zones establish runtime health |
 

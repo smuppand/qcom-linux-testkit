@@ -5748,7 +5748,7 @@ dt_validate_remoteproc_inventory() {
     : >"$dvri_node_file"
     : >"$dvri_runtime_file"
 
-    if ! dt_list_compatible_nodes 'qcom,.*(adsp|cdsp|gpdsp|mpss|wpss|remoteproc)' regex >"$dvri_node_file"; then
+    if ! dt_list_compatible_nodes 'qcom,.*(adsp|cdsp|gpdsp|mpss|soccp|wpss|remoteproc)' regex >"$dvri_node_file"; then
         test_result_record "SKIP" "No enabled Qualcomm remoteproc nodes were discovered"
         return 0
     fi
