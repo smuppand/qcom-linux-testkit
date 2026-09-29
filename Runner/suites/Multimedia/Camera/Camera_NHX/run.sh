@@ -116,7 +116,7 @@ Options:
   --fit-dtb NAME    Select this FIT DTB compatibility name for the next boot.
                    Camera_NHX supports camx, which is the --overlay default.
                    This option requires --overlay.
-  --json JSON_FILE NHX JSON file to pass to nhx.sh.
+  --json JSON_FILE NHX JSON file to pass to the selected NHX launcher.
                      Can be absolute, relative to Camera_NHX/, or relative
                      to target folder when --target is provided.
   --target TARGET Target folder name: Kodiak, Lemans, Monaco, Talos.
@@ -315,12 +315,20 @@ fi
 
 NHX_RUNNER="$(command -v nhx.sh 2>/dev/null || true)"
 if [ -n "$NHX_RUNNER" ] && [ -f "$NHX_RUNNER" ] && [ -x "$NHX_RUNNER" ]; then
-  NHX_RUNNER_SOURCE="PATH"
-elif [ -f "/usr/libexec/camx/nhx.sh" ] && [ -x "/usr/libexec/camx/nhx.sh" ]; then
+  NHX_RUNNER_SOURCE="PATH-nhx.sh"
+else
+  NHX_RUNNER="$(command -v camera-nhx 2>/dev/null || true)"
+fi
+
+if [ -z "$NHX_RUNNER_SOURCE" ] && \
+  [ -n "$NHX_RUNNER" ] && [ -f "$NHX_RUNNER" ] && [ -x "$NHX_RUNNER" ]; then
+  NHX_RUNNER_SOURCE="PATH-camera-nhx"
+elif [ -z "$NHX_RUNNER_SOURCE" ] && \
+  [ -f "/usr/libexec/camx/nhx.sh" ] && [ -x "/usr/libexec/camx/nhx.sh" ]; then
   NHX_RUNNER="/usr/libexec/camx/nhx.sh"
   NHX_RUNNER_SOURCE="packaged-libexec"
-else
-  log_skip "$TESTNAME SKIP nhx.sh not found in PATH or /usr/libexec/camx"
+elif [ -z "$NHX_RUNNER_SOURCE" ]; then
+  log_skip "$TESTNAME SKIP NHX launcher not found, provide executable nhx.sh or camera-nhx in PATH, or /usr/libexec/camx/nhx.sh"
   echo "$TESTNAME SKIP" >"$RES_FILE"
   exit 0
 fi
@@ -554,10 +562,10 @@ if [ -n "$CAM_SERVER_SERVICE" ]; then
     "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "$CAM_SERVER_SERVICE" || true
 
   if systemd_service_is_active "$CAM_SERVER_SERVICE"; then
-    log_info "Stopping active camera server before nhx.sh"
+    log_info "Stopping active camera server before NHX launcher"
 
     if ! systemd_service_stop_safe "$CAM_SERVER_SERVICE"; then
-      log_fail "$TESTNAME FAIL - unable to stop active $CAM_SERVER_SERVICE before nhx.sh"
+      log_fail "$TESTNAME FAIL - unable to stop active $CAM_SERVER_SERVICE before NHX launcher"
       echo "$TESTNAME FAIL" >"$RES_FILE"
       exit 0
     fi
@@ -621,13 +629,13 @@ if [ -n "$NHX_JSON" ]; then
   NHX_JSON_ARG="$(nhx_stage_json_for_launcher "$SCRIPT_DIR" "$NHX_JSON_RESOLVED" "$NHX_TARGET" 2>/dev/null || true)"
 
   if [ -z "$NHX_JSON_ARG" ]; then
-    log_skip "$TESTNAME SKIP failed to stage NHX JSON for nhx.sh: $NHX_JSON_RESOLVED"
+    log_skip "$TESTNAME SKIP failed to stage NHX JSON for selected launcher: $NHX_JSON_RESOLVED"
     echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
   fi
 
-  log_info "Launching nhx.sh with JSON source: $NHX_JSON_RESOLVED"
-  log_info "Launching nhx.sh with JSON argument: $NHX_JSON_ARG"
+  log_info "Launching NHX with JSON source: $NHX_JSON_RESOLVED"
+  log_info "Launching NHX with JSON argument: $NHX_JSON_ARG"
 
   if command -v run_cmd_live_to_log >/dev/null 2>&1; then
     run_cmd_live_to_log "$RUN_LOG" "$NHX_RUNNER" "$NHX_JSON_ARG"
@@ -651,7 +659,7 @@ if [ -n "$NHX_JSON" ]; then
     wait "$TEEPID" 2>/dev/null || true
   fi
 else
-  log_info "Launching nhx.sh with default SoC-specific JSON"
+  log_info "Launching NHX with default SoC-specific JSON"
 
   if command -v run_cmd_live_to_log >/dev/null 2>&1; then
     run_cmd_live_to_log "$RUN_LOG" "$NHX_RUNNER"
@@ -680,7 +688,7 @@ fi
 # Restore camera server state after NHX
 # -----------------------------------------------------------------------------
 if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ]; then
-  log_info "Restoring camera server after nhx.sh: $CAM_SERVER_SERVICE"
+  log_info "Restoring camera server after NHX launcher: $CAM_SERVER_SERVICE"
   if systemd_service_start_safe "$CAM_SERVER_SERVICE"; then
     CAM_SERVER_STOPPED_FOR_TEST=0
     CAM_SERVER_TS_AFTER_START="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -693,7 +701,7 @@ if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ]; then
     systemd_service_stdout_since "Camera server AFTER restore (stdout since restore marker)" \
       "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "$CAM_SERVER_SERVICE" || true
   else
-    log_warn "Failed to restore camera server after nhx.sh: $CAM_SERVER_SERVICE"
+    log_warn "Failed to restore camera server after NHX launcher: $CAM_SERVER_SERVICE"
   fi
 else
   log_info "Camera server state was not changed for NHX, skipping restore"
@@ -753,7 +761,7 @@ TOTAL_BYTES=0
   echo "========================================"
   echo "$TESTNAME Summary"
   echo "Timestamp: $TS"
-  echo "nhx.sh exit code: $NHX_RC"
+  echo "NHX launcher exit code: $NHX_RC"
   echo "NHX runner: $NHX_RUNNER"
   echo "NHX runner source: $NHX_RUNNER_SOURCE"
   echo "NHX JSON requested: ${NHX_JSON:-<default>}"

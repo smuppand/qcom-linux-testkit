@@ -661,7 +661,7 @@ nhx_resolve_json_file() {
 }
 
 # Stage resolved NHX JSON into the path expected by the NHX launcher.
-# nhx.sh expects an argument without ".json" and internally looks under:
+# NHX launchers expect an argument without ".json" and internally look under:
 # /etc/camera/test/NHX/${JSON_FILE}.json
 #
 # Usage:
