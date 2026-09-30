@@ -16,7 +16,8 @@ Only these binaries are executed, in this order (anything else is ignored):
 
 ## Gating policy
 
-* **Service check (early gate):** If `urm.service` is **not active**, the test **SKIPs overall** and exits.
+* **Service check (early gate):** The selected service (`SERVICE_NAME`, default `urm.service`) must be applicable and active. A genuinely absent/non-applicable service is **overall SKIP**; an applicable service that cannot be started/restarted is **overall FAIL**.
+* **Required service restart:** Before the first runnable suite only, the runner restarts the selected service so it observes the staged test nodes. Restart failure or failure to become active is **overall FAIL** with service evidence retained in the log directory.
 * **Per‑suite SKIP conditions (neutral):**  
   * Missing binary → **SKIP that suite**, continue.  
   * Missing base configs → **SKIP that suite**, continue.  
@@ -33,9 +34,14 @@ Only these binaries are executed, in this order (anything else is ignored):
 ## Pre‑checks
 
 ### 1) Service
-The runner uses the repo helper `check_systemd_services()` to verify **`urm.service`** is active.
-- On failure: overall **SKIP** (ends early).  
-- Override service name: `SERVICE_NAME=your.service ./run.sh`
+The runner uses explicit `systemd_service_exists()` and `systemd_service_is_active()` predicates to verify the selected systemd unit. It does not rely on legacy aggregate service helpers that may treat missing `systemctl` or missing units as success. The default service is **`urm.service`** and it can be overridden with `SERVICE_NAME=your.service ./run.sh`.
+
+Runtime contract:
+- If the selected service is genuinely absent/non-applicable → overall **SKIP**.
+- If the selected service is applicable but cannot be started → overall **FAIL**.
+- Before the first runnable suite only, the runner performs a required `systemctl restart "$SERVICE_NAME"`.
+- If the required restart fails, or the service does not become active within the bounded wait → overall **FAIL**.
+- Restart diagnostics are retained under the run log directory, for example `service_restart.log`, `service_restart_status.log`, and when available `service_restart_journal.log`.
 
 ### 2) Config presence
 Suites that parse configs require **all** of these base config trees:
@@ -82,27 +88,64 @@ Usage: ./run.sh [--all] [--bin <name|absolute>] [--list] [--timeout SECS]
 - `--all` (default): run all approved suites.  
 - `--bin NAME|PATH`: run a single approved suite.  
 - `--list`: print approved list and presence coverage, then exit.  
-- `--timeout SECS`: default per‑binary timeout **if** `run_with_timeout()` helper exists (else ignored).
+- `--timeout SECS`: default per‑binary timeout for suites without a suite-specific timeout.
 
-Per‑suite default timeouts (if helper is present):
+Per‑suite default timeouts enforced through the opt-in managed timeout helper:
 - `UrmComponentTests`: **1800s**
 - `UrmIntegrationTests`: **2400s**
 - others: **1200s** (default)
 
 ---
 
+## Timeout helper contract
+
+`run.sh` uses the opt-in `run_with_managed_timeout()` helper from `functestlib.sh` instead of changing the existing shared `run_with_timeout()` behavior. This keeps legacy callers untouched while reusing generic timeout lifecycle handling. URM keeps only suite-specific behavior locally: `run_cmd_with_timeout_no_lock_fd()` sets `MANAGED_TIMEOUT_PRE_EXEC_HOOK=close_lock_fd_in_child` so the command, watcher, and watcher `sleep` close inherited FD 9 before doing work, preventing background timeout processes from retaining the flock after the parent exits.
+
+Function contract for `run_cmd_with_timeout_no_lock_fd TIMEOUT_SECS COMMAND [ARG...]`:
+
+- **Arguments:**
+  - `TIMEOUT_SECS`: positive integer enables timeout enforcement.
+  - Empty, zero, or non-numeric timeout runs `COMMAND` directly without spawning a watcher.
+  - `COMMAND [ARG...]`: binary and arguments to execute.
+- **Return statuses:**
+  - command exit status on normal completion.
+  - `124` when the managed-timeout watcher's deadline expires.
+  - other signal-derived statuses are preserved when they were not caused by this helper's timeout watcher.
+- **Spawned processes when timeout is enabled:**
+  - one command process,
+  - one watcher subshell,
+  - one watcher `sleep` process.
+- **Retained files:**
+  - temporary watcher sleep PID and timeout marker files are created by `run_with_managed_timeout()` under the run log directory while the command is active.
+  - these files are removed before the managed helper returns; URM's `cleanup()` path owns removal on interruption or termination using the exposed `MANAGED_TIMEOUT_*` state.
+- **Timeout logging:**
+  - when the watcher expires, the suite log records `[TIMEOUT] command exceeded <seconds>s: <command>`.
+  - `run_one()` reports this as `TIMEOUT` / `FAIL` instead of ambiguous `UNKNOWN RC=143` or `UNKNOWN RC=137`.
+
+---
+
+## Locking and diagnostics
+
+The runner keeps `flock` as the primary concurrency guard because URM tests and the service use shared system resources. Cleanup explicitly unlocks and closes FD 9. If `flock` is unavailable, a simple `mkdir` lock directory fallback is used and removed during cleanup.
+
+When `flock` acquisition fails, diagnostics avoid broad `run.sh` process-name matching and prefer:
+
+- `lslocks` entries for `/tmp/userspace-resource-manager.lock`,
+- `fuser` output for processes with the lock file open,
+- `/proc/*/fd` references to the lock file when available.
+
+---
+
 ## Output layout
 
-- **Overall status file:** `./userspace-resource-manager.res` → `PASS` / `FAIL` / `SKIP`
+- **Overall status file:** `./userspace-resource-manager.res` → `PASS` / `FAIL` / `SKIP`. The runner removes any stale result at startup and writes `FAIL` on INT/TERM before cleanup so LAVA cannot publish an old result from a previous run.
 - **Logs directory:** `./logs/userspace-resource-manager-YYYYMMDD-HHMMSS/`
   - Per‑suite logs: `SUITE.log`
   - Per‑suite result markers: `SUITE.res` (`PASS`/`FAIL`/`SKIP`)
   - Coverage summaries: `coverage.txt`, `missing_bins.txt`, `coverage_counts.env`
   - System snapshot: `dmesg_snapshot.log`
+  - Service restart evidence when applicable: `service_restart.log`, `service_restart_status.log`, `service_restart_journal.log`
 - **Symlink to latest:** `./logs/userspace-resource-manager-latest`
-
-**Parsing heuristics:** a suite is considered PASS if the binary exits 0 **or** its log contains
-`Run Successful`, `executed successfully`, or `Ran Successfully`. Strings like `Assertion failed`, `Terminating Suite`, `Segmentation fault`, `Backtrace`, or `fail/failed` mark **FAIL**.
 
 ---
 
@@ -153,17 +196,19 @@ URM_TEST_NODES_DIR=/opt/rt/usr/share/urm ./run.sh
 
 ## Exit status
 
-The script writes the overall result to `userspace-resource-manager.res`. The **process exit code is 0** in case of SUCCESS, while the **exit code is 1** in case of overall FAILURE.
+The script removes any stale `userspace-resource-manager.res` at startup, writes the final overall result before exit, and writes `FAIL` if interrupted or terminated. The **process exit code is 0** in case of SUCCESS, while the **exit code is 1** in case of overall FAILURE.
 
 ---
 
 ## Troubleshooting
 
-- **Overall SKIP immediately** → service inactive. Check `systemctl status urm.service`.
+- **Overall SKIP immediately** → selected service appears absent/non-applicable, or no suite is runnable.
+- **Overall FAIL during service setup/restart** → selected service is applicable but failed to start/restart; inspect `logs/.../service_*` files.
 - **Suite SKIP (config)** → confirm required files exist under `common/`, `tests/configs` and `tests/nodes` (see lists above).
 - **Suite SKIP (missing bin)** → verify the binary is installed and executable under `/usr/bin`.
 - **Suite FAIL** → inspect `logs/.../SUITE.log` for the first failure pattern or assertion.
-- **Very long runs** → a `run_with_timeout` helper (if available in your repo toolchain) will be used automatically.
+- **Very long runs** → the opt-in managed timeout helper enforces the configured per-suite deadline and reports helper-expired timeouts as `TIMEOUT` / rc `124`.
+- **Unexpected concurrent-run SKIP** → inspect the emitted lock diagnostics (`lslocks`, `fuser`, `/proc/*/fd`) to identify any real lock holder.
 
 ## License
 - SPDX-License-Identifier: BSD-3-Clause
