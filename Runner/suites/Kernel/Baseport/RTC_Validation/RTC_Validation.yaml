@@ -1,0 +1,25 @@
+metadata:
+  name: RTC_Validation
+  format: "Lava-Test Test Definition 1.0"
+  description: "Dynamically validate Linux RTC time progression, wake-alarm expiration, and guarded time-setting support"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  RTC_DEVICE: "auto"
+  RTC_READ_DELAY: "2"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Baseport/RTC_Validation
+    - >-
+      ./run.sh
+      --device "${RTC_DEVICE:-auto}"
+      --read-delay "${RTC_READ_DELAY:-2}"
+      --alarm-test
+      --time-set-test
+      --allow-write || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh RTC_Validation.res
