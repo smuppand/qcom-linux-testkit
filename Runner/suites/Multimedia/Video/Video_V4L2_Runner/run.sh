@@ -38,6 +38,11 @@ fi
 # shellcheck disable=SC1091
 . "$TOOLS/lib_video.sh"
 
+if [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+fi
+
 TESTNAME="Video_V4L2_Runner"
 RES_FILE="./${TESTNAME}.res"
 
@@ -749,6 +754,45 @@ log_info "Detected platform: $plat"
 VIDEO_STACK="$(video_normalize_stack "$VIDEO_STACK")"
 pre_stack="$(video_stack_status "$plat")"
 log_info "Current video stack (pre): $pre_stack"
+
+VIDEO_OS_ID="unknown"
+if command -v pkg_detect_os_id >/dev/null 2>&1; then
+    VIDEO_OS_ID="$(pkg_detect_os_id 2>/dev/null || true)"
+elif [ -r /etc/os-release ]; then
+    VIDEO_OS_ID="$(
+        sed -n 's/^ID=//p' /etc/os-release |
+            sed -n '1p' |
+            tr -d '"' |
+            tr '[:upper:]' '[:lower:]'
+    )"
+fi
+
+if [ "$VIDEO_STACK" = "downstream" ] &&
+   [ "$VIDEO_OS_ID" = "centos" ]; then
+    for required_helper in \
+        pkg_provider_init \
+        pkg_ensure_optional_package_set_present; do
+        if ! command -v "$required_helper" >/dev/null 2>&1; then
+            log_fail "$TESTNAME FAIL - required video overlay package helper is unavailable: $required_helper"
+            printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+            exit 0
+        fi
+    done
+
+    pkg_provider_init
+
+    if ! pkg_ensure_optional_package_set_present \
+        video-overlay \
+        none \
+        auto \
+        --overlay; then
+        log_fail "$TESTNAME FAIL - failed to ensure Qualcomm video overlay package set"
+        printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+        exit 0
+    fi
+
+    log_pass "Qualcomm video overlay package set is ready"
+fi
 
 # Kodiak + upstream → install backup firmware to /lib/firmware before switching
 if [ "$plat" = "kodiak" ]; then

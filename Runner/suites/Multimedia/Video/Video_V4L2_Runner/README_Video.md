@@ -156,6 +156,11 @@ cd <target_path>/Runner
 
 > **Default remains unchanged.** If you omit all `--ko-*` flags, the runner uses the system module tree and `modinfo`/`modprobe` resolution only.
 
+On CentOS Stream 10, selecting `--stack downstream`, `--stack overlay`, or the
+overlay half of `--stack both` ensures EPEL and both Qualcomm RPM repositories,
+refreshes DNF metadata, and installs the documented `iris-vpu` overlay package.
+Yocto and other image-managed systems continue to use image-provided packages.
+
 ---
 
 ## Pre‑Flight: Rootfs Size & Network
@@ -350,4 +355,3 @@ export VIDEO_INTER_TEST_SLEEP=3
   Ensure time is sane (TLS), network is reachable, and provide Wi‑Fi creds via env or `ssid_list.txt`. The downloader uses BusyBox‑compatible flags with retries and a final TLS‑lenient attempt if needed. When the network remains unreachable, the runner **SKIPs** decode cases.
 
 ---
-
