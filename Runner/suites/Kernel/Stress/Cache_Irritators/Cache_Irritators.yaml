@@ -1,0 +1,25 @@
+metadata:
+  name: Cache_Irritators
+  format: "Lava-Test Test Definition 1.0"
+  description: "Exercise whole-cache, per-level cache, and TLB shootdown workloads with stress-ng"
+  os:
+    - linux
+  scope:
+    - functional
+    - performance
+
+params:
+  MODE: "nominal"
+  WORKERS: "1"
+  OPERATIONS: "auto"
+  TIMEOUT: "120"
+  CACHE_OPTIONS: "auto"
+  CACHE_SIZE: "auto"
+  CACHE_WAYS: "auto"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Kernel/Stress/Cache_Irritators
+    - ./run.sh --mode "${MODE}" --workers "${WORKERS}" --operations "${OPERATIONS}" --timeout "${TIMEOUT}" --cache-options "${CACHE_OPTIONS}" --cache-size "${CACHE_SIZE}" --cache-ways "${CACHE_WAYS}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Cache_Irritators.res
