@@ -276,16 +276,19 @@ video_list_runtime_blocks() {
 # -------------------------------------------------------------------------
 video_dump_stack_state() {
     when="$1" # pre|post
+    probe_mode="${2:-full}"
 
     log_info "Modules ($when):"
     log_info "lsmod (iris/venus):"
     "$LSMOD" 2>/dev/null | awk 'NR==1 || $1 ~ /^(iris_vpu|qcom_iris|venus_core|venus_dec|venus_enc)$/ {print}'
 
-    video_modprobe_dryrun qcom_iris
-    video_modprobe_dryrun iris_vpu
-    video_modprobe_dryrun venus_core
-    video_modprobe_dryrun venus_dec
-    video_modprobe_dryrun venus_enc
+    if [ "$probe_mode" = "full" ]; then
+        video_modprobe_dryrun qcom_iris
+        video_modprobe_dryrun iris_vpu
+        video_modprobe_dryrun venus_core
+        video_modprobe_dryrun venus_dec
+        video_modprobe_dryrun venus_enc
+    fi
 
     log_info "runtime blocks:"
     video_list_runtime_blocks
@@ -974,9 +977,13 @@ video_hot_switch_modules() {
                     rc=1
                 fi
 
-                log_info "Kodiak: invoking firmware swap/reload helper (if VIDEO_FW_DS provided)"
-                if ! video_kodiak_swap_and_reload "${VIDEO_FW_DS}"; then
-                    log_warn "Kodiak: swap/reload helper reported failure (continuing)"
+                if [ -n "${VIDEO_FW_DS:-}" ] && [ -f "$VIDEO_FW_DS" ]; then
+                    log_info "Kodiak: applying the explicit downstream firmware override"
+                    if ! video_kodiak_swap_and_reload "$VIDEO_FW_DS"; then
+                        log_warn "Kodiak: firmware override swap/reload reported failure"
+                    fi
+                else
+                    log_info "Kodiak: using upstream image-provided firmware for the downstream stack"
                 fi
                 video_usleep "${MOD_SETTLE_SLEEP}"
 
@@ -1456,22 +1463,42 @@ video_ensure_clips_present_or_fetch() {
     fi
 
     if command -v ensure_network_online >/dev/null 2>&1; then
-        if ! ensure_network_online; then
-            log_warn "Network offline/limited; cannot fetch media bundle"
-            rm -f "$tmp_list" 2>/dev/null || true
-            return 2
-        fi
+        ensure_network_online
+        video_network_rc=$?
+
+        case "$video_network_rc" in
+            0)
+                ;;
+            1)
+                log_warn "No configured IP route is available, cannot fetch media bundle"
+                rm -f "$tmp_list" 2>/dev/null || true
+                return 2
+                ;;
+            2)
+                log_info "Generic reachability is inconclusive, trying the configured media endpoint"
+                ;;
+        esac
     fi
 
     if [ -n "$tu" ]; then
         log_info "Attempting fetch via TAR_URL=$tu"
-        if extract_tar_from_url "$tu"; then
-            rm -f "$tmp_list" 2>/dev/null || true
-            return 0
-        fi
-        log_warn "Fetch/extract failed for TAR_URL"
+        extract_tar_from_url "$tu"
+        video_fetch_rc=$?
         rm -f "$tmp_list" 2>/dev/null || true
-        return 1
+
+        case "$video_fetch_rc" in
+            0)
+                return 0
+                ;;
+            2)
+                log_warn "Media endpoint is unavailable for this environment"
+                return 2
+                ;;
+            *)
+                log_warn "Fetch/extract failed for TAR_URL"
+                return 1
+                ;;
+        esac
     fi
 
     log_warn "No TAR_URL provided; cannot fetch media bundle."
@@ -1553,12 +1580,24 @@ video_prepare_app() {
     return 1
 }
 
+video_iris_output_has_failure() {
+    # Return success when iris_v4l2_test emitted a conclusive failure marker.
+    output_file="$1"
+
+    [ -r "$output_file" ] || return 1
+
+    grep -Eiq \
+        '^[[:space:]]*(ERROR|FAIL)([[:space:]:!]|$)|^[[:space:]]*\[(ERROR|FAIL)\]|^[[:space:]]*FAILED!([[:space:]]|$)|Testcase(\[[^]]*\])?[[:space:]]*:[[:space:]]*Failed([[:space:]]|$)' \
+        "$output_file"
+}
+
 video_run_once() {
     cfg="$1"
     logf="$2"
     tmo="$3"
     suc="$4"
     lvl="$5"
+    rc=0
 
     video_prepare_app || true
 
@@ -1578,29 +1617,43 @@ video_run_once() {
             :
         else
             rc=$?
-            if [ "$rc" -eq 124 ] 2>/dev/null; then
-                log_fail "[run] timeout after ${tmo}s"
-            else
-                log_fail "[run] $VIDEO_APP exited rc=$rc"
-            fi
-            printf 'END-RUN rc=%s\n' "$rc" >>"$logf"
-            grep -Eq "$suc" "$logf"
-            return $?
         fi
     else
         if "$VIDEO_APP" --config "$cfg" --loglevel "$lvl" >>"$logf" 2>&1; then
             :
         else
             rc=$?
-            log_fail "[run] $VIDEO_APP exited rc=$rc (no timeout enforced)"
-            printf 'END-RUN rc=%s\n' "$rc" >>"$logf"
-            grep -Eq "$suc" "$logf"
-            return $?
         fi
     fi
 
-    printf 'END-RUN rc=0\n' >>"$logf"
-    grep -Eq "$suc" "$logf"
+    printf 'END-RUN rc=%s\n' "$rc" >>"$logf"
+
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ] 2>/dev/null; then
+            log_fail "[run] timeout after ${tmo}s"
+        elif video_have_run_with_timeout; then
+            log_fail "[run] $VIDEO_APP exited rc=$rc"
+        else
+            log_fail "[run] $VIDEO_APP exited rc=$rc (no timeout enforced)"
+        fi
+        printf 'VALIDATION=FAIL reason=nonzero-exit\n' >>"$logf"
+        return "$rc"
+    fi
+
+    if video_iris_output_has_failure "$logf"; then
+        log_fail "[run] $VIDEO_APP reported an explicit ERROR or FAIL marker"
+        printf 'VALIDATION=FAIL reason=explicit-failure-marker\n' >>"$logf"
+        return 1
+    fi
+
+    if ! grep -Eq "$suc" "$logf"; then
+        log_fail "[run] $VIDEO_APP did not report the required success marker"
+        printf 'VALIDATION=FAIL reason=success-marker-missing\n' >>"$logf"
+        return 1
+    fi
+
+    printf 'VALIDATION=PASS\n' >>"$logf"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
