@@ -69,7 +69,7 @@ Relaunch mode
 
 ./run.sh --allow-relaunch
 
-This mode enables an explicit recovery attempt for a broken systemd-managed Weston runtime.
+This mode enables an explicit recovery attempt for a broken or absent Weston runtime. On desktop distributions without a packaged `weston.service`, the shared helper starts Weston directly on the dynamically selected DRM device. CentOS installs `seatd` with the Weston runtime package set and starts `seatd.service` when the direct DRM launcher needs a seat provider.
 
 In this mode, if Weston runtime is unhealthy, the testcase may:
 
@@ -79,7 +79,7 @@ stop weston.service
 
 reset failed systemd state
 
-restart the systemd-managed Weston runtime
+restart the systemd-managed Weston runtime or launch the validated direct DRM runtime
 
 re-check Weston service state, runtime directory, Wayland socket, and compositor process
 

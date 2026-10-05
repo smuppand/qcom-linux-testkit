@@ -508,7 +508,7 @@ if [ "$OS_ID" = "centos" ]; then
     if ! CHECK_DEPS_RECOVER="$CHECK_DEPS_RECOVER" \
         CHECK_DEPS_NO_EXIT=1 \
         check_dependencies kmscube; then
-        log_skip "$TESTNAME SKIP - required command kmscube is absent from the CentOS image"
+        log_skip "$TESTNAME SKIP - kmscube is unavailable from the configured CentOS repositories, publish or provision the kmscube package"
         echo "$TESTNAME SKIP" >"$RES_FILE"
         exit 0
     fi

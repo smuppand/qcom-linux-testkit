@@ -2,6 +2,8 @@
 
 Runs `weston-smoke` under a working Wayland session (existing Weston or private Weston started by helpers) and validates that the client actually exercised Wayland.
 
+On CentOS, the shared dependency path provides `weston`, `weston-demo`, `seatd`, and `egl-utils`. With `--allow-relaunch`, the test starts `seatd.service` when needed, launches Weston on the selected DRM device, and adopts the generated Wayland socket.
+
 ## What this test validates
 
 - A connected DRM display exists (otherwise SKIP)
@@ -23,4 +25,3 @@ Runs `weston-smoke` under a working Wayland session (existing Weston or private 
 - `weston-smoke.res` contains `weston-smoke PASS/FAIL/SKIP`
 - `weston-smoke_run.log` contains WAYLAND_DEBUG output when protocol validation is enabled
 - `weston-smoke_stdout_*.log` contains extra logs (including screenshot helper output)
-

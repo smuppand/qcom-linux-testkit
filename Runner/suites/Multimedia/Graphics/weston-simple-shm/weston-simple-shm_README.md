@@ -74,6 +74,8 @@ Before running the testcase, ensure that:
 - the target has the required Wayland runtime environment
 - the display stack is already brought up on the system
 
+On CentOS, the shared dependency path provides `weston`, `weston-demo`, `seatd`, and `egl-utils`. With `--allow-relaunch`, the test starts `seatd.service` when needed, launches Weston on the selected DRM device, and adopts the generated Wayland socket.
+
 ---
 
 ## Test Location

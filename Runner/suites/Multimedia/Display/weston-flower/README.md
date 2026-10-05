@@ -2,6 +2,8 @@
 
 Runs `weston-flower` under a working Wayland session (existing Weston or private Weston started by helpers) and validates that the client actually exercised Wayland.
 
+On CentOS, the shared dependency path provides `weston`, `weston-demo`, `seatd`, and `egl-utils`. With `--allow-relaunch`, the test starts `seatd.service` when needed, launches Weston on the selected DRM device, and adopts the generated Wayland socket.
+
 ## What this test validates
 
 - A connected DRM display exists (otherwise SKIP)

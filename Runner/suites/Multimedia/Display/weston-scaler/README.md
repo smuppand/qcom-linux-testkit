@@ -2,6 +2,8 @@
 
 Runs `weston-scaler` as a Wayland client and validates it actually ran in a usable Wayland session.
 
+On CentOS, the shared dependency path provides `weston`, `weston-demo`, `seatd`, and `egl-utils`. With `--allow-relaunch`, the test starts `seatd.service` when needed, launches Weston on the selected DRM device, and adopts the generated Wayland socket.
+
 ## What this test validates
 
 1. **Display presence (DRM connector)**  

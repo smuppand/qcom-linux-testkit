@@ -16,7 +16,7 @@ This suite validates OpenGL ES 2.0 through the `weston-simple-egl` Wayland clien
 
 ## Prerequisites
 
-Yocto images must provide the required client and Weston runtime. On Ubuntu and Debian, the shared package provider ensures the mapped Weston and graphics packages.
+Yocto images must provide the required client and Weston runtime. Debian and Ubuntu recover Weston from `weston`. CentOS recovers the compositor from `weston`, the example clients from `weston-demo`, the DRM seat provider from `seatd`, and `/usr/bin/eglinfo` from `egl-utils`. Overlay mode first accepts a complete image-provided Qualcomm EGL, GBM, and KGSL runtime. When graphics recovery is needed, it uses the distro-specific package family and repository policy.
 
 - `weston-simple-egl` (Binary Available in /usr/bin) be default
 - Write access to root filesystem (for environment setup)
@@ -24,11 +24,13 @@ Yocto images must provide the required client and Weston runtime. On Ubuntu and 
 ## Desktop distribution modes
 
 - `./run.sh --base` selects the upstream MSM/freedreno stack and ensures the OS-specific Mesa package set.
-- `./run.sh --overlay` selects the Qualcomm KGSL/Adreno stack and ensures the OS-specific overlay package set. Package or DKMS changes can require a reboot before validation continues.
-- Debian uses `libgbm-msm1`, while Ubuntu uses `libgbm-msm`. Set `GPU_OVERLAY_GBM_PACKAGE` only when an explicit override is required.
+- `./run.sh --overlay` selects the Qualcomm KGSL/Adreno stack. A ready runtime is reused without package changes. Otherwise, the focused EGL/GLES package set is recovered and DKMS changes can require a reboot before validation continues.
+- Debian uses the `adreno-*` packages from `qli-staging`. Ubuntu uses the `qcom-adreno-*` packages and existing image APT sources, never Debian `qli` or `qli-staging`. CentOS uses the `adreno-*` RPMs from the configured Qualcomm RPM repositories.
+- The MSM GBM package is resolved from the distro package map: `libgbm-msm1` on Debian, `libgbm-msm` on Ubuntu, and `gbm-msm-backend` on CentOS. Set `GPU_OVERLAY_GBM_PACKAGE` only when an explicit override is required.
 - Desktop automatic mode runs `weston-simple-egl -b` when the client advertises that option. This is an unsynchronized EGL throughput benchmark with a minimum functional FPS gate, not a display-refresh measurement.
 - Yocto, other image-based runs, and `--strict-refresh-fps` keep the compositor-synchronized client mode. FPS evidence remains required by default. Use `--no-require-fps` only when connectivity and EGL execution are the intended coverage.
 - On Ubuntu, the test reuses an active GNOME Wayland session when Weston is not running. A root-launched test executes the client as the Wayland socket owner without stopping or restarting GDM.
+- On desktop distributions without a packaged `weston.service`, `--allow-relaunch` starts Weston directly on the dynamically selected DRM device and validates the resulting Wayland socket before launching the client. On CentOS, the shared runtime preparation starts the packaged `seatd.service` when needed. It does not enable the service persistently.
 - GDM can throttle an unfocused greeter client. That path validates compositor connectivity and EGL startup while recording, but not performance-gating, any FPS samples.
 
 Examples:
