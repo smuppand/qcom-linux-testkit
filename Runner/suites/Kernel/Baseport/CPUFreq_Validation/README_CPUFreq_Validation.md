@@ -1,71 +1,80 @@
-# CPUFreq_Validation
+# CPUFreq validation
 
-## Overview
+`CPUFreq_Validation` validates CPU frequency policy topology, the advertised
+frequency/OPP table, and functional transitions at every exposed frequency.
+It uses only public CPUFreq sysfs interfaces and is portable across Yocto,
+Debian, Ubuntu, and CentOS. The runner never installs packages.
 
-The `CPUFreq_Validation` test validates the CPU frequency scaling capabilities of a system using the Linux `cpufreq` subsystem. It verifies the ability to set and reflect CPU frequencies across shared policy domains (e.g., clusters of CPUs sharing frequency control).
+## Coverage
 
-This test is designed to be **SoC-agnostic**, supporting platforms with per-policy frequency management (e.g., Qualcomm SoCs with `policy0`, `policy4`, etc.).
+For every `/sys/devices/system/cpu/cpufreq/policy*` directory, the suite:
 
-## Test Goals
+- verifies that `related_cpus` or `affected_cpus` is populated;
+- checks that each related CPU resolves to the same policy through its
+  per-CPU `cpufreq` link;
+- inventories the scaling driver, current governor, and CPU frequency range;
+- validates all entries from `scaling_available_frequencies` and optional
+  `scaling_boost_frequencies` against `cpuinfo_min_freq` and
+  `cpuinfo_max_freq`;
+- compares the policy frequency table with available `rate_hz` entries from
+  the public OPP debugfs interface when the matching CPU OPP directory exists;
+- falls back to the CPU minimum and maximum endpoints when a driver does not
+  expose a discrete frequency table;
+- clamps `scaling_min_freq` and `scaling_max_freq` to each advertised point;
+- validates `scaling_cur_freq` or `cpuinfo_cur_freq` within a bounded wait and
+  tolerance; and
+- scans the captured kernel log for CPUFreq and OPP errors.
 
-- Ensure all cpufreq policies are present and functional
-- Iterate through all available frequencies and validate correct scaling
-- Ensure that CPU governors can be set to `userspace`
-- Provide robust reporting per policy (e.g., `CPU0-3 [via policy0] = PASS`)
-- Avoid flaky failures in CI by using retries and proper checks
+Before changing any policy, the runner snapshots its governor and scaling
+limits. It restores all policies after each sweep, during final cleanup, and
+when interrupted by HUP, INT, or TERM. It does not hotplug CPUs or alter
+thermal trip points.
 
-## Prerequisites
+## Usage
 
-- Kernel must be built with `CONFIG_CPU_FREQ` and `CONFIG_CPU_FREQ_GOV_USERSPACE`
-- `sysfs` access to `/sys/devices/system/cpu/cpufreq/*`
-- Root privileges (to write to cpufreq entries)
+```text
+./run.sh [OPTIONS]
 
-## Script Location
-
-```
-Runner/suites/Kernel/FunctionalArea/baseport/CPUFreq_Validation/run.sh
-```
-
-## Files
-
-- `run.sh` - Main test script
-- `CPUFreq_Validation.res` - Summary result file with PASS/FAIL
-- `CPUFreq_Validation.log` - Full execution log (generated if logging is enabled)
-
-## How It Works
-
-1. The script detects all cpufreq policies under `/sys/devices/system/cpu/cpufreq/`
-2. For each policy:
-   - Reads the list of related CPUs
-   - Attempts to set each available frequency using the `userspace` governor
-   - Verifies that the frequency was correctly applied
-3. The result is logged per policy
-4. The overall test passes only if all policies succeed
-
-## Example Output
-
-```
-[INFO] CPU0-3 [via policy0] = PASS
-[FAIL] CPU4-6 [via policy4] = FAIL
-[INFO] CPU7 [via policy7] = PASS
+Options:
+  --tolerance-khz <khz>  Maximum readback difference, 0-1000000 (default: 400)
+  --settle-attempts <n>  One-second readback attempts, 1-30 (default: 5)
+  -h, --help             Show help and exit
 ```
 
-## Return Code
+Examples:
 
-- `0` — All policies passed
-- `1` — One or more policies failed
+```sh
+./run.sh
+./run.sh --tolerance-khz 1000 --settle-attempts 10
+```
 
-## Integration in CI
+## Results
 
-- Can be run standalone or via LAVA
-- Result file `CPUFreq_Validation.res` will be parsed by `result_parse.sh`
+- `PASS`: policy topology and frequency tables are valid, every writable
+  policy reaches all advertised frequencies, restoration succeeds, and no
+  relevant kernel errors are found.
+- `FAIL`: an applicable policy has malformed topology or frequency data,
+  rejects an advertised point, cannot reach it within tolerance, reports a
+  relevant kernel error, or cannot be restored.
+- `SKIP`: CPUFreq is absent or one or more detected policies cannot run
+  functional transitions because their controls are read-only. A missing
+  discrete table uses endpoint fallback, and inaccessible kernel logs remain
+  optional subchecks when all policies complete their functional sweep.
 
-## Notes
+Malformed command-line arguments are reported as `FAIL`.
 
-- Some CPUs may share frequency domains, so per-core testing is not reliable
-- The test includes retries to reduce false failures due to transient conditions
+## Artifacts
 
-## License
+Artifacts are retained under `logs_CPUFreq_Validation_<UTC timestamp>/`:
 
-SPDX-License-Identifier: BSD-3-Clause(c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+- `cpufreq_policy_snapshot.log`
+- `cpufreq_policy_inventory.log`
+- `policyN_frequencies.log`
+- `policyN_opp_frequencies.log` and any `policyN_opp_mismatches.log`
+- `cpufreq_frequency_results.csv`
+- `dmesg_snapshot.log`, `dmesg_errors.log`, and kernel-log access evidence
 
+## Public references
+
+- [Linux CPU frequency and voltage scaling](https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/pm/cpufreq.rst)
+- [Linux OPP library](https://github.com/torvalds/linux/blob/master/Documentation/power/opp.rst)

@@ -4055,6 +4055,714 @@ kernel_module_runtime_origin() {
     return 1
 }
 
+# debugfs_mountpoint
+# Prints the first mounted debugfs root reported by the running kernel.
+debugfs_mountpoint() {
+    dfm_mounts="/proc/self/mounts"
+
+    if [ ! -r "$dfm_mounts" ]; then
+        dfm_mounts="/proc/mounts"
+    fi
+    [ -r "$dfm_mounts" ] || return 1
+
+    awk '$3 == "debugfs" { print $2; found=1; exit } END { exit !found }' \
+        "$dfm_mounts"
+}
+
+# debugfs_prepare [mountpoint]
+# Reuses an existing debugfs mount or mounts it at the standard kernel path.
+# Exposes FTEST_DEBUGFS_MOUNTPOINT and FTEST_DEBUGFS_MOUNTED_BY_TEST.
+debugfs_prepare() {
+    fdp_target="${1:-/sys/kernel/debug}"
+    FTEST_DEBUGFS_MOUNTPOINT=""
+    FTEST_DEBUGFS_MOUNTED_BY_TEST=0
+
+    if fdp_existing=$(debugfs_mountpoint 2>/dev/null); then
+        FTEST_DEBUGFS_MOUNTPOINT="$fdp_existing"
+        return 0
+    fi
+
+    [ -d "$fdp_target" ] || return 1
+    command -v mount >/dev/null 2>&1 || return 1
+
+    if ! mount -t debugfs debugfs "$fdp_target" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    FTEST_DEBUGFS_MOUNTPOINT="$fdp_target"
+    FTEST_DEBUGFS_MOUNTED_BY_TEST=1
+    return 0
+}
+
+# debugfs_restore
+# Unmounts debugfs only when debugfs_prepare mounted it for the current test.
+debugfs_restore() {
+    [ "${FTEST_DEBUGFS_MOUNTED_BY_TEST:-0}" = "1" ] || return 0
+    [ -n "${FTEST_DEBUGFS_MOUNTPOINT:-}" ] || return 1
+    command -v umount >/dev/null 2>&1 || return 1
+
+    if ! umount "$FTEST_DEBUGFS_MOUNTPOINT" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    FTEST_DEBUGFS_MOUNTPOINT=""
+    FTEST_DEBUGFS_MOUNTED_BY_TEST=0
+    return 0
+}
+
+# clock_debugfs_summary_file <debugfs-root>
+# Prints the readable Common Clock Framework summary exposed by debugfs.
+clock_debugfs_summary_file() {
+    cdfsf_root="$1"
+    [ -n "$cdfsf_root" ] || return 3
+
+    for cdfsf_candidate in \
+        "$cdfsf_root/clk/clk_summary" \
+        "$cdfsf_root/clk_summary"; do
+        if [ -r "$cdfsf_candidate" ]; then
+            printf '%s\n' "$cdfsf_candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# clock_summary_analyze <summary-file> <state-file> <metrics-file>
+# Validates a Common Clock Framework summary and emits normalized state and
+# machine-readable metrics. Supports summaries with and without protect_count.
+clock_summary_analyze() {
+    csa_summary_file="$1"
+    csa_state_file="$2"
+    csa_metrics_file="$3"
+    csa_state_tmp="${csa_state_file}.tmp.$$"
+
+    [ -r "$csa_summary_file" ] && [ -n "$csa_state_file" ] &&
+        [ -n "$csa_metrics_file" ] || return 3
+
+    rm -f "$csa_state_tmp" "$csa_state_file" "$csa_metrics_file"
+
+    if ! awk -v state_file="$csa_state_tmp" -v metrics_file="$csa_metrics_file" '
+        BEGIN {
+            saw_count_header = 0
+            saw_clock_header = 0
+            has_protect = 0
+            total = 0
+            enabled = 0
+            prepared = 0
+            protected = 0
+            nonzero_rate = 0
+            hardware_enabled = 0
+        }
+        {
+            lower_line = tolower($0)
+            if (lower_line ~ /enable[^[:space:]]*[[:space:]]+prepare/) {
+                saw_count_header = 1
+                if (lower_line ~ /protect/) {
+                    has_protect = 1
+                }
+                if ($1 == "clock" && lower_line ~ /rate/) {
+                    saw_clock_header = 1
+                }
+                next
+            }
+            if ($1 == "clock" && lower_line ~ /rate/) {
+                saw_clock_header = 1
+                next
+            }
+        }
+        $1 ~ /^-+$/ {
+            next
+        }
+        $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ {
+            next
+        }
+        {
+            clock_name = $1
+            enable_count = $2
+            prepare_count = $3
+            protect_count = "-"
+            hardware_state = "-"
+
+            if (has_protect) {
+                if ($4 !~ /^[0-9]+$/ || $5 !~ /^[0-9]+$/) {
+                    next
+                }
+                protect_count = $4
+                clock_rate = $5
+                if (NF >= 9) {
+                    hardware_state = $9
+                }
+            } else {
+                if ($4 !~ /^[0-9]+$/) {
+                    next
+                }
+                clock_rate = $4
+                if (NF >= 8) {
+                    hardware_state = $8
+                }
+            }
+
+            total++
+            if (enable_count > 0) {
+                enabled++
+            }
+            if (prepare_count > 0) {
+                prepared++
+            }
+            if (protect_count != "-" && protect_count > 0) {
+                protected++
+            }
+            if (clock_rate > 0) {
+                nonzero_rate++
+            }
+            if (hardware_state == "Y") {
+                hardware_enabled++
+            }
+
+            printf "%s|%s|%s|%s|%s|%s\n", \
+                clock_name, enable_count, prepare_count, protect_count, \
+                clock_rate, hardware_state > state_file
+        }
+        END {
+            print "metric,value" > metrics_file
+            print "format," (has_protect ? "protect-count" : "legacy") \
+                >> metrics_file
+            print "total_clocks," total >> metrics_file
+            print "enabled_clocks," enabled >> metrics_file
+            print "prepared_clocks," prepared >> metrics_file
+            print "protected_clocks," protected >> metrics_file
+            print "nonzero_rate_clocks," nonzero_rate >> metrics_file
+            print "hardware_enabled_clocks," hardware_enabled >> metrics_file
+
+            if (!saw_count_header || !saw_clock_header || total == 0) {
+                exit 1
+            }
+        }
+    ' "$csa_summary_file"; then
+        rm -f "$csa_state_tmp" "$csa_state_file"
+        return 1
+    fi
+
+    if ! sort -u "$csa_state_tmp" >"$csa_state_file"; then
+        rm -f "$csa_state_tmp" "$csa_state_file" "$csa_metrics_file"
+        return 1
+    fi
+
+    rm -f "$csa_state_tmp"
+    return 0
+}
+
+# clock_summary_compare <previous-state> <current-state> <delta-file>
+# Records added, removed, or changed clocks. Returns 0 when state changed, 1
+# when the snapshots match, and 3 for invalid arguments or comparison errors.
+clock_summary_compare() {
+    csc_previous="$1"
+    csc_current="$2"
+    csc_delta_file="$3"
+
+    [ -r "$csc_previous" ] && [ -r "$csc_current" ] &&
+        [ -n "$csc_delta_file" ] || return 3
+
+    if ! awk -F '|' '
+        NR == FNR {
+            previous[$1] = $0
+            next
+        }
+        {
+            current[$1] = 1
+            if (!($1 in previous)) {
+                print "added|" $0
+            } else if (previous[$1] != $0) {
+                print "changed|before=" previous[$1] "|after=" $0
+            }
+        }
+        END {
+            for (clock_name in previous) {
+                if (!(clock_name in current)) {
+                    print "removed|" previous[clock_name]
+                }
+            }
+        }
+    ' "$csc_previous" "$csc_current" >"$csc_delta_file"; then
+        return 3
+    fi
+
+    [ -s "$csc_delta_file" ]
+}
+
+# clock_summary_consumer_inventory <summary-file> <inventory-file>
+# Extracts clock consumer and connection identifiers from modern clk_summary
+# output. The output format is clock|consumer|connection_id.
+clock_summary_consumer_inventory() {
+    csci_summary_file="$1"
+    csci_inventory_file="$2"
+    csci_tmp_file="${csci_inventory_file}.tmp.$$"
+
+    [ -r "$csci_summary_file" ] && [ -n "$csci_inventory_file" ] || return 3
+    rm -f "$csci_tmp_file" "$csci_inventory_file"
+
+    if ! awk '
+        BEGIN {
+            current_clock = ""
+            has_protect = 0
+        }
+        {
+            lower_line = tolower($0)
+            if (lower_line ~ /enable[^[:space:]]*[[:space:]]+prepare/) {
+                if (lower_line ~ /protect/) {
+                    has_protect = 1
+                }
+                next
+            }
+            if ($1 == "clock" || $1 ~ /^-+$/) {
+                next
+            }
+        }
+        $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+            current_clock = $1
+            consumer_field = has_protect ? 10 : 9
+            if (NF >= consumer_field) {
+                connection_id = NF > consumer_field ? $(consumer_field + 1) : ""
+                print current_clock "|" $consumer_field "|" connection_id
+            }
+            next
+        }
+        current_clock != "" && NF >= 1 {
+            leading = match($0, /[^[:space:]]/) - 1
+            if (leading >= 100) {
+                connection_id = NF >= 2 ? $2 : ""
+                print current_clock "|" $1 "|" connection_id
+            }
+        }
+    ' "$csci_summary_file" >"$csci_tmp_file"; then
+        rm -f "$csci_tmp_file"
+        return 1
+    fi
+
+    if ! sort -u "$csci_tmp_file" >"$csci_inventory_file"; then
+        rm -f "$csci_tmp_file" "$csci_inventory_file"
+        return 1
+    fi
+
+    rm -f "$csci_tmp_file"
+    [ -s "$csci_inventory_file" ]
+}
+
+# clock_summary_topology_analyze <summary-file> <topology-file> <metrics-file>
+# Extracts the runtime parent hierarchy and checks generic Common Clock
+# Framework invariants without relying on SoC-specific clock names.
+clock_summary_topology_analyze() {
+    csta_summary_file="$1"
+    csta_topology_file="$2"
+    csta_metrics_file="$3"
+
+    [ -r "$csta_summary_file" ] && [ -n "$csta_topology_file" ] &&
+        [ -n "$csta_metrics_file" ] || return 3
+    rm -f "$csta_topology_file" "$csta_metrics_file"
+
+    awk -v topology_file="$csta_topology_file" \
+        -v metrics_file="$csta_metrics_file" '
+        BEGIN {
+            has_protect = 0
+            total = 0
+            roots = 0
+            parent_links = 0
+            depth_errors = 0
+            enabled_parent_errors = 0
+            enabled_unprepared_errors = 0
+            enabled_hardware_off_errors = 0
+            previous_depth = -1
+        }
+        {
+            lower_line = tolower($0)
+            if (lower_line ~ /enable[^[:space:]]*[[:space:]]+prepare/) {
+                if (lower_line ~ /protect/) {
+                    has_protect = 1
+                }
+                next
+            }
+            if ($1 == "clock" || $1 ~ /^-+$/ ||
+                $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) {
+                next
+            }
+
+            leading = match($0, /[^[:space:]]/) - 1
+            if (leading < 0) {
+                leading = 0
+            }
+            depth = int(leading / 3)
+            if (total > 0 && depth > previous_depth + 1) {
+                depth_errors++
+            }
+
+            clock_name = $1
+            enable_count = $2
+            prepare_count = $3
+            rate_field = has_protect ? 5 : 4
+            hardware_field = has_protect ? 9 : 8
+            clock_rate = $rate_field
+            hardware_state = NF >= hardware_field ? $hardware_field : "-"
+            parent_name = depth > 0 && ((depth - 1) in stack) \
+                ? stack[depth - 1] : "-"
+
+            if (depth == 0) {
+                roots++
+            } else if (parent_name != "-") {
+                parent_links++
+                if (enable_count > 0 && parent_enable[depth - 1] == 0) {
+                    enabled_parent_errors++
+                }
+            } else {
+                depth_errors++
+            }
+
+            if (enable_count > 0 && prepare_count == 0) {
+                enabled_unprepared_errors++
+            }
+            if (enable_count > 0 && hardware_state == "N") {
+                enabled_hardware_off_errors++
+            }
+
+            printf "%s|%s|%s|%s|%s|%s|%s\n", \
+                depth, clock_name, parent_name, enable_count, prepare_count, \
+                clock_rate, hardware_state > topology_file
+
+            stack[depth] = clock_name
+            parent_enable[depth] = enable_count
+            for (prune_depth = depth + 1;
+                 prune_depth <= previous_depth;
+                 prune_depth++) {
+                delete stack[prune_depth]
+                delete parent_enable[prune_depth]
+            }
+            previous_depth = depth
+            total++
+        }
+        END {
+            print "metric,value" > metrics_file
+            print "total_clocks," total >> metrics_file
+            print "root_clocks," roots >> metrics_file
+            print "parent_links," parent_links >> metrics_file
+            print "depth_errors," depth_errors >> metrics_file
+            print "enabled_parent_errors," enabled_parent_errors \
+                >> metrics_file
+            print "enabled_unprepared_errors," enabled_unprepared_errors \
+                >> metrics_file
+            print "enabled_hardware_off_errors," \
+                enabled_hardware_off_errors >> metrics_file
+
+            if (total == 0 || depth_errors > 0 ||
+                enabled_parent_errors > 0 ||
+                enabled_unprepared_errors > 0 ||
+                enabled_hardware_off_errors > 0) {
+                exit 1
+            }
+        }
+    ' "$csta_summary_file"
+}
+
+# clock_sync_state_inventory <provider-list> <inventory-file> <metrics-file>
+# Correlates runtime DT clock providers with platform devices and inventories
+# any driver-core consumer*/status entries exposed for sync-state reporting.
+clock_sync_state_inventory() {
+    cssi_provider_file="$1"
+    cssi_inventory_file="$2"
+    cssi_metrics_file="$3"
+    cssi_provider_count=0
+    cssi_device_count=0
+    cssi_bound_count=0
+    cssi_consumer_count=0
+    cssi_available_count=0
+    cssi_active_count=0
+    cssi_other_count=0
+    cssi_unknown_count=0
+
+    [ -r "$cssi_provider_file" ] && [ -n "$cssi_inventory_file" ] &&
+        [ -n "$cssi_metrics_file" ] || return 3
+    rm -f "$cssi_inventory_file" "$cssi_metrics_file"
+    : >"$cssi_inventory_file"
+
+    while IFS= read -r cssi_provider || [ -n "$cssi_provider" ]; do
+        [ -n "$cssi_provider" ] || continue
+        cssi_provider_count=$((cssi_provider_count + 1))
+        cssi_compatible=$(dt_property_text "$cssi_provider" compatible 2>/dev/null || true)
+        cssi_compatible=$(printf '%s' "$cssi_compatible" | tr '[:space:]' ',')
+        cssi_device=""
+        cssi_driver=""
+
+        if cssi_device=$(find_platform_device_for_dt_node "$cssi_provider" 2>/dev/null); then
+            cssi_device_count=$((cssi_device_count + 1))
+            cssi_driver=$(platform_device_driver_name "$cssi_device" 2>/dev/null || true)
+            if [ -n "$cssi_driver" ]; then
+                cssi_bound_count=$((cssi_bound_count + 1))
+            fi
+        fi
+
+        cssi_found=0
+        if [ -n "$cssi_device" ]; then
+            for cssi_status_file in "$cssi_device"/consumer*/status; do
+                [ -r "$cssi_status_file" ] || continue
+                cssi_consumer=$(basename "$(dirname "$cssi_status_file")")
+                cssi_status=$(awk 'NR == 1 { print; exit }' "$cssi_status_file")
+                cssi_status=$(printf '%s' "$cssi_status" | tr '[:space:]' '_')
+                if [ -z "$cssi_status" ]; then
+                    cssi_status="unknown"
+                    cssi_unknown_count=$((cssi_unknown_count + 1))
+                fi
+                cssi_consumer_count=$((cssi_consumer_count + 1))
+                cssi_found=1
+
+                case "$cssi_status" in
+                    active)
+                        cssi_active_count=$((cssi_active_count + 1))
+                        ;;
+                    available)
+                        cssi_available_count=$((cssi_available_count + 1))
+                        ;;
+                    *)
+                        cssi_other_count=$((cssi_other_count + 1))
+                        ;;
+                esac
+
+                printf '%s|%s|%s|%s|%s|%s\n' \
+                    "$cssi_provider" \
+                    "${cssi_compatible:--}" \
+                    "${cssi_device:--}" \
+                    "${cssi_driver:--}" \
+                    "$cssi_consumer" \
+                    "$cssi_status" >>"$cssi_inventory_file"
+            done
+        fi
+
+        if [ "$cssi_found" -eq 0 ]; then
+            printf '%s|%s|%s|%s|-|unavailable\n' \
+                "$cssi_provider" \
+                "${cssi_compatible:--}" \
+                "${cssi_device:--}" \
+                "${cssi_driver:--}" >>"$cssi_inventory_file"
+        fi
+    done <"$cssi_provider_file"
+
+    {
+        printf 'metric,value\n'
+        printf 'providers,%s\n' "$cssi_provider_count"
+        printf 'platform_devices,%s\n' "$cssi_device_count"
+        printf 'bound_providers,%s\n' "$cssi_bound_count"
+        printf 'consumers,%s\n' "$cssi_consumer_count"
+        printf 'active_consumers,%s\n' "$cssi_active_count"
+        printf 'available_consumers,%s\n' "$cssi_available_count"
+        printf 'other_consumer_states,%s\n' "$cssi_other_count"
+        printf 'unknown_consumer_states,%s\n' "$cssi_unknown_count"
+    } >"$cssi_metrics_file"
+
+    [ "$cssi_provider_count" -gt 0 ]
+}
+
+# cpufreq_policy_snapshot <cpufreq-root> <snapshot-file>
+# Saves mutable policy state as policy|governor|min|max for later restoration.
+cpufreq_policy_snapshot() {
+    cps_root="$1"
+    cps_snapshot_file="$2"
+    cps_count=0
+
+    [ -d "$cps_root" ] && [ -n "$cps_snapshot_file" ] || return 3
+    rm -f "$cps_snapshot_file"
+    : >"$cps_snapshot_file"
+
+    for cps_policy_dir in "$cps_root"/policy*; do
+        [ -d "$cps_policy_dir" ] || continue
+        [ -r "$cps_policy_dir/scaling_governor" ] || continue
+        [ -r "$cps_policy_dir/scaling_min_freq" ] || continue
+        [ -r "$cps_policy_dir/scaling_max_freq" ] || continue
+
+        cps_governor=$(awk 'NR == 1 { print; exit }' "$cps_policy_dir/scaling_governor")
+        cps_min=$(awk 'NR == 1 { print; exit }' "$cps_policy_dir/scaling_min_freq")
+        cps_max=$(awk 'NR == 1 { print; exit }' "$cps_policy_dir/scaling_max_freq")
+        printf '%s|%s|%s|%s\n' \
+            "$cps_policy_dir" "$cps_governor" "$cps_min" "$cps_max" \
+            >>"$cps_snapshot_file"
+        cps_count=$((cps_count + 1))
+    done
+
+    [ "$cps_count" -gt 0 ]
+}
+
+# cpufreq_opp_frequencies_khz <opp-device-dir> <output-file>
+# Extracts available CPU OPP rates from the public OPP debugfs interface and
+# normalizes them to sorted kHz values.
+cpufreq_opp_frequencies_khz() {
+    cofk_opp_device_dir="$1"
+    cofk_output_file="$2"
+    cofk_tmp_file="${cofk_output_file}.tmp.$$"
+
+    [ -d "$cofk_opp_device_dir" ] && [ -n "$cofk_output_file" ] || return 3
+    rm -f "$cofk_tmp_file" "$cofk_output_file"
+    : >"$cofk_tmp_file"
+
+    for cofk_opp_dir in "$cofk_opp_device_dir"/opp:*; do
+        [ -d "$cofk_opp_dir" ] || continue
+        cofk_available=$(awk 'NR == 1 { print; exit }' \
+            "$cofk_opp_dir/available" 2>/dev/null || true)
+        case "$cofk_available" in
+            0|N|n|false|False|FALSE)
+                continue
+                ;;
+        esac
+
+        cofk_rate_file="$cofk_opp_dir/rate_hz"
+        if [ ! -r "$cofk_rate_file" ]; then
+            cofk_rate_file="$cofk_opp_dir/rate_hz_0"
+        fi
+        [ -r "$cofk_rate_file" ] || continue
+
+        cofk_rate_hz=$(awk 'NR == 1 { print; exit }' "$cofk_rate_file")
+        case "$cofk_rate_hz" in
+            ''|*[!0-9]*|0)
+                continue
+                ;;
+        esac
+        printf '%s\n' "$((cofk_rate_hz / 1000))" >>"$cofk_tmp_file"
+    done
+
+    if ! sort -nu "$cofk_tmp_file" >"$cofk_output_file"; then
+        rm -f "$cofk_tmp_file" "$cofk_output_file"
+        return 1
+    fi
+
+    rm -f "$cofk_tmp_file"
+    [ -s "$cofk_output_file" ]
+}
+
+# cpufreq_policy_restore <snapshot-file>
+# Restores min/max limits and governor for every snapshotted policy.
+cpufreq_policy_restore() {
+    cpr_snapshot_file="$1"
+    cpr_failed=0
+
+    [ -r "$cpr_snapshot_file" ] || return 3
+
+    while IFS='|' read -r cpr_policy_dir cpr_governor cpr_min cpr_max; do
+        [ -d "$cpr_policy_dir" ] || {
+            cpr_failed=1
+            continue
+        }
+
+        cpr_current_max=$(awk 'NR == 1 { print; exit }' \
+            "$cpr_policy_dir/scaling_max_freq" 2>/dev/null)
+        case "$cpr_current_max:$cpr_min" in
+            *[!0-9:]*|:*|*:)
+                cpr_failed=1
+                continue
+                ;;
+        esac
+
+        if [ "$cpr_min" -gt "$cpr_current_max" ]; then
+            if ! printf '%s\n' "$cpr_max" >"$cpr_policy_dir/scaling_max_freq" 2>/dev/null; then
+                cpr_failed=1
+            fi
+            if ! printf '%s\n' "$cpr_min" >"$cpr_policy_dir/scaling_min_freq" 2>/dev/null; then
+                cpr_failed=1
+            fi
+        else
+            if ! printf '%s\n' "$cpr_min" >"$cpr_policy_dir/scaling_min_freq" 2>/dev/null; then
+                cpr_failed=1
+            fi
+            if ! printf '%s\n' "$cpr_max" >"$cpr_policy_dir/scaling_max_freq" 2>/dev/null; then
+                cpr_failed=1
+            fi
+        fi
+        if ! printf '%s\n' "$cpr_governor" >"$cpr_policy_dir/scaling_governor" 2>/dev/null; then
+            cpr_failed=1
+        fi
+    done <"$cpr_snapshot_file"
+
+    return "$cpr_failed"
+}
+
+# cpufreq_policy_set_frequency <policy-dir> <frequency-khz>
+# Clamps a policy to one advertised frequency while respecting sysfs min/max
+# ordering constraints.
+cpufreq_policy_set_frequency() {
+    cpsf_policy_dir="$1"
+    cpsf_frequency="$2"
+
+    [ -d "$cpsf_policy_dir" ] && [ -n "$cpsf_frequency" ] || return 3
+    cpsf_current_min=$(awk 'NR == 1 { print; exit }' "$cpsf_policy_dir/scaling_min_freq" 2>/dev/null)
+    cpsf_current_max=$(awk 'NR == 1 { print; exit }' "$cpsf_policy_dir/scaling_max_freq" 2>/dev/null)
+
+    case "$cpsf_current_min" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    case "$cpsf_current_max" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    case "$cpsf_frequency" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    if [ "$cpsf_frequency" -gt "$cpsf_current_max" ]; then
+        printf '%s\n' "$cpsf_frequency" \
+            >"$cpsf_policy_dir/scaling_max_freq" 2>/dev/null || return 1
+        printf '%s\n' "$cpsf_frequency" \
+            >"$cpsf_policy_dir/scaling_min_freq" 2>/dev/null || return 1
+    else
+        printf '%s\n' "$cpsf_frequency" \
+            >"$cpsf_policy_dir/scaling_min_freq" 2>/dev/null || return 1
+        printf '%s\n' "$cpsf_frequency" \
+            >"$cpsf_policy_dir/scaling_max_freq" 2>/dev/null || return 1
+    fi
+
+    if [ -w "$cpsf_policy_dir/scaling_setspeed" ]; then
+        printf '%s\n' "$cpsf_frequency" \
+            >"$cpsf_policy_dir/scaling_setspeed" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+# cpufreq_policy_wait_for_frequency <policy-dir> <frequency-khz> <tolerance-khz> [attempts]
+# Prints the accepted readback as source=value. Returns 1 when no readback is
+# within tolerance after the bounded number of attempts.
+cpufreq_policy_wait_for_frequency() {
+    cpwf_policy_dir="$1"
+    cpwf_target="$2"
+    cpwf_tolerance="$3"
+    cpwf_attempts="${4:-5}"
+    cpwf_attempt=1
+
+    while [ "$cpwf_attempt" -le "$cpwf_attempts" ]; do
+        for cpwf_source in scaling_cur_freq cpuinfo_cur_freq; do
+            [ -r "$cpwf_policy_dir/$cpwf_source" ] || continue
+            cpwf_actual=$(awk 'NR == 1 { print; exit }' "$cpwf_policy_dir/$cpwf_source")
+            case "$cpwf_actual" in
+                ''|*[!0-9]*)
+                    continue
+                    ;;
+            esac
+            cpwf_delta=$((cpwf_actual - cpwf_target))
+            if [ "$cpwf_delta" -lt 0 ]; then
+                cpwf_delta=$((-cpwf_delta))
+            fi
+            if [ "$cpwf_delta" -le "$cpwf_tolerance" ]; then
+                printf '%s=%s\n' "$cpwf_source" "$cpwf_actual"
+                return 0
+            fi
+        done
+
+        sleep 1
+        cpwf_attempt=$((cpwf_attempt + 1))
+    done
+
+    return 1
+}
+
 # interconnect_debugfs_dir
 # Prints the ICC debugfs directory when its graph and summary are readable.
 # Returns 0 when available, otherwise 1.
@@ -7247,7 +7955,6 @@ scan_dmesg_errors() {
     prefix="$1"
     module_regex="$2"   # e.g. 'qcom_camss|camss|isp'
     exclude_regex="${3:-"dummy regulator|supply [^ ]+ not found|using dummy regulator"}"
-    shift 3
 
     mkdir -p "$prefix"
 
