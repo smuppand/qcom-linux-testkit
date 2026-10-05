@@ -3012,11 +3012,30 @@ weston_prepare_runtime() {
     wr_wait_secs="${2:-10}"
     wr_validate_mode="${3:-runtime}"
     wr_allow_relaunch="${4:-0}"
+    wr_os_id="unknown"
+    wr_desktop_os=0
 
     DISPLAY_WAYLAND_SOCKET=""
     DISPLAY_RUNTIME_MODEL="unknown"
     export DISPLAY_WAYLAND_SOCKET
     export DISPLAY_RUNTIME_MODEL
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        wr_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    elif [ -r /etc/os-release ]; then
+        wr_os_id="$(
+            sed -n 's/^ID=//p' /etc/os-release |
+                head -n 1 |
+                tr -d '"' |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    case "$wr_os_id" in
+        debian|ubuntu|centos|rhel|fedora)
+            wr_desktop_os=1
+            ;;
+    esac
 
     if [ -z "${DISPLAY_BUILD_FLAVOUR:-}" ]; then
         display_detect_build_flavour
@@ -3138,11 +3157,32 @@ weston_prepare_runtime() {
         log_warn "Preparing Weston runtime relaunch, cleaning stale systemd state first"
 
         if command -v systemd_service_exists >/dev/null 2>&1 && systemd_service_exists weston.service; then
+            if [ "$wr_os_id" = "centos" ]; then
+                if ! command -v display_prepare_desktop_weston_seat >/dev/null 2>&1 ||
+                   ! display_prepare_desktop_weston_seat; then
+                    log_fail "Weston relaunch attempt failed, desktop seat provider could not be prepared"
+                    return 3
+                fi
+            fi
+
             if ! weston_restart_systemd_runtime "$wr_wait_secs"; then
                 if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
                     weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
                 fi
                 log_fail "Weston relaunch attempt failed, systemd-managed Weston could not be recovered"
+                return 3
+            fi
+        elif [ "$wr_desktop_os" -eq 1 ] &&
+             command -v display_prepare_desktop_weston_runtime >/dev/null 2>&1; then
+            log_info "Relaunch path, starting desktop Weston directly on the selected DRM device"
+
+            if ! display_prepare_desktop_weston_runtime \
+                "$wr_testname" \
+                "$wr_wait_secs"; then
+                if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+                    weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
+                fi
+                log_fail "Weston relaunch attempt failed, desktop DRM runtime could not be prepared"
                 return 3
             fi
         elif command -v weston_restore_runtime >/dev/null 2>&1; then
@@ -3331,7 +3371,7 @@ weston_prepare_runtime() {
 #
 # Args:
 #   $1 - package-set name, default: graphics
-#   $2 - Debusine source, default: qli-staging
+#   $2 - Debusine source, default: qli-staging on Debian and none elsewhere
 #   $3 - Debusine suite, default: auto
 #
 # Return:
@@ -3339,8 +3379,9 @@ weston_prepare_runtime() {
 #   1 - package-set recovery failed
 display_ensure_graphics_package_set() {
     graphics_set_name="${1:-graphics}"
-    graphics_source="${2:-qli-staging}"
+    graphics_source="${2:-}"
     graphics_suite="${3:-auto}"
+    graphics_os_id=""
 
     if [ -z "${TOOLS:-}" ] || [ ! -f "$TOOLS/lib_pkg_provider.sh" ]; then
         log_warn "Package provider helper not found; continuing without graphics package recovery"
@@ -3353,6 +3394,23 @@ display_ensure_graphics_package_set() {
     # Load provider config first. Otherwise pkg_provider.conf can overwrite
     # caller-provided/default values such as apt_debusine_source.
     pkg_provider_init || true
+    graphics_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+
+    case "$graphics_os_id" in
+        ubuntu)
+            graphics_source="none"
+            ;;
+        debian)
+            if [ -z "$graphics_source" ]; then
+                graphics_source="qli-staging"
+            fi
+            ;;
+        *)
+            if [ -z "$graphics_source" ]; then
+                graphics_source="none"
+            fi
+            ;;
+    esac
 
     old_graphics_source="${PKG_APT_DEBUSINE_SOURCE:-none}"
     old_graphics_suite="${PKG_APT_DEBUSINE_SUITE:-auto}"
@@ -3379,6 +3437,51 @@ display_ensure_graphics_package_set() {
     pkg_log_info "Graphics package recovery source, source=${PKG_APT_DEBUSINE_SOURCE:-none} suite=${PKG_APT_DEBUSINE_SUITE:-auto} set=${graphics_set_name}"
 
     pkg_ensure_package_set "$graphics_set_name"
+}
+
+# Print the first package in a mapped set that matches an extended regex.
+# Diagnostics are intentionally omitted because callers use command substitution.
+display_package_set_member_matching() {
+    dpsmm_set_name="$1"
+    dpsmm_pattern="$2"
+    dpsmm_packages=""
+
+    if [ -z "$dpsmm_set_name" ] || [ -z "$dpsmm_pattern" ] ||
+       ! command -v pkg_lookup_package_set >/dev/null 2>&1; then
+        return 1
+    fi
+
+    dpsmm_packages="$(pkg_lookup_package_set "$dpsmm_set_name" 2>/dev/null || true)"
+
+    for dpsmm_package in $dpsmm_packages; do
+        if printf '%s\n' "$dpsmm_package" | grep -Eq "$dpsmm_pattern"; then
+            printf '%s\n' "$dpsmm_package"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Print the first installed Qualcomm MSM GBM backend found in standard libdirs.
+# Diagnostics are intentionally omitted because callers use command substitution.
+display_find_msm_gbm_backend() {
+    for dfmgb_dir in \
+        /usr/lib/gbm \
+        /usr/lib64/gbm \
+        /usr/lib/*/gbm \
+        /lib/gbm \
+        /lib64/gbm \
+        /lib/*/gbm; do
+        [ -d "$dfmgb_dir" ] || continue
+
+        if [ -f "$dfmgb_dir/msm_gbm.so" ]; then
+            printf '%s\n' "$dfmgb_dir/msm_gbm.so"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 ###############################################################################
@@ -4799,10 +4902,12 @@ display_get_primary_refresh_hz() {
 # - minimal Weston package/client recovery on apt systems
 # - the already validated base/overlay graphics-stack transitions
 # - the existing image-managed Yocto Weston lifecycle
+# - explicit desktop relaunch through the shared direct DRM helper
 # - testcase FPS policy
 #
 # It does not create users, TTY sessions, PAM configuration, udev rules,
-# systemd units, seatd instances, or standalone Weston processes.
+# persistent systemd units, or standalone seatd instances. On CentOS, it may
+# start the image-provided seatd.service for the direct DRM runtime.
 ###############################################################################
 
 display_ensure_weston_test_dependencies() {
@@ -4845,9 +4950,20 @@ display_ensure_weston_test_dependencies() {
             dewtd_dependencies="$dewtd_client weston"
             ;;
 
-        centos|rhel|fedora)
-            # RPM package names vary by release and repository. Keep this path
-            # check-only until explicit validated mappings are added.
+        centos)
+            if [ "$dewtd_provider" = "rpm" ] &&
+               command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+                if ! pkg_ensure_required_package_set_present weston-runtime; then
+                    log_fail "Failed to ensure the minimal CentOS Weston runtime package set"
+                    return 1
+                fi
+            fi
+
+            dewtd_dependencies="$dewtd_client weston"
+            ;;
+
+        rhel|fedora)
+            # RPM package names can differ outside the validated CentOS path.
             dewtd_dependencies="$dewtd_client weston"
             ;;
 
@@ -5228,6 +5344,63 @@ display_start_transient_weston_runtime() {
     return 0
 }
 
+# Ensure the CentOS Weston DRM launcher has a usable seat provider.
+# The Weston RPM uses libseat, while the target-validated CentOS flow requires
+# the packaged seatd service when the invoking shell is not a logind session.
+# Other distributions keep their existing logind or image-managed seat policy.
+display_prepare_desktop_weston_seat() {
+    dpdws_os_id="unknown"
+    dpdws_wait=0
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        dpdws_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    elif [ -r /etc/os-release ]; then
+        dpdws_os_id="$(
+            sed -n 's/^ID=//p' /etc/os-release |
+                head -n 1 |
+                tr -d '"' |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    [ "$dpdws_os_id" = "centos" ] || return 0
+
+    if ! command -v systemd_service_exists >/dev/null 2>&1 ||
+       ! command -v systemd_service_is_active >/dev/null 2>&1 ||
+       ! command -v systemd_service_start_safe >/dev/null 2>&1; then
+        log_error "Cannot prepare the CentOS Weston seat, shared systemd service helpers are unavailable"
+        return 1
+    fi
+
+    if ! systemd_service_exists seatd.service; then
+        log_error "Cannot prepare the CentOS Weston seat, seatd.service is unavailable after package recovery"
+        return 1
+    fi
+
+    if ! systemd_service_is_active seatd.service 2>/dev/null; then
+        log_info "Starting seatd.service for the CentOS Weston DRM runtime"
+
+        if ! systemd_service_start_safe seatd.service; then
+            log_error "Failed to start seatd.service for the CentOS Weston DRM runtime"
+            return 1
+        fi
+    fi
+
+    while [ "$dpdws_wait" -lt 5 ]; do
+        if systemd_service_is_active seatd.service 2>/dev/null &&
+           [ -S /run/seatd.sock ]; then
+            log_pass "CentOS Weston seat provider is ready, service=seatd.service socket=/run/seatd.sock"
+            return 0
+        fi
+
+        sleep 1
+        dpdws_wait=$((dpdws_wait + 1))
+    done
+
+    log_error "CentOS Weston seat provider is not ready, expected active seatd.service and /run/seatd.sock"
+    return 1
+}
+
 ###############################################################################
 # Desktop Weston runtime, manual command promoted to shared helper
 #
@@ -5380,6 +5553,10 @@ display_prepare_desktop_weston_runtime() {
 
     if ! command -v weston >/dev/null 2>&1; then
         log_error "Cannot start desktop Weston, weston command is unavailable"
+        return 1
+    fi
+
+    if ! display_prepare_desktop_weston_seat; then
         return 1
     fi
 
@@ -5565,15 +5742,20 @@ display_prepare_desktop_graphics_stack() {
     dpdgs_dkms_package="kgsl-dkms"
     dpdgs_dkms_before=""
     dpdgs_dkms_after=""
+    dpdgs_os_id=""
+    dpdgs_apt_source="none"
+    dpdgs_gbm_path=""
+    dpdgs_mapped_gbm_package=""
 
-    if [ -z "$dpdgs_gbm_package" ]; then
-        if command -v pkg_detect_os_id >/dev/null 2>&1 &&
-           [ "$(pkg_detect_os_id 2>/dev/null || true)" = "ubuntu" ]; then
-            dpdgs_gbm_package="libgbm-msm"
-        else
-            dpdgs_gbm_package="libgbm-msm1"
-        fi
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        dpdgs_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
     fi
+
+    case "$dpdgs_os_id" in
+        debian)
+            dpdgs_apt_source="qli-staging"
+            ;;
+    esac
 
     case "$dpdgs_mode" in
         auto)
@@ -5583,6 +5765,9 @@ display_prepare_desktop_graphics_stack() {
 
         overlay)
             for dpdgs_helper in \
+                display_detect_build_flavour \
+                display_find_msm_gbm_backend \
+                display_package_set_member_matching \
                 pkg_package_set_contains \
                 pkg_ensure_optional_package_set_present \
                 pkg_installed_package_version \
@@ -5594,6 +5779,46 @@ display_prepare_desktop_graphics_stack() {
                     return 1
                 fi
             done
+
+            display_detect_build_flavour
+            dpdgs_gbm_path="$(display_find_msm_gbm_backend 2>/dev/null || true)"
+
+            if [ "${DISPLAY_BUILD_FLAVOUR:-base}" = "overlay" ] &&
+               [ -n "$dpdgs_gbm_path" ]; then
+                mrv_qcom_gpu_validate_boot_mode \
+                    kgsl \
+                    "$dpdgs_gpu_module" \
+                    "$dpdgs_gpu_device" \
+                    msm
+                dpdgs_rc=$?
+
+                if [ "$dpdgs_rc" -eq 0 ] &&
+                   display_select_egl_vendor adreno; then
+                    log_pass "Qualcomm overlay runtime is already ready, EGL vendor=${DISPLAY_EGL_VENDOR_JSON:-unknown} GBM backend=$dpdgs_gbm_path"
+                    return 0
+                fi
+            fi
+
+            if [ -z "$dpdgs_gbm_package" ] ||
+               ! pkg_package_set_contains graphics "$dpdgs_gbm_package"; then
+                dpdgs_mapped_gbm_package="$(
+                    display_package_set_member_matching \
+                        graphics \
+                        '^(libgbm-msm1?|gbm-msm-backend)$' || true
+                )"
+
+                if [ -n "$dpdgs_mapped_gbm_package" ] &&
+                   [ "$dpdgs_mapped_gbm_package" != "$dpdgs_gbm_package" ]; then
+                    log_info "Using mapped Qualcomm GBM package for os=${dpdgs_os_id:-unknown}, package=$dpdgs_mapped_gbm_package"
+                fi
+
+                dpdgs_gbm_package="$dpdgs_mapped_gbm_package"
+            fi
+
+            if [ -z "$dpdgs_gbm_package" ]; then
+                log_fail "$dpdgs_testname FAIL - graphics package set has no supported Qualcomm MSM GBM backend package"
+                return 1
+            fi
 
             if ! pkg_package_set_contains graphics "$dpdgs_gbm_package"; then
                 log_fail "$dpdgs_testname FAIL - graphics package set is incomplete, missing $dpdgs_gbm_package"
@@ -5607,7 +5832,7 @@ display_prepare_desktop_graphics_stack() {
 
             if ! pkg_ensure_optional_package_set_present \
                 graphics \
-                qli-staging \
+                "$dpdgs_apt_source" \
                 auto \
                 --overlay; then
                 log_fail "$dpdgs_testname FAIL - failed to ensure Qualcomm graphics overlay package set"

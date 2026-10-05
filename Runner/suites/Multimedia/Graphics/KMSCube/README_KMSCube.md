@@ -116,12 +116,18 @@ ensure EPEL and the Qualcomm CentOS 10 aarch64 and noarch repositories, refresh
 DNF metadata, and install the documented Adreno overlay packages:
 
 ```text
-adreno-egl1 adreno-gles2 adreno-opencl-icd adreno-vulkan-icd
+kgsl-dkms gbm-msm-backend adreno-common adreno-gles1 adreno-gles2 adreno-egl1
 ```
 
 The `gbm-msm-backend` dependency is tracked explicitly because this suite
 validates the Qualcomm GBM backend before running KMSCube. Yocto execution
 continues to use image-provided components.
+
+`modetest` remains optional on CentOS because no verified `libdrm-tests`
+package is available there. When `kmscube` is absent, the suite requests the
+`kmscube` RPM from the configured CentOS repositories. If those repositories
+do not publish the package, the suite reports an actionable SKIP asking for
+the package to be published or provisioned in the image.
 
 When the requested GPU stack has been installed but the running kernel still
 uses the opposite `msm.skip_gpu` policy, the suite reports SKIP with a reboot

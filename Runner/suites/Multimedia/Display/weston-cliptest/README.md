@@ -3,6 +3,8 @@
 Runs `weston-cliptest` inside an existing Wayland/Weston session and validates the client created and committed
 a Wayland surface using `WAYLAND_DEBUG` output.
 
+On CentOS, the shared dependency path provides `weston`, `weston-demo`, `seatd`, and `egl-utils`. With `--allow-relaunch`, the test starts `seatd.service` when needed, launches Weston on the selected DRM device, and adopts the generated Wayland socket.
+
 ## What it validates
 
 - A connected DRM display is present (otherwise SKIP)
