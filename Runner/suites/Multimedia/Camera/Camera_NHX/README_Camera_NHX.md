@@ -114,24 +114,26 @@ Snapshot JSON files are currently expected only for targets where the files are 
 
 ## Desktop CAMX overlay flow
 
-Yocto and meta-qcom LAVA images keep their image-provided camera stack and do
-not use this flow. On Debian and Ubuntu, an explicit overlay request installs
-the `camera-nhx` package set:
+On Debian and Ubuntu, an explicit overlay request ensures the complete mapped
+`camera-nhx` package set:
 
 ```text
 camx-dkms camx-glymur libcamx-glymur1 camx-firmware-glymur camx-nhx
 ```
 
-On CentOS Stream 10, the runner follows the Qualcomm overlay installation
-guide and installs the Kodiak package set:
+On CentOS Stream 10, the runner ensures the complete mapped Kodiak package set:
 
 ```text
-camx-dkms camx-firmware-kodiak camx-kodiak libcamx-kodiak1
+camx-dkms camx-firmware-kodiak camx-kodiak libcamx-kodiak1 dtc diffutils
 ```
 
-Before a missing CentOS package is installed, the shared package provider
-ensures EPEL and both `qualcomm-linux-aarch64` and
-`qualcomm-linux-noarch` repositories are enabled, then refreshes DNF metadata.
+Ubuntu uses the APT sources already configured in the image. Debian may use the
+Qualcomm `qli-staging` source. CentOS prepares EPEL and the Qualcomm Linux
+`aarch64` and `noarch` RPM repositories before installation. Yocto does not use
+this package-recovery flow and continues with its image-provided camera stack.
+The runner passes the complete mapped package list to the shared package
+provider instead of selecting a suite-local subset. If package recovery fails,
+the explicit `--overlay` request reports FAIL with the complete required list.
 
 `--overlay` requires the CAMX FIT DTB and uses the compatibility name `camx`.
 The same requirement can be stated explicitly with `--fit-dtb camx`:
@@ -312,8 +314,9 @@ NHX JSON argument
 Options:
 
 ```text
---overlay          Install the optional Camera NHX CAMX package set on Debian,
-                   Ubuntu, or CentOS and ensure the CAMX FIT DTB is selected.
+--overlay          Verify the Camera NHX CAMX package set on Debian, Ubuntu,
+                   or CentOS, install missing packages, and ensure the CAMX
+                   FIT DTB is selected.
 
 --fit-dtb NAME     Select NAME as the FIT DTB compatibility name for the next
                    boot. Requires --overlay on a supported desktop distro.
@@ -486,6 +489,7 @@ run:
 ### FAIL
 
 - Any PASS condition is not met
+- Explicit `--overlay` package recovery fails or leaves the mapped package set incomplete
 - EFI selects `camx`, but the active runtime DT has no enabled downstream CamX nodes
 - NHX reports one or more failed cases
 - Final Report is missing/unparseable

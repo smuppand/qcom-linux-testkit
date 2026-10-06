@@ -116,9 +116,9 @@ usage() {
 Usage: $0 [--overlay] [--fit-dtb NAME] [--json JSON_FILE] [--target TARGET] [--help]
 
 Options:
-  --overlay        Install the Camera NHX CAMX package set on supported
-                   Debian, Ubuntu, or CentOS images and ensure the CAMX FIT
-                   DTB is selected for boot.
+  --overlay        Verify the Camera NHX CAMX package set on supported Debian,
+                   Ubuntu, or CentOS images, install missing packages, and
+                   ensure the CAMX FIT DTB is selected for boot.
   --fit-dtb NAME    Select this FIT DTB compatibility name for the next boot.
                    Camera_NHX supports camx, which is the --overlay default.
                    This option requires --overlay.
@@ -222,6 +222,8 @@ fi
 if [ "$OVERLAY_REQUESTED" -eq 1 ]; then
   for required_helper in \
     pkg_provider_init \
+    pkg_detect_os_id \
+    pkg_lookup_package_set \
     pkg_ensure_optional_package_set_present \
     pkg_verify_package_set_installed; do
     if ! command -v "$required_helper" >/dev/null 2>&1; then
@@ -232,20 +234,40 @@ if [ "$OVERLAY_REQUESTED" -eq 1 ]; then
   done
 
   pkg_provider_init
+  CAMX_OVERLAY_OS_ID="$(pkg_detect_os_id 2>/dev/null || true)"
+  CAMX_APT_SOURCE="none"
+
+  if [ "$CAMX_OVERLAY_OS_ID" = "debian" ]; then
+    CAMX_APT_SOURCE="qli-staging"
+  fi
+
+  CAMX_PACKAGES="$(pkg_lookup_package_set camera-nhx 2>/dev/null || true)"
+  if [ -z "$CAMX_PACKAGES" ]; then
+    log_skip "$TESTNAME SKIP - no Camera NHX package-set mapping is available, os=${CAMX_OVERLAY_OS_ID:-unknown} action=add-a-camera-nhx-package-set-mapping-for-this-os"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
+
+  log_info "Ensuring complete Camera NHX package set, os=${CAMX_OVERLAY_OS_ID:-unknown} packages=$CAMX_PACKAGES"
 
   if ! pkg_ensure_optional_package_set_present \
     camera-nhx \
-    qli-staging \
+    "$CAMX_APT_SOURCE" \
     auto \
     --overlay; then
-    log_fail "$TESTNAME FAIL - failed to ensure Camera NHX CAMX package set"
+    log_fail "$TESTNAME FAIL - --overlay package-set installation failed, os=${CAMX_OVERLAY_OS_ID:-unknown} packages=$CAMX_PACKAGES action=verify-configured-package-repositories-and-package-availability"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+    exit 0
+  fi
+
+  if ! pkg_verify_package_set_installed camera-nhx; then
+    log_fail "$TESTNAME FAIL - Camera NHX package recovery completed but the required package set is still incomplete, os=${CAMX_OVERLAY_OS_ID:-unknown} packages=$CAMX_PACKAGES"
     echo "$TESTNAME FAIL" >"$RES_FILE"
     exit 0
   fi
 
   log_pass "Camera NHX CAMX package set is ready"
 
-  CAMX_OVERLAY_OS_ID="$(pkg_detect_os_id 2>/dev/null || true)"
   case "$CAMX_OVERLAY_OS_ID" in
     debian|ubuntu|centos)
       for required_helper in \
@@ -306,7 +328,7 @@ if [ "$OVERLAY_REQUESTED" -eq 1 ]; then
       ;;
   esac
 else
-  log_info "Camera NHX overlay package installation not requested"
+  log_info "Camera NHX overlay package recovery not requested"
 fi
 
 # -----------------------------------------------------------------------------
