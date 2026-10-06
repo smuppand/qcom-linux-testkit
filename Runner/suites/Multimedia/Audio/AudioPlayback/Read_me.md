@@ -67,6 +67,11 @@ the Yocto package flow.
 - Common tools: `pgrep`, `timeout`, `grep`, `tar`, and either `curl` or `wget`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
+On Debian, Ubuntu, and CentOS, the selected backend controls client package
+recovery. PipeWire ensures `pw-play`, `pw-record`, and `wpctl`; ALSA ensures
+`aplay` and `arecord`; PulseAudio ensures `paplay`, `parecord`, and `pactl`.
+Yocto continues to use image-provided clients.
+
 ### Ubuntu package preparation
 
 When run as root, the suite uses the shared package provider to install missing
@@ -105,14 +110,13 @@ audioreach-dkms audioreach-pal audioreach-pipewire-plugin
 ```
 
 If the DKMS package changes, the suite requests a reboot before validation.
-Base mode continues to use the components provided by the CentOS image.
+In base mode, CentOS recovers only the complete client set for the selected
+backend from the configured distribution repositories.
 
-Backend client checks are read-only after package preparation. PipeWire uses
-`pw-play` when available and falls back to `pw-cat --playback`. A missing
-playback client does not start an additional package-manager transaction.
-Automatic backend selection falls back to an available ALSA path. An explicitly
-requested backend skips with the missing image-package prerequisite before any
-audio-clip download begins.
+Backend client checks run after package recovery. PipeWire uses `pw-play` when
+available and falls back to `pw-cat --playback`. Automatic backend selection
+falls back to an available ALSA path. Package-recovery failure is reported as
+FAIL before any audio-clip download begins.
 
 ```sh
 # Let the suite detect a server or desktop Ubuntu image

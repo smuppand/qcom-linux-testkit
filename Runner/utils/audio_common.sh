@@ -19,14 +19,14 @@ have_cmd() {
 
 # ---------- Backend detection & daemon checks ----------
 detect_audio_backend() {
-  if pgrep -x pipewire >/dev/null 2>&1 && command -v wpctl >/dev/null 2>&1; then
+  if pgrep -x pipewire >/dev/null 2>&1; then
     echo pipewire; return 0
   fi
-  if pgrep -x pulseaudio >/dev/null 2>&1 && command -v pactl >/dev/null 2>&1; then
+  if pgrep -x pulseaudio >/dev/null 2>&1; then
     echo pulseaudio; return 0
   fi
   # Accept pipewire-pulse shim as PulseAudio
-  if pgrep -x pipewire-pulse >/dev/null 2>&1 && command -v pactl >/dev/null 2>&1; then
+  if pgrep -x pipewire-pulse >/dev/null 2>&1; then
     echo pulseaudio; return 0
   fi
   echo ""
@@ -5011,7 +5011,7 @@ audio_prepare_audioreach_udev_rule() {
 #   Debian overlay    - ensure audio-base and Debian AudioReach package sets
 #   Ubuntu server     - ensure ALSA utilities
 #   Ubuntu desktop    - ensure ALSA, PipeWire, PipeWire-Pulse, and WirePlumber
-#   CentOS base       - use image-provided components
+#   CentOS base       - defer client recovery until backend selection
 #   CentOS overlay    - ensure the documented Qualcomm AudioReach RPM set
 #   other distros     - no-op until their package mappings are verified
 #
@@ -5147,7 +5147,7 @@ audio_prepare_test_packages() {
 
   if [ "$atp_os_id" = "centos" ] &&
      [ "$atp_overlay_requested" -eq 0 ]; then
-    log_info "CentOS base Audio mode uses image-provided components"
+    log_info "CentOS base Audio mode defers client package recovery until backend selection"
     return 0
   fi
 
@@ -5302,6 +5302,69 @@ audio_prepare_test_packages() {
   fi
  
   log_pass "$atp_os_id AudioReach package set is ready"
+  return 0
+}
+
+# Ensure complete playback and recording clients for one selected backend.
+# Debian, Ubuntu, and CentOS use exact package-set mappings. Yocto and other
+# image-managed environments retain their preinstalled userspace.
+audio_prepare_backend_client_packages() {
+  apbcp_backend="$1"
+
+  case "$apbcp_backend" in
+    pipewire|pulseaudio|alsa)
+      apbcp_package_set="audio-client-$apbcp_backend"
+      ;;
+    *)
+      log_fail "Unsupported Audio backend for package preparation: $apbcp_backend"
+      return 1
+      ;;
+  esac
+
+  if command -v pkg_detect_os_id >/dev/null 2>&1; then
+    apbcp_os_id="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
+  else
+    apbcp_os_id="$(
+      sed -n 's/^ID=//p' /etc/os-release 2>/dev/null |
+        sed -n '1p' |
+        sed 's/^"//;s/"$//' |
+        tr '[:upper:]' '[:lower:]'
+    )"
+  fi
+
+  [ -n "$apbcp_os_id" ] || apbcp_os_id="unknown"
+
+  case "$apbcp_os_id" in
+    qcom-distro|poky|openembedded|oe)
+      log_info "Native image uses preinstalled $apbcp_backend Audio clients"
+      return 0
+      ;;
+    debian|ubuntu|centos)
+      ;;
+    *)
+      log_info "Audio backend client package recovery is not enabled, os=$apbcp_os_id backend=$apbcp_backend"
+      return 0
+      ;;
+  esac
+
+  if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+    log_fail "Audio backend client package preparation must run as root, os=$apbcp_os_id backend=$apbcp_backend"
+    return 1
+  fi
+
+  if ! command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+    log_fail "Required package-set helper is unavailable"
+    return 1
+  fi
+
+  log_info "Ensuring complete Audio backend client package set, os=$apbcp_os_id backend=$apbcp_backend set=$apbcp_package_set"
+
+  if ! pkg_ensure_required_package_set_present "$apbcp_package_set"; then
+    log_fail "Failed to ensure Audio backend client package set, os=$apbcp_os_id backend=$apbcp_backend set=$apbcp_package_set"
+    return 1
+  fi
+
+  log_pass "Audio backend client package set is ready, os=$apbcp_os_id backend=$apbcp_backend"
   return 0
 }
 

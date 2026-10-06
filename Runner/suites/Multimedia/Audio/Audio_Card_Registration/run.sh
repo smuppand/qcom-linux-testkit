@@ -180,6 +180,18 @@ case "$audio_prepare_rc" in
         ;;
 esac
 
+if ! command -v audio_prepare_backend_client_packages >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_backend_client_packages"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! audio_prepare_backend_client_packages alsa; then
+    log_fail "$TESTNAME FAIL: failed to prepare ALSA playback and recording clients"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
 # Prepare only the Debian Audio account and group membership. This ALSA-only
 # testcase does not require a systemd user manager and does not re-execute the
 # complete runner as debian.

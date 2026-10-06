@@ -591,6 +591,18 @@ fi
 
 log_info "Using backend: $AUDIO_BACKEND"
 
+if ! command -v audio_prepare_backend_client_packages >/dev/null 2>&1; then
+  log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_backend_client_packages"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if ! audio_prepare_backend_client_packages "$AUDIO_BACKEND"; then
+  log_fail "$TESTNAME FAIL - failed to prepare $AUDIO_BACKEND playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
 backend_ok=0
 if [ "$AUDIO_BACKEND" = "alsa" ]; then
   if [ "$ALSA_CAPTURE_PROBED" -eq 1 ]; then
@@ -655,8 +667,8 @@ if [ "$backend_ok" -ne 1 ]; then
   exit 0
 fi
 
-# Package preparation has already completed above. Keep backend-client checks
-# read-only so automatic backend discovery cannot trigger package installation.
+# Package recovery above installs the complete client set for the selected
+# backend. These checks verify that the expected commands are now available.
 case "$AUDIO_BACKEND" in
   pipewire)
     if ! command -v wpctl >/dev/null 2>&1 ||
@@ -889,7 +901,14 @@ else # ALSA
   log_info "Routing to source: name='$SRC_LABEL' choice=$SRC_CHOICE"
 fi
 
-# If fallback changed backend, ensure deps are present (non-fatal → SKIP)
+# If route discovery changed the backend, prepare that backend's complete
+# playback and recording client set before validating its commands.
+if ! audio_prepare_backend_client_packages "$AUDIO_BACKEND"; then
+  log_fail "$TESTNAME FAIL - failed to prepare fallback $AUDIO_BACKEND playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
 case "$AUDIO_BACKEND" in
   pipewire)
     if ! command -v wpctl >/dev/null 2>&1 ||

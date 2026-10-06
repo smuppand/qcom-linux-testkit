@@ -647,6 +647,28 @@ fi
 
 log_info "Args: backend=${AUDIO_BACKEND:-auto} sink=$SINK_CHOICE overlay=$AUDIO_OVERLAY_REQUESTED volume=$AUDIO_PLAYBACK_VOLUME loops=$LOOPS timeout=$TIMEOUT formats='$FORMATS' durations='$DURATIONS' strict=$STRICT dmesg=$DMESG_SCAN extract=$EXTRACT_AUDIO_ASSETS network_download=$ENABLE_NETWORK_DOWNLOAD clips_path=${AUDIO_CLIPS_BASE_DIR:-default} bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
 
+if ! command -v audio_prepare_backend_client_packages >/dev/null 2>&1; then
+  log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_backend_client_packages"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if [ -n "$AUDIO_BACKEND_REQUESTED" ] &&
+   ! audio_prepare_backend_client_packages "$AUDIO_BACKEND_REQUESTED"; then
+  log_fail "$TESTNAME FAIL - failed to prepare $AUDIO_BACKEND_REQUESTED playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+# Refresh client discovery after package preparation.
+AUDIO_PIPEWIRE_PLAY_COMMAND=""
+if command -v pw-play >/dev/null 2>&1; then
+  AUDIO_PIPEWIRE_PLAY_COMMAND="pw-play"
+elif command -v pw-cat >/dev/null 2>&1 &&
+     pw-cat --help 2>&1 | grep -q -- '--playback'; then
+  AUDIO_PIPEWIRE_PLAY_COMMAND="pw-cat"
+fi
+
 # Reject an unusable requested backend before network setup or clip download.
 # In automatic mode, continue when any supported image-provided playback
 # client is available because backend selection may fall back later.
@@ -802,6 +824,22 @@ fi
 
 log_info "Using backend: $AUDIO_BACKEND"
 
+if ! audio_prepare_backend_client_packages "$AUDIO_BACKEND"; then
+  log_fail "$TESTNAME FAIL - failed to prepare $AUDIO_BACKEND playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if [ "$AUDIO_BACKEND" = "pipewire" ]; then
+  AUDIO_PIPEWIRE_PLAY_COMMAND=""
+  if command -v pw-play >/dev/null 2>&1; then
+    AUDIO_PIPEWIRE_PLAY_COMMAND="pw-play"
+  elif command -v pw-cat >/dev/null 2>&1 &&
+       pw-cat --help 2>&1 | grep -q -- '--playback'; then
+    AUDIO_PIPEWIRE_PLAY_COMMAND="pw-cat"
+  fi
+fi
+
 backend_ok=0
 if [ "$AUDIO_BACKEND" = "alsa" ]; then
   if audio_playback_probe_alsa_with_recovery; then
@@ -873,9 +911,24 @@ if [ "$backend_ok" -ne 1 ]; then
 fi
 
 # Dependencies per backend
-# Package preparation has already completed above. Keep these late backend
-# checks read-only so an automatically detected backend cannot trigger an
-# unrelated package transaction when its playback client is absent.
+# If backend readiness selected a fallback, prepare that backend's complete
+# playback and recording client set before validating its commands.
+if ! audio_prepare_backend_client_packages "$AUDIO_BACKEND"; then
+  log_fail "$TESTNAME FAIL - failed to prepare fallback $AUDIO_BACKEND playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if [ "$AUDIO_BACKEND" = "pipewire" ]; then
+  AUDIO_PIPEWIRE_PLAY_COMMAND=""
+  if command -v pw-play >/dev/null 2>&1; then
+    AUDIO_PIPEWIRE_PLAY_COMMAND="pw-play"
+  elif command -v pw-cat >/dev/null 2>&1 &&
+       pw-cat --help 2>&1 | grep -q -- '--playback'; then
+    AUDIO_PIPEWIRE_PLAY_COMMAND="pw-cat"
+  fi
+fi
+
 case "$AUDIO_BACKEND" in
   pipewire)
     if [ -z "$AUDIO_PIPEWIRE_PLAY_COMMAND" ]; then

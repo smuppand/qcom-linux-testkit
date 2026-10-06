@@ -61,6 +61,11 @@ Ensure the following components are present in the target Yocto build:
 - Common tools: `pgrep`, `timeout`, `grep`, `sed`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
+On Debian, Ubuntu, and CentOS, the selected backend controls client package
+recovery. PipeWire ensures `pw-play`, `pw-record`, and `wpctl`; ALSA ensures
+`aplay` and `arecord`; PulseAudio ensures `paplay`, `parecord`, and `pactl`.
+Yocto continues to use image-provided clients.
+
 ## Backend and Route Selection
 
 When no backend is requested, the suite uses automatic selection. A real PipeWire audio source uses `pw-record`, and a real PulseAudio source uses `parecord`. Camera, dummy, null, monitor, and loopback PipeWire nodes are not accepted as microphone sources.
@@ -87,10 +92,10 @@ installs `audioreach-dkms`, `audioreach-pal`, and
 `audioreach-pipewire-plugin`. If the DKMS package changes, reboot before
 rerunning validation. Yocto remains image-provided and non-installing.
 
-Backend client checks are read-only after package preparation. A missing
-`pw-record`, `wpctl`, `parecord`, `pactl`, or `arecord` does not start an
-additional package-manager transaction and instead produces a clean SKIP for
-the unavailable recording path.
+Backend client checks run after recovery of the selected backend's complete
+playback and recording client package set. Package recovery failure is reported
+as FAIL. A client that remains unavailable after successful recovery produces
+a clean SKIP for the unavailable recording path.
 
 For overlay builds using audioreach kernel modules, the test automatically:
 - Detects the overlay build configuration
