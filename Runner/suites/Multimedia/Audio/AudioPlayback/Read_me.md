@@ -19,8 +19,17 @@ This suite automates the validation of audio playback capabilities on Qualcomm L
   - Unique testcase IDs prevent LAVA testcase ID collisions
   - Enables running multiple AudioPlayback configurations simultaneously in CI
 - Plays audio clips with configurable format, duration, and loop count
+- Validates every WAV before playback and emits machine-readable
+  `AUDIO_VALIDATION` records for both clip integrity and playback execution
 - **Network operations are optional**: By default, no network connection is attempted. Use `--enable-network-download` to enable downloading missing audio files
 - Automatically downloads and extracts audio assets if missing
+
+Playback clip validation blocks only on basic integrity failures: corrupt or
+empty WAV files, header-only payloads, all-zero audio, materially short clips,
+or filename metadata that disagrees with the WAV header. RMS, peak, clipping,
+digital-silence runs, DC offset, large sample transitions, and silent-channel
+counts are reported as diagnostic `AUDIO_VALIDATION` metrics and do not fail the
+default policy.
 - Validates playback using multiple evidence sources:
   - PipeWire/PulseAudio streaming state
   - ALSA and ASoC runtime status
@@ -67,6 +76,11 @@ the Yocto package flow.
 - Common tools: `pgrep`, `timeout`, `grep`, `tar`, and either `curl` or `wget`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
+On Debian, Ubuntu, and CentOS, the selected backend controls client package
+recovery. PipeWire ensures `pw-play`, `pw-record`, and `wpctl`; ALSA ensures
+`aplay` and `arecord`; PulseAudio ensures `paplay`, `parecord`, and `pactl`.
+Yocto continues to use image-provided clients.
+
 ### Ubuntu package preparation
 
 When run as root, the suite uses the shared package provider to install missing
@@ -105,14 +119,18 @@ audioreach-dkms audioreach-pal audioreach-pipewire-plugin
 ```
 
 If the DKMS package changes, the suite requests a reboot before validation.
-Base mode continues to use the components provided by the CentOS image.
+In base mode, CentOS recovers only the complete client set for the selected
+backend from the configured distribution repositories.
 
-Backend client checks are read-only after package preparation. PipeWire uses
-`pw-play` when available and falls back to `pw-cat --playback`. A missing
-playback client does not start an additional package-manager transaction.
-Automatic backend selection falls back to an available ALSA path. An explicitly
-requested backend skips with the missing image-package prerequisite before any
-audio-clip download begins.
+Backend client checks run after package recovery. PipeWire uses `pw-play` when
+available and falls back to `pw-cat --playback`. Automatic backend selection
+falls back to an available ALSA path. Package-recovery failure is reported as
+FAIL before any audio-clip download begins.
+
+When launched by root on Debian or CentOS, the suite discovers and prepares the
+regular desktop audio user, then runs PipeWire, PulseAudio, UCM, mixer, and PCM
+operations in that user's context. Yocto retains its native execution model,
+and Ubuntu continues to use its dynamically discovered desktop session.
 
 ```sh
 # Let the suite detect a server or desktop Ubuntu image
@@ -131,12 +149,12 @@ AUDIO_PACKAGE_PROFILE=desktop AUDIO_PACKAGE_UPDATE=1 \
 
 When no backend is requested, the suite uses automatic selection. A physical PipeWire audio sink uses `pw-play` or `pw-cat --playback`, and a physical PulseAudio sink uses `paplay`. For the `speakers` route, a speaker endpoint takes precedence over headphones, then other physical outputs. Dummy, null, monitor, and loopback PipeWire sinks are not accepted as speaker routes.
 
-If automatic selection finds no physical managed speaker sink, the suite probes direct ALSA playback. It selects an ALSA card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `aplay -D <device>`. This supports the Shikra primary-MI2S, secondary-TDM, and codec-direct route capabilities without selecting a form factor or assuming card `0`.
+If automatic selection finds no physical managed speaker sink, the suite probes direct ALSA playback. It selects an ALSA card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `aplay -D <device>`. This supports the Shikra primary-MI2S, secondary-TDM, and codec-direct route capabilities without selecting a form factor or assuming card `0`. When the audio remoteproc preflight proves that audio is applicable, failure of both managed-sink discovery and direct ALSA probing is reported as FAIL so the image or runtime regression remains tracked. The same absence remains SKIP only when runtime preflight found no applicable audio subsystem.
 
 An explicit backend request is never replaced:
 
-- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-play` or `pw-cat --playback` and skips if the `pipewire-utils` playback client or a physical PipeWire speaker sink is absent.
-- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `paplay` only and skips if no matching sink is available.
+- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-play` or `pw-cat --playback`. A missing optional client can skip, but a ready backend with no requested physical sink fails.
+- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `paplay` only. A ready backend with no requested sink fails.
 - `--backend alsa` or `AUDIO_BACKEND=alsa` runs `aplay` with the discovered ALSA route.
 
 ## Audio Remoteproc Preflight
@@ -298,7 +316,7 @@ CLIP_FILTER              Filter clips by pattern (e.g., "48KHz" or "16b" or "2ch
 FORMATS	                 Audio formats: e.g. wav	                       wav
 DURATIONS	             Playback durations: short, medium, long (legacy mode only)    ""
 LOOPS	                 Number of playback loops	                       1
-TIMEOUT	                 Playback timeout per loop (e.g., 15s, 0=none)     "10s"
+TIMEOUT	                 Playback timeout per loop (0=automatic for discovered clips) "10s"
 STRICT	                 Enable strict mode (fail on any error)            0
 DMESG_SCAN	             Scan dmesg for errors after playback	           1
 VERBOSE	                 Enable verbose logging                            0
@@ -325,7 +343,7 @@ Option	                    Description
 --formats	                Audio formats (space/comma separated): e.g. wav 
 --durations	                Playback durations: short, medium, long (legacy mode only)
 --loops	                    Number of playback loops
---timeout	                Playback timeout per loop (e.g., 15s)
+--timeout <duration>      Playback timeout per loop; 0 uses clip duration plus five seconds in discovery mode
 --strict	                Enable strict mode
 --no-dmesg	                Disable dmesg scan
 --no-extract-assets         Disable asset extraction entirely (skips all asset operations)
@@ -430,7 +448,7 @@ sh-5.3# ./run.sh --clip-name "playback_config1" --res-suffix "Config01" --audio-
 [INFO] 2026-01-22 17:46:33 - ---------------- Starting AudioPlayback ----------------
 [INFO] 2026-01-22 17:46:33 - Using clip discovery mode
 [INFO] 2026-01-22 17:46:33 - Discovered 1 clips to test
-[INFO] 2026-01-22 17:46:33 - [play_16KHz_16b_2ch] Clip duration: 30s (timeout threshold: 29s)
+[INFO] 2026-01-22 17:46:33 - [play_16KHz_16b_2ch] Clip duration: 30s (minimum successful runtime: 29s)
 [PASS] 2026-01-22 17:47:04 - [play_16KHz_16b_2ch] loop 1 OK (rc=0, 30s)
 [PASS] 2026-01-22 17:47:04 - AudioPlayback PASS
 
@@ -479,7 +497,7 @@ Results:
 - Results are stored in: results/AudioPlayback/ (or results/AudioPlayback_<suffix>/ when using --res-suffix)
 - Summary result file: AudioPlayback.res (or AudioPlayback_<suffix>.res when using --res-suffix)
 - JUnit XML (if enabled): <your-path>.xml
-- Diagnostic logs: dmesg snapshots, mixer dumps, playback logs per test case
+- Diagnostic logs: dmesg snapshots, mixer dumps, playback logs per test case, and `alsa_playback_probe.log` containing the selected direct-ALSA candidate, probe command, exit status, and `aplay` error output
 - **Note**: When using --res-suffix, both result files AND log directories are unique per invocation, preventing log collisions in CI/LAVA workflows
 
 

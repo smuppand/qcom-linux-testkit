@@ -53,7 +53,7 @@ RES_SUFFIX="" # Optional suffix for unique result files (e.g., "Config1")
 
 # Pre-parse the options required by privileged Audio preparation without
 # consuming the original argument list. The complete original "$@" must remain
-# available for the root-to-debian re-exec performed below.
+# available for privileged desktop-audio preparation performed below.
 AUDIO_OVERLAY_REQUESTED=0
 AUDIO_EARLY_HELP_REQUESTED=0
 AUDIO_EARLY_EXPECT=""
@@ -171,7 +171,7 @@ Examples:
 EOF
 }
 
-# Keep Debian service recovery inside the prepared user manager. Preserve the
+# Keep desktop service recovery inside the prepared user manager. Preserve the
 # existing broad best-effort recovery only for native/Yocto execution.
 # --help must not install packages, change user groups, create output files, or
 # start a systemd user manager.
@@ -192,7 +192,7 @@ else
 fi
 
 # Package and udev preparation remain privileged. The complete runner stays
-# the root orchestrator on Debian.
+# the root orchestrator on Debian and CentOS.
 if ! command -v audio_prepare_test_packages >/dev/null 2>&1; then
   log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_test_packages"
   echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
@@ -225,7 +225,7 @@ if ! mkdir -p "$LOGDIR"; then
   exit 1
 fi
 
-# The Debian Audio user needs traverse-only access to reach its dedicated
+# The desktop Audio user needs traverse-only access to reach its dedicated
 # scratch capture directory. Final logs and WAV artifacts remain root-owned.
 if ! chmod 0755 "$LOGDIR"; then
   log_fail "$TESTNAME FAIL - failed to set log directory traversal mode: $LOGDIR"
@@ -356,7 +356,7 @@ case "$AUDIO_RECORD_STRICT_SIGNAL" in
 esac
 export AUDIO_RECORD_STRICT_SIGNAL
 
-# Prepare only the Debian user capabilities required by the selected mode.
+# Prepare only the desktop user capabilities required by the selected mode.
 # Explicit base ALSA capture needs group membership but no systemd user
 # manager. Overlay and managed backends require the user session.
 AUDIO_RECORD_USER_MANAGER_REQUIRED=1
@@ -366,7 +366,7 @@ if [ "$AUDIO_OVERLAY_REQUESTED" -eq 0 ] &&
 fi
 
 for audio_required_helper in \
-  audio_prepare_debian_audio_environment \
+  audio_prepare_desktop_audio_environment \
   audio_run_as_test_user \
   audio_run_helper_as_test_user \
   audio_run_with_timeout_as_test_user
@@ -378,14 +378,14 @@ do
   fi
 done
 
-if ! audio_prepare_debian_audio_environment \
+if ! audio_prepare_desktop_audio_environment \
     "$AUDIO_RECORD_USER_MANAGER_REQUIRED"; then
-  log_fail "$TESTNAME FAIL - Debian Audio environment preparation failed"
+  log_fail "$TESTNAME FAIL - desktop Audio environment preparation failed"
   echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
   exit 1
 fi
 
-AUDIO_RECORD_DEBIAN_ROOT_MODE=0
+AUDIO_RECORD_DESKTOP_ROOT_MODE=0
 if command -v pkg_detect_os_id >/dev/null 2>&1; then
   AUDIO_RECORD_OS_ID="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
 else
@@ -397,18 +397,20 @@ else
   )"
 fi
 
-if [ "$AUDIO_RECORD_OS_ID" = "debian" ]; then
-  AUDIO_RECORD_DEBIAN_ROOT_MODE=1
-fi
+case "$AUDIO_RECORD_OS_ID" in
+  debian|centos)
+    AUDIO_RECORD_DESKTOP_ROOT_MODE=1
+    ;;
+esac
 
-export AUDIO_RECORD_DEBIAN_ROOT_MODE
+export AUDIO_RECORD_DESKTOP_ROOT_MODE
 
-# Only this scratch directory is writable by the Debian Audio user. Root keeps
+# Only this scratch directory is writable by the desktop Audio user. Root keeps
 # ownership of the final LOGDIR, logs, summary, JUnit data, and promoted WAVs.
 AUDIO_RECORD_USER_CAPTURE_DIR="$LOGDIR/.user-capture"
 export AUDIO_RECORD_USER_CAPTURE_DIR
 
-if [ "$AUDIO_RECORD_DEBIAN_ROOT_MODE" -eq 1 ]; then
+if [ "$AUDIO_RECORD_DESKTOP_ROOT_MODE" -eq 1 ]; then
   rm -rf "$AUDIO_RECORD_USER_CAPTURE_DIR"
 
   if ! mkdir -p "$AUDIO_RECORD_USER_CAPTURE_DIR"; then
@@ -417,7 +419,7 @@ if [ "$AUDIO_RECORD_DEBIAN_ROOT_MODE" -eq 1 ]; then
     exit 1
   fi
 
-  if ! chown "${AUDIO_TEST_USER:-debian}:audio" \
+  if ! chown "$AUDIO_TEST_USER:audio" \
       "$AUDIO_RECORD_USER_CAPTURE_DIR"; then
     log_fail "$TESTNAME FAIL - failed to assign Audio user capture directory"
     echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
@@ -430,11 +432,12 @@ if [ "$AUDIO_RECORD_DEBIAN_ROOT_MODE" -eq 1 ]; then
     exit 1
   fi
 
-  log_pass "Prepared Debian Audio capture workspace: $AUDIO_RECORD_USER_CAPTURE_DIR"
+  log_pass "Prepared desktop Audio capture workspace: $AUDIO_RECORD_USER_CAPTURE_DIR"
 fi
 
-# Debian overlay runtime preparation runs from the root orchestrator after
-# normal CLI parsing. Only its device and PipeWire probes execute as debian.
+# Desktop overlay runtime preparation runs from the root orchestrator after
+# normal CLI parsing. Only its device and PipeWire probes execute as the
+# prepared regular user.
 if [ "$AUDIO_OVERLAY_REQUESTED" -eq 1 ]; then
   if ! command -v audio_prepare_overlay_runtime >/dev/null 2>&1; then
     log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_overlay_runtime"
@@ -460,8 +463,8 @@ if [ "$AUDIO_OVERLAY_REQUESTED" -eq 1 ]; then
       ;;
   esac
 elif [ "$SYSTEMD_AVAILABLE" -eq 1 ] &&
-     [ "$AUDIO_RECORD_DEBIAN_ROOT_MODE" -ne 1 ]; then
-  # Preserve the existing native/Yocto validation path. Debian base mode uses
+     [ "$AUDIO_RECORD_DESKTOP_ROOT_MODE" -ne 1 ]; then
+  # Preserve the existing native/Yocto validation path. Desktop base mode uses
   # command-level user probes during backend discovery instead.
   if ! setup_overlay_audio_environment; then
     log_warn "Existing overlay audio environment validation failed, continuing with backend recovery flow"
@@ -582,6 +585,12 @@ if [ -z "$AUDIO_BACKEND" ]; then
       export AUDIO_SYSTEMD_MANAGED
       log_warn "$TESTNAME: no managed audio backend running - using direct ALSA capture path"
     else
+      if [ "$audio_remoteproc_rc" -eq 0 ] 2>/dev/null; then
+        log_fail "$TESTNAME FAIL - audio runtime is applicable but no managed recording backend or direct ALSA capture path is usable, reason=${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}, verify sound-card registration, topology, UCM, mixer routing, and image audio packages"
+        echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+        exit 1
+      fi
+
       log_skip "$TESTNAME SKIP - no audio backend running and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
       echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
@@ -590,6 +599,18 @@ if [ -z "$AUDIO_BACKEND" ]; then
 fi
 
 log_info "Using backend: $AUDIO_BACKEND"
+
+if ! command -v audio_prepare_backend_client_packages >/dev/null 2>&1; then
+  log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_backend_client_packages"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if ! audio_prepare_backend_client_packages "$AUDIO_BACKEND"; then
+  log_fail "$TESTNAME FAIL - failed to prepare $AUDIO_BACKEND playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
 
 backend_ok=0
 if [ "$AUDIO_BACKEND" = "alsa" ]; then
@@ -646,17 +667,24 @@ if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
 fi
 
 if [ "$backend_ok" -ne 1 ]; then
-  if [ "$AUDIO_BACKEND" = "alsa" ] || [ "$ALSA_CAPTURE_PROBED" -eq 1 ]; then
-    log_skip "$TESTNAME SKIP - ALSA capture path unavailable: ${AUDIO_ALSA_CAPTURE_REASON:-capture device could not be opened}"
-  else
-    log_skip "$TESTNAME SKIP - backend not available: $AUDIO_BACKEND"
+  if [ -n "$AUDIO_BACKEND_REQUESTED" ] ||
+     [ "$audio_remoteproc_rc" -eq 0 ] 2>/dev/null; then
+    if [ "$AUDIO_BACKEND" = "alsa" ] || [ "$ALSA_CAPTURE_PROBED" -eq 1 ]; then
+      log_fail "$TESTNAME FAIL - audio runtime is applicable but the ALSA capture path is unusable, reason=${AUDIO_ALSA_CAPTURE_REASON:-capture device could not be opened}"
+    else
+      log_fail "$TESTNAME FAIL - requested or applicable recording backend is unavailable: $AUDIO_BACKEND"
+    fi
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
   fi
+
+  log_skip "$TESTNAME SKIP - no applicable recording backend or ALSA capture path was discovered"
   echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
 fi
 
-# Package preparation has already completed above. Keep backend-client checks
-# read-only so automatic backend discovery cannot trigger package installation.
+# Package recovery above installs the complete client set for the selected
+# backend. These checks verify that the expected commands are now available.
 case "$AUDIO_BACKEND" in
   pipewire)
     if ! command -v wpctl >/dev/null 2>&1 ||
@@ -772,6 +800,12 @@ if [ -z "$SRC_ID" ] && [ -z "$AUDIO_BACKEND_REQUESTED" ] &&
 
     log_warn "$TESTNAME: falling back to direct ALSA capture device: $SRC_ID"
   else
+    if [ "$audio_remoteproc_rc" -eq 0 ] 2>/dev/null; then
+      log_fail "$TESTNAME FAIL - audio runtime is applicable but no physical PipeWire microphone source or direct ALSA capture path is usable, reason=${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}, verify sound-card registration, topology, UCM, mixer routing, and image audio packages"
+      echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+      exit 1
+    fi
+
     log_skip "$TESTNAME SKIP - no real capture source available, PipeWire mic source missing and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
     echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
     exit 0
@@ -821,13 +855,13 @@ if [ -z "$SRC_ID" ] && [ -z "$AUDIO_BACKEND_REQUESTED" ] &&
 fi
 
 if [ -z "$SRC_ID" ]; then
-  log_skip "$TESTNAME SKIP - requested source '$SRC_CHOICE' not available on any backend (${BACKENDS_TO_TRY:-unknown})"
-  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-  exit 0
-fi
+  if [ -n "$AUDIO_BACKEND_REQUESTED" ] ||
+     [ "$audio_remoteproc_rc" -eq 0 ] 2>/dev/null; then
+    log_fail "$TESTNAME FAIL - requested source '$SRC_CHOICE' is unavailable on ready audio backends (${BACKENDS_TO_TRY:-unknown}), verify the capture route and image audio configuration"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
 
-# Only skip if no source AND not on PipeWire.
-if [ -z "$SRC_ID" ] && [ "$AUDIO_BACKEND" != "pipewire" ]; then
   log_skip "$TESTNAME SKIP - requested source '$SRC_CHOICE' not available on any backend (${BACKENDS_TO_TRY:-unknown})"
   echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
   exit 0
@@ -861,6 +895,13 @@ if [ "$AUDIO_BACKEND" = "alsa" ]; then
         SRC_ID="$cand"
         log_info "ALSA auto-pick: using $SRC_ID"
       else
+        if [ -n "$AUDIO_BACKEND_REQUESTED" ] ||
+           [ "$audio_remoteproc_rc" -eq 0 ] 2>/dev/null; then
+          log_fail "$TESTNAME FAIL - audio runtime is applicable but no valid ALSA capture device was discovered, verify sound-card registration and the capture PCM configuration"
+          echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+          exit 1
+        fi
+
         log_skip "$TESTNAME SKIP - no valid ALSA capture device found"
         echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
         exit 0
@@ -889,7 +930,14 @@ else # ALSA
   log_info "Routing to source: name='$SRC_LABEL' choice=$SRC_CHOICE"
 fi
 
-# If fallback changed backend, ensure deps are present (non-fatal → SKIP)
+# If route discovery changed the backend, prepare that backend's complete
+# playback and recording client set before validating its commands.
+if ! audio_prepare_backend_client_packages "$AUDIO_BACKEND"; then
+  log_fail "$TESTNAME FAIL - failed to prepare fallback $AUDIO_BACKEND playback and recording clients"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
 case "$AUDIO_BACKEND" in
   pipewire)
     if ! command -v wpctl >/dev/null 2>&1 ||

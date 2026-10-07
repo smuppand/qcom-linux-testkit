@@ -25,6 +25,14 @@ Common helper dependency:
 Runner/utils/audio_common.sh
 ```
 
+On Debian, Ubuntu, and CentOS, the suite ensures the complete ALSA client
+package set before card validation. This provides both `aplay` and `arecord`
+from `alsa-utils`. Yocto continues to use image-provided clients.
+
+When invoked by root on Debian or CentOS, ALSA inventory and device-node checks
+run as the prepared regular audio user. This validates the same access context
+used by the functional playback and recording suites.
+
 ## What This Test Validates
 
 The test checks:
@@ -114,7 +122,8 @@ The test reports `FAIL` when:
 On CentOS Stream 10, `--overlay` prepares EPEL and the Qualcomm aarch64 and
 noarch RPM repositories, refreshes DNF metadata, and installs
 `audioreach-dkms`, `audioreach-pal`, and `audioreach-pipewire-plugin`. The
-default mode continues to use image-provided audio components.
+default mode ensures the distribution ALSA client package set before
+validation.
 
 ```sh
 ./run.sh [options]

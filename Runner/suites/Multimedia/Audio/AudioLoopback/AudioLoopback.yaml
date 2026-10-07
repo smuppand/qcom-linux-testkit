@@ -1,0 +1,21 @@
+metadata:
+  name: audio-loopback
+  format: "Lava-Test Test Definition 1.0"
+  description: "ALSA playback-to-capture loopback validation"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  DURATION: 5
+  PLAYBACK_DEVICE: ""
+  CAPTURE_DEVICE: ""
+  DMESG_SCAN: 1
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Audio/AudioLoopback/
+    - ./run.sh --duration "${DURATION}" --playback-device "${PLAYBACK_DEVICE}" --capture-device "${CAPTURE_DEVICE}" --dmesg-scan "${DMESG_SCAN}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh AudioLoopback.res

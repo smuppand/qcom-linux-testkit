@@ -28,7 +28,13 @@ test_result_init() {
         return 3
     fi
 
-    rm -f "$TEST_RESULT_FILE"
+    if [ "${TEST_RESULT_FILE_PREPARED:-0}" -eq 1 ] &&
+       [ -f "$TEST_RESULT_FILE" ] &&
+       [ ! -L "$TEST_RESULT_FILE" ]; then
+        : >"$TEST_RESULT_FILE"
+    else
+        rm -f "$TEST_RESULT_FILE"
+    fi
 }
 
 # test_result_record <PASS|FAIL|SKIP> <message>
