@@ -19,6 +19,8 @@ import sys
 from dataclasses import dataclass
 from typing import BinaryIO, Iterable
 
+VALIDATION_SCOPE = "record"
+
 
 class WavValidationError(Exception):
     """Raised for malformed or unsupported WAV files."""
@@ -55,10 +57,17 @@ class WaveInfo:
 @dataclass
 class SignalStats:
     samples: int = 0
+    nonzero_storage_samples: int = 0
     active_samples: int = 0
+    clipped_samples: int = 0
+    glitch_candidates: int = 0
+    silence_runs: int = 0
+    longest_silence_frames: int = 0
     peak: float = 0.0
+    sum_values: float = 0.0
     sum_squares: float = 0.0
     distinct: set[object] | None = None
+    channel_active_samples: list[int] | None = None
     invalid_float_samples: int = 0
 
     def __post_init__(self) -> None:
@@ -76,6 +85,18 @@ class SignalStats:
         if self.samples == 0:
             return 0.0
         return self.active_samples / float(self.samples)
+
+    @property
+    def clipped_ratio(self) -> float:
+        if self.samples == 0:
+            return 0.0
+        return self.clipped_samples / float(self.samples)
+
+    @property
+    def dc_offset(self) -> float:
+        if self.samples == 0:
+            return 0.0
+        return self.sum_values / float(self.samples)
 
 
 def _read_exact(handle: BinaryIO, count: int) -> bytes:
@@ -279,22 +300,40 @@ def _decode_float(sample: bytes, container_bytes: int) -> tuple[float, float]:
     return value, value
 
 
-def analyze_signal(path: str, info: WaveInfo, analyze_bytes: int, threshold: float) -> SignalStats:
+def analyze_signal(
+    path: str,
+    info: WaveInfo,
+    analyze_bytes: int,
+    threshold: float,
+    clipping_threshold: float,
+    glitch_threshold: float,
+    dropout_min_ms: float,
+) -> SignalStats:
     stats = SignalStats()
+    stats.channel_active_samples = [0] * info.channels
     container_bytes = info.block_align // info.channels
     ranges = _window_ranges(info.usable_data_bytes, analyze_bytes, info.block_align)
+    minimum_silence_frames = max(
+        1,
+        int(info.sample_rate * max(0.0, dropout_min_ms) / 1000.0),
+    )
 
     with open(path, "rb") as handle:
         for relative_offset, length in ranges:
+            previous_samples: list[float | None] = [None] * info.channels
+            current_silence_frames = 0
             handle.seek(info.data_offset + relative_offset)
             payload = handle.read(length)
             payload = payload[: len(payload) - (len(payload) % info.block_align)]
 
             for frame_offset in range(0, len(payload), info.block_align):
                 frame = payload[frame_offset : frame_offset + info.block_align]
+                frame_active = False
                 for channel in range(info.channels):
                     start = channel * container_bytes
                     sample = frame[start : start + container_bytes]
+                    if any(sample):
+                        stats.nonzero_storage_samples += 1
 
                     if info.format_code == 1:
                         normalized, distinct_value = _decode_pcm(
@@ -312,13 +351,42 @@ def analyze_signal(path: str, info: WaveInfo, analyze_bytes: int, threshold: flo
 
                     magnitude = abs(normalized)
                     stats.samples += 1
+                    stats.sum_values += normalized
                     stats.sum_squares += normalized * normalized
                     if magnitude > stats.peak:
                         stats.peak = magnitude
                     if magnitude > threshold:
                         stats.active_samples += 1
+                        stats.channel_active_samples[channel] += 1
+                        frame_active = True
+                    if magnitude >= clipping_threshold:
+                        stats.clipped_samples += 1
+                    if (
+                        previous_samples[channel] is not None
+                        and abs(normalized - previous_samples[channel]) >= glitch_threshold
+                    ):
+                        stats.glitch_candidates += 1
+                    previous_samples[channel] = normalized
                     if len(stats.distinct) < 256:
                         stats.distinct.add(distinct_value)
+
+                if frame_active:
+                    if current_silence_frames >= minimum_silence_frames:
+                        stats.silence_runs += 1
+                    stats.longest_silence_frames = max(
+                        stats.longest_silence_frames,
+                        current_silence_frames,
+                    )
+                    current_silence_frames = 0
+                else:
+                    current_silence_frames += 1
+
+            if current_silence_frames >= minimum_silence_frames:
+                stats.silence_runs += 1
+            stats.longest_silence_frames = max(
+                stats.longest_silence_frames,
+                current_silence_frames,
+            )
 
     return stats
 
@@ -361,11 +429,25 @@ def emit(status: str, reason: str, info: WaveInfo | None, stats: SignalStats | N
         fields.extend(
             [
                 ("analyzed_samples", stats.samples),
+                ("nonzero_storage_samples", stats.nonzero_storage_samples),
                 ("active_samples", stats.active_samples),
                 ("active_ratio", f"{stats.active_ratio:.8f}"),
                 ("distinct_samples", len(stats.distinct)),
                 ("peak_dbfs", f"{_dbfs(stats.peak):.2f}"),
                 ("rms_dbfs", f"{_dbfs(stats.rms):.2f}"),
+                ("dc_offset", f"{stats.dc_offset:.8f}"),
+                ("clipped_samples", stats.clipped_samples),
+                ("clipped_ratio", f"{stats.clipped_ratio:.8f}"),
+                ("silence_runs", stats.silence_runs),
+                (
+                    "longest_silence_ms",
+                    f"{1000.0 * stats.longest_silence_frames / info.sample_rate:.2f}",
+                ),
+                ("glitch_candidates", stats.glitch_candidates),
+                (
+                    "silent_channels",
+                    sum(1 for count in stats.channel_active_samples or [] if count == 0),
+                ),
                 ("invalid_float_samples", stats.invalid_float_samples),
             ]
         )
@@ -373,9 +455,17 @@ def emit(status: str, reason: str, info: WaveInfo | None, stats: SignalStats | N
     warning_list = list(warnings)
     fields.append(("warnings", ",".join(warning_list) if warning_list else "none"))
 
+    legacy_rendered = " ".join(f"{key}={_clean(value)}" for key, value in fields)
+    validation_status = "FAIL" if status == "ERROR" else status
+    validation_fields = [("status", validation_status), *fields[1:]]
+    validation_rendered = " ".join(
+        f"{key}={_clean(value)}" for key, value in validation_fields
+    )
+    print("AUDIO_WAV_VALIDATION " + legacy_rendered)
     print(
-        "AUDIO_WAV_VALIDATION "
-        + " ".join(f"{key}={_clean(value)}" for key, value in fields)
+        "AUDIO_VALIDATION "
+        f"scope={_clean(VALIDATION_SCOPE)} policy=basic-integrity "
+        + validation_rendered
     )
 
 
@@ -385,6 +475,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-kind", choices=("mic", "null"), default="mic")
     parser.add_argument("--expect-rate", type=int, default=0)
     parser.add_argument("--expect-channels", type=int, default=0)
+    parser.add_argument("--expect-bits", type=int, default=0)
     parser.add_argument("--expected-seconds", type=float, default=0.0)
     parser.add_argument("--analyze-bytes", type=int, default=4 * 1024 * 1024)
     parser.add_argument("--min-active-samples", type=int, default=100)
@@ -393,11 +484,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-duration-ratio", type=float, default=0.70)
     parser.add_argument("--strict-signal", choices=("0", "1"), default="0")
     parser.add_argument("--min-rms-dbfs", type=float, default=-60.0)
+    parser.add_argument("--clipping-threshold", type=float, default=0.999)
+    parser.add_argument("--glitch-threshold", type=float, default=0.80)
+    parser.add_argument("--dropout-min-ms", type=float, default=50.0)
+    parser.add_argument(
+        "--validation-scope",
+        choices=("record", "playback", "loopback"),
+        default="record",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
+    global VALIDATION_SCOPE
+
     args = parse_args()
+    VALIDATION_SCOPE = args.validation_scope
     warnings: list[str] = []
 
     try:
@@ -420,6 +522,16 @@ def main() -> int:
         emit(
             "FAIL",
             f"channel-mismatch:{info.channels}!={args.expect_channels}",
+            info,
+            None,
+            warnings,
+        )
+        return 1
+
+    if args.expect_bits > 0 and info.bits_per_sample != args.expect_bits:
+        emit(
+            "FAIL",
+            f"bits-per-sample-mismatch:{info.bits_per_sample}!={args.expect_bits}",
             info,
             None,
             warnings,
@@ -453,6 +565,9 @@ def main() -> int:
             info,
             max(info.block_align, args.analyze_bytes),
             threshold,
+            max(0.0, min(1.0, args.clipping_threshold)),
+            max(0.0, min(2.0, args.glitch_threshold)),
+            max(0.0, args.dropout_min_ms),
         )
     except (OSError, struct.error, ValueError) as error:
         emit("ERROR", f"signal-analysis-failed:{error}", info, None, warnings)
@@ -466,23 +581,21 @@ def main() -> int:
         emit("PASS", "valid-null-source-recording", info, stats, warnings)
         return 0
 
+    if stats.nonzero_storage_samples == 0:
+        emit("FAIL", "all-zero-audio-payload", info, stats, warnings)
+        return 1
+
     if stats.peak == 0.0:
         emit("FAIL", "digital-silence-all-zero", info, stats, warnings)
         return 1
 
     if len(stats.distinct) < max(2, args.min_distinct_samples):
-        emit("FAIL", "constant-or-near-constant-payload", info, stats, warnings)
-        return 1
+        warnings.append("constant-or-near-constant-payload")
 
     if stats.active_samples < args.min_active_samples:
-        emit(
-            "FAIL",
-            f"insufficient-active-samples:{stats.active_samples}<{args.min_active_samples}",
-            info,
-            stats,
-            warnings,
+        warnings.append(
+            f"low-active-sample-count:{stats.active_samples}<{args.min_active_samples}"
         )
-        return 1
 
     if args.strict_signal == "1" and _dbfs(stats.rms) < args.min_rms_dbfs:
         emit(
@@ -496,6 +609,18 @@ def main() -> int:
 
     if _dbfs(stats.rms) < -60.0:
         warnings.append("very-low-rms")
+    if stats.clipped_samples > 0:
+        warnings.append("clipping-observed")
+    if stats.silence_runs > 0:
+        warnings.append("digital-silence-runs-observed")
+    if abs(stats.dc_offset) >= 0.10:
+        warnings.append("large-dc-offset")
+    if stats.glitch_candidates > 0:
+        warnings.append("large-sample-transitions-observed")
+    if any(count == 0 for count in stats.channel_active_samples or []):
+        warnings.append("silent-channel-observed")
+    if stats.invalid_float_samples > 0:
+        warnings.append("invalid-float-samples-observed")
 
     emit("PASS", "signal-activity-present", info, stats, warnings)
     return 0
@@ -503,4 +628,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

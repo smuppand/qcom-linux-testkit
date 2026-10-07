@@ -29,6 +29,10 @@ On Debian, Ubuntu, and CentOS, the suite ensures the complete ALSA client
 package set before card validation. This provides both `aplay` and `arecord`
 from `alsa-utils`. Yocto continues to use image-provided clients.
 
+When invoked by root on Debian or CentOS, ALSA inventory and device-node checks
+run as the prepared regular audio user. This validates the same access context
+used by the functional playback and recording suites.
+
 ## What This Test Validates
 
 The test checks:

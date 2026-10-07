@@ -4,6 +4,13 @@
 
 This suite automates the validation of audio recording capabilities on Qualcomm Linux-based platforms. It supports PipeWire, PulseAudio, and direct ALSA backends with robust evidence-based PASS/FAIL logic, asset management, and diagnostic logging.
 
+The default CI policy blocks corrupt or empty WAV files, header-only payloads,
+all-zero audio, materially short captures, and explicitly requested format
+mismatches. RMS, peak, clipping, digital-silence runs, DC offset, large sample
+transitions, and silent-channel counts are emitted as diagnostic
+`AUDIO_VALIDATION` metrics. These metrics do not fail the default policy unless
+strict signal validation is explicitly enabled.
+
 ## Features
 
 - Supports **PipeWire**, **PulseAudio**, and direct **ALSA** backends
@@ -66,16 +73,20 @@ recovery. PipeWire ensures `pw-play`, `pw-record`, and `wpctl`; ALSA ensures
 `aplay` and `arecord`; PulseAudio ensures `paplay`, `parecord`, and `pactl`.
 Yocto continues to use image-provided clients.
 
+When launched by root on Debian or CentOS, the suite discovers and prepares the
+regular desktop audio user, then runs PipeWire, PulseAudio, UCM, mixer, and PCM
+operations in that user's context. Yocto retains its native execution model.
+
 ## Backend and Route Selection
 
 When no backend is requested, the suite uses automatic selection. A real PipeWire audio source uses `pw-record`, and a real PulseAudio source uses `parecord`. Camera, dummy, null, monitor, and loopback PipeWire nodes are not accepted as microphone sources.
 
-If automatic selection finds no physical managed microphone source, the suite probes direct ALSA capture. It selects a card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `arecord -D <device>`. This discovers the VA-DMIC capture route from its controls without selecting a form factor or assuming card `0`.
+If automatic selection finds no physical managed microphone source, the suite probes direct ALSA capture. It selects a card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `arecord -D <device>`. This discovers the VA-DMIC capture route from its controls without selecting a form factor or assuming card `0`. When audio remoteproc preflight proves that audio is applicable, failure of both managed-source discovery and direct ALSA probing is reported as FAIL so the image or runtime regression remains tracked. The same absence remains SKIP only when runtime preflight found no applicable audio subsystem.
 
 An explicit backend request is never replaced:
 
-- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-record` only and skips if PipeWire has no physical microphone source.
-- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `parecord` only and skips if no matching source is available.
+- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-record` only and fails if the requested physical microphone source is unavailable.
+- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `parecord` only and fails if the requested source is unavailable.
 - `--backend alsa` or `AUDIO_BACKEND=alsa` runs `arecord` with the discovered ALSA route.
 
 ## Audio Remoteproc Preflight
@@ -287,10 +298,10 @@ sh-5.3# ./run.sh --config-name "record_config1"
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] Using config: record_config1 (rate=8000Hz channels=1)
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] loop 1/1 start=2026-01-02T12:00:46Z rate=8000Hz channels=1 backend=pipewire source=mic(45)
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] exec: pw-record -v --rate=8000 --channels=1 "results/AudioRecord/record_8KHz_1ch.wav"
-[WARN] 2026-01-02 12:01:16 - [record_8KHz_1ch] nonzero rc=124 but recording looks valid (bytes=482634) - PASS
+[INFO] 2026-01-02 12:01:16 - Recorder ended through expected watchdog timeout rc=124, validated WAV payload is accepted
 [INFO] 2026-01-02 12:01:16 - [record_8KHz_1ch] evidence: pw_streaming=1 pa_streaming=0 alsa_running=1 asoc_path_on=1 bytes=482634 pw_log=1
 [PASS] 2026-01-02 12:01:16 - [record_8KHz_1ch] loop 1 OK (rc=0, 30s, bytes=482634)
-[INFO] 2026-01-02 12:01:16 - No relevant, non-benign errors for modules [results/AudioRecord] in recent dmesg.
+[INFO] 2026-01-02 12:01:16 - No relevant, non-benign errors for modules [snd|asoc|audio|lpass|q6|codec|xrun|underrun|overrun|pipewire|pulseaudio] in recent dmesg.
 [INFO] 2026-01-02 12:01:16 - Summary: total=1 pass=1 fail=0 skip=0
 [PASS] 2026-01-02 12:01:16 - AudioRecord PASS
 ```

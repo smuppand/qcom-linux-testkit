@@ -150,8 +150,8 @@ if [ "$AUDIO_EARLY_HELP_REQUESTED" -eq 1 ]; then
 fi
 
 # Resolve absolute output paths. The complete runner remains the root
-# orchestrator on Debian, so logs, results, inventory, and dmesg evidence stay
-# root-owned.
+# orchestrator on Debian and CentOS, so logs, results, inventory, and dmesg
+# evidence stay root-owned.
 RES_FILE="$SCRIPT_DIR/$TESTNAME.res"
 LOGDIR="$SCRIPT_DIR/results/$TESTNAME"
 
@@ -192,17 +192,17 @@ if ! audio_prepare_backend_client_packages alsa; then
     exit 1
 fi
 
-# Prepare only the Debian Audio account and group membership. This ALSA-only
+# Prepare only the desktop Audio account and group membership. This ALSA-only
 # testcase does not require a systemd user manager and does not re-execute the
-# complete runner as debian.
-if ! command -v audio_prepare_debian_audio_environment >/dev/null 2>&1; then
-    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_debian_audio_environment"
+# complete runner as the regular user.
+if ! command -v audio_prepare_desktop_audio_environment >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_desktop_audio_environment"
     echo "$TESTNAME FAIL" > "$RES_FILE"
     exit 1
 fi
 
-if ! audio_prepare_debian_audio_environment 0; then
-    log_fail "$TESTNAME FAIL: Debian Audio environment preparation failed"
+if ! audio_prepare_desktop_audio_environment 0; then
+    log_fail "$TESTNAME FAIL: desktop Audio environment preparation failed"
     echo "$TESTNAME FAIL" > "$RES_FILE"
     exit 1
 fi
@@ -398,7 +398,7 @@ fi
 # This testcase intentionally performs no PipeWire/PulseAudio runtime setup.
 # Do not call audio_prepare_overlay_runtime(), audio_restart_pipewire_service(),
 # or audio_restart_services_best_effort() here. Only the ALSA node validation
-# helpers below are executed as the Debian Audio user.
+# helpers below are executed as the prepared desktop Audio user.
 
 log_info "--------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase --------------------------"
