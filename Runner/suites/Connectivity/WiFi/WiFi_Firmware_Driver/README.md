@@ -13,9 +13,13 @@ This test is useful for verifying basic WiFi firmware and driver readiness befor
 - WiFi firmware is found under `/lib/firmware`, including readable symlinks
   and kernel-supported `.xz` or `.zst` compressed files.
 - The WiFi firmware family is detected.
+- Platform-specific WiFi DT requirements are present when the board identity is recognized.
 - Family-specific runtime preparation succeeds.
 - Family-specific modules are visible.
-- Firmware load or use evidence exists in the kernel log.
+- Recognized platform drivers have bound runtime devices, not only registered
+  or loaded modules.
+- Firmware load or use evidence exists in family-specific kernel messages or
+  an exposed wireless PHY.
 - Kernel logs do not show WiFi probe/runtime failures.
 
 ## Dependencies
@@ -89,7 +93,7 @@ The test passes when:
 
 1. Required tools are available.
 2. WiFi firmware is detected.
-3. Family-specific preparation and module checks pass.
+3. Family-specific preparation, module, and platform binding checks pass.
 4. Firmware load/use evidence is found.
 5. No WiFi probe/runtime failures are detected.
 
@@ -107,10 +111,15 @@ The test fails when:
 
 - Family-specific runtime preparation fails.
 - Expected family modules are not visible.
+- A recognized platform is missing its required WiFi DT compatible, support
+  modules, or bound runtime devices.
 - Firmware load/use evidence is not found.
 - WiFi probe/runtime failures are detected in the kernel log.
 
 ## Notes
 
 - The test currently detects ath12k, ath11k, and ath10k firmware families through common connectivity helpers.
+- Arduino VENTUNO Q requires `qcom,pcie-m2-1418-lga-connector` together with
+  `pcie-m2-e-connector`, plus bound `pwrseq-pcie-m2` and `ath11k_pci`
+  runtime devices. Loaded modules without those bindings are not sufficient.
 - This test does not validate association to an access point or IP assignment. Use `WiFi_Dynamic_IP` or `WiFi_Manual_IP` for connection validation.

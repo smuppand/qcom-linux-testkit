@@ -1,7 +1,7 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
-# Robustly find and source init_env
+# ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
     cd "$(dirname "$0")" || exit 1
     pwd
@@ -22,20 +22,25 @@ if [ -z "$INIT_ENV" ]; then
     exit 1
 fi
 
+# Only source once (idempotent)
+# NOTE: We intentionally **do not export** any new vars. They stay local to this shell.
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
+    __INIT_ENV_LOADED=1
 fi
 
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1090
+. "$INIT_ENV"
+# shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1091
 . "$TOOLS/lib_connectivity.sh"
 
-TESTNAME="WiFi_Firmware_Driver"
-test_path="$(find_test_case_by_name "$TESTNAME")"
+test_path="$(find_test_case_by_name WiFi_Firmware_Driver)"
 cd "$test_path" || exit 1
 
+TESTNAME="WiFi_Firmware_Driver"
 RES_FILE="./${TESTNAME}.res"
 WIFI_FW_PROBE_LOG_DIR="${WIFI_FW_PROBE_LOG_DIR:-./wifi_firmware_driver_dmesg}"
 WIFI_FW_PROBE_LOG_TAG="${WIFI_FW_PROBE_LOG_TAG:-${TESTNAME}/probe}"
@@ -64,6 +69,26 @@ fi
 log_info "Detected SoC model: $soc_model"
 
 suite_rc=0
+wifi_platform_expected=0
+
+log_info "=== WiFi DT Validation ==="
+if wifi_detect_platform_requirements; then
+    wifi_platform_expected=1
+    log_info "Detected platform-specific WiFi requirements: $WIFI_PLATFORM_NAME"
+
+    if wifi_platform_dt_present; then
+        log_pass "Required WiFi DT compatibles are present: $WIFI_REQUIRED_DT_COMPATIBLE, $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE node=$WIFI_DT_EVIDENCE"
+    else
+        log_fail "Required WiFi DT compatibles are missing or incomplete for $WIFI_PLATFORM_NAME: $WIFI_REQUIRED_DT_COMPATIBLE, $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE"
+        suite_rc=1
+    fi
+
+    if ! wifi_prepare_platform_modules; then
+        suite_rc=1
+    fi
+else
+    log_info "No platform-specific WiFi DT requirements were identified"
+fi
 
 log_info "=== WiFi Firmware Detection ==="
 if ! wifi_detect_firmware_info; then
@@ -83,6 +108,11 @@ fi
 
 log_info "=== Family-specific Module Visibility ==="
 if ! wifi_verify_family_modules "$WIFI_FW_FAMILY"; then
+    suite_rc=1
+fi
+
+if [ "$wifi_platform_expected" -eq 1 ] &&
+   ! wifi_verify_platform_modules; then
     suite_rc=1
 fi
 

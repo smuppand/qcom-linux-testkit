@@ -12,7 +12,8 @@ The test performs kernel configuration checks, device tree visibility checks, mo
 - Mandatory WiFi kernel configs are enabled.
 - Optional WiFi configs are reported when visible.
 - WiFi or combined WCN device tree entries are visible based on configured patterns.
-- WiFi driver module visibility is logged.
+- WiFi driver module visibility and recognized-platform driver bindings are
+  logged.
 - Target-specific WiFi driver kernel configs can be inferred and validated.
 - Kernel logs do not show WiFi probe/runtime failures.
 - A usable WiFi interface appears within the configured wait window.
@@ -64,9 +65,21 @@ WIFI_IFACE=wlan0 ./run.sh
 | `WIFI_DT_PATTERNS` | built-in list | Newline-separated DT compatible/name patterns |
 | `WIFI_DRIVER_MODULES` | built-in list | Newline-separated driver module names to log/check |
 
-Default DT patterns include Qualcomm/WCN and common WiFi identifiers such as `qcom,wcn7850`, `qcom,wcn6855`, `ath12k`, `ath11k`, `ath10k`, `wifi`, `wlan`, and `qca`.
+Default DT patterns include Qualcomm/WCN and common WiFi identifiers such as `qcom,wcn7850`, `qcom,wcn6855`, `ath12k`, `ath11k`, `ath10k`, `wifi`, `wlan`, and `qca`. PCIe M.2 WiFi coverage also includes `qcom,pcie-m2-1418-lga-connector` and `pcie-m2-e-connector`.
 
-Default module names include `ath12k_wifi7`, `ath12k`, `ath11k`, `ath11k_pci`, `ath10k_pci`, `ath10k_snoc`, `cfg80211`, `mac80211`, and `mhi`.
+Default module names include the ath12k, ath11k, and ath10k core and transport modules, `cfg80211`, `mac80211`, `mhi`, and the PCIe M.2 support module `pwrseq_pcie_m2`.
+
+Arduino VENTUNO Q is identified from its runtime `arduino,monza` compatible.
+On that platform the test requires the QCA2066 connector compatibles
+`qcom,pcie-m2-1418-lga-connector` and `pcie-m2-e-connector`, then validates
+`pwrseq_pcie_m2`, `ath11k`, and `ath11k_pci`. The platform and PCI drivers must
+also have bound runtime devices. Missing DT or driver binding evidence is a
+platform failure rather than an optional-hardware skip.
+
+The Ventuno Q DT and driver-binding prerequisites are checked before the
+interface wait or recovery path. A missing connector node or unbound mandatory
+driver therefore fails immediately instead of waiting for an interface that
+cannot be created or reloading an unbound module.
 
 ## LAVA usage
 
@@ -124,6 +137,8 @@ The test fails when:
 - Target-specific WiFi driver kernel configs are missing.
 - WiFi probe/runtime failures are detected.
 - The WiFi runtime stack is present but no usable interface appears.
+- A recognized platform is missing its required WiFi DT compatible, kernel
+  driver stack, or bound runtime devices.
 - The interface cannot be brought down.
 - The interface cannot be brought back up.
 
@@ -131,4 +146,6 @@ The test fails when:
 
 - This test does not connect to an access point.
 - Use `WiFi_Dynamic_IP` or `WiFi_Manual_IP` to validate association, DHCP, and external connectivity.
-- The test logs extra diagnostics when no interface appears or an interface toggle operation fails.
+- The test logs extra diagnostics when no interface appears or an interface
+  toggle operation fails, including bound driver devices and Qualcomm or
+  network-class PCI inventory for recognized platforms.

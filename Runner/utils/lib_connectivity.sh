@@ -163,7 +163,293 @@ wait_for_wifi_interface() {
 # Reuse the existing DT matcher with caller-provided WiFi node/compatible
 # patterns so run.sh stays small and gets built-in logging from functestlib.sh.
 wifi_dt_present() {
-    dt_confirm_node_or_compatible_all "$@"
+    wifi_dp_root="$(dt_runtime_root 2>/dev/null || true)"
+    [ -n "$wifi_dp_root" ] || return 1
+
+    DT_ROOT="$wifi_dp_root" dt_confirm_node_or_compatible_all "$@"
+}
+
+# Detect platforms whose WiFi DT and driver requirements are authoritative.
+# Callers use the returned shell variables to validate applicability without
+# encoding board-specific bus numbers or device paths.
+wifi_detect_platform_requirements() {
+    WIFI_PLATFORM_NAME=""
+    WIFI_REQUIRED_DT_COMPATIBLE=""
+    WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE=""
+    WIFI_REQUIRED_CORE_MODULE=""
+    WIFI_REQUIRED_BUS_MODULE=""
+    WIFI_REQUIRED_SUPPORT_MODULE=""
+    WIFI_REQUIRED_BUS_DRIVER_PATH=""
+    WIFI_REQUIRED_SUPPORT_DRIVER_PATH=""
+
+    if dt_list_compatible_nodes "arduino,monza" fixed >/dev/null 2>&1; then
+        WIFI_PLATFORM_NAME="Arduino VENTUNO Q"
+        WIFI_REQUIRED_DT_COMPATIBLE="qcom,pcie-m2-1418-lga-connector"
+        WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE="pcie-m2-e-connector"
+        WIFI_REQUIRED_CORE_MODULE="ath11k"
+        WIFI_REQUIRED_BUS_MODULE="ath11k_pci"
+        WIFI_REQUIRED_SUPPORT_MODULE="pwrseq_pcie_m2"
+        WIFI_REQUIRED_BUS_DRIVER_PATH="/sys/bus/pci/drivers/ath11k_pci"
+        WIFI_REQUIRED_SUPPORT_DRIVER_PATH="/sys/bus/platform/drivers/pwrseq-pcie-m2"
+        return 0
+    fi
+
+    return 1
+}
+
+# Return success when the platform-specific WiFi DT compatible is present.
+# WIFI_DT_EVIDENCE contains the resolved node path on success.
+wifi_platform_dt_present() {
+    WIFI_DT_EVIDENCE=""
+    wifi_pdt_candidates=""
+    wifi_pdt_candidate=""
+    wifi_pdt_compatibles=""
+
+    if [ -z "${WIFI_REQUIRED_DT_COMPATIBLE:-}" ] &&
+       ! wifi_detect_platform_requirements; then
+        return 1
+    fi
+
+    wifi_pdt_candidates="$(
+        dt_list_compatible_nodes \
+            "$WIFI_REQUIRED_DT_COMPATIBLE" \
+            fixed 2>/dev/null || true
+    )"
+    if [ -z "$wifi_pdt_candidates" ]; then
+        log_warn \
+            "No enabled DT node contains required compatible $WIFI_REQUIRED_DT_COMPATIBLE"
+        return 1
+    fi
+
+    while IFS= read -r wifi_pdt_candidate; do
+        [ -n "$wifi_pdt_candidate" ] || continue
+        wifi_pdt_compatibles="$(
+            dt_property_text "$wifi_pdt_candidate" compatible 2>/dev/null || true
+        )"
+        log_info \
+            "WiFi DT candidate: node=$wifi_pdt_candidate compatible=${wifi_pdt_compatibles:-unreadable}"
+
+        case " $wifi_pdt_compatibles " in
+            *" $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE "*)
+                # shellcheck disable=SC2034  # Returned to suite callers.
+                WIFI_DT_EVIDENCE="$wifi_pdt_candidate"
+                return 0
+                ;;
+        esac
+    done <<EOF
+$wifi_pdt_candidates
+EOF
+
+    log_warn \
+        "No matching WiFi DT node also contains required compatible $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE"
+    return 1
+}
+
+# Print bound devices for a sysfs driver directory. Driver control files are
+# regular files, while bound devices are symlinks resolving below /sys/devices.
+wifi_driver_bound_devices() {
+    wifi_dbd_driver_path="$1"
+    wifi_dbd_entry=""
+    wifi_dbd_target=""
+    wifi_dbd_found=0
+
+    [ -d "$wifi_dbd_driver_path" ] || return 1
+
+    for wifi_dbd_entry in "$wifi_dbd_driver_path"/*; do
+        [ -L "$wifi_dbd_entry" ] || continue
+        wifi_dbd_target="$(readlink -f "$wifi_dbd_entry" 2>/dev/null || true)"
+
+        case "$wifi_dbd_target" in
+            /sys/devices/*)
+                printf '%s\n' "${wifi_dbd_entry##*/}"
+                wifi_dbd_found=1
+                ;;
+        esac
+    done
+
+    [ "$wifi_dbd_found" -eq 1 ]
+}
+
+# Return success only when a registered driver has at least one bound device.
+wifi_driver_has_bound_device() {
+    wifi_driver_bound_devices "$1" >/dev/null 2>&1
+}
+
+# Log a compact platform binding and PCI inventory for missing-WiFi diagnosis.
+wifi_log_platform_runtime_info() {
+    wifi_lpri_driver_path=""
+    wifi_lpri_devices=""
+    wifi_lpri_pci_device=""
+    wifi_lpri_vendor=""
+    wifi_lpri_device_id=""
+    wifi_lpri_class=""
+    wifi_lpri_driver=""
+    wifi_lpri_driver_target=""
+    wifi_lpri_pci_found=0
+
+    for wifi_lpri_driver_path in \
+        "${WIFI_REQUIRED_SUPPORT_DRIVER_PATH:-}" \
+        "${WIFI_REQUIRED_BUS_DRIVER_PATH:-}"; do
+        [ -n "$wifi_lpri_driver_path" ] || continue
+
+        wifi_lpri_devices="$(
+            wifi_driver_bound_devices "$wifi_lpri_driver_path" 2>/dev/null || true
+        )"
+        if [ -n "$wifi_lpri_devices" ]; then
+            printf '%s\n' "$wifi_lpri_devices" |
+                while IFS= read -r wifi_lpri_bound_device; do
+                    [ -n "$wifi_lpri_bound_device" ] || continue
+                    log_info \
+                        "[wifi-driver-binding] driver=${wifi_lpri_driver_path##*/} device=$wifi_lpri_bound_device"
+                done
+        else
+            log_warn \
+                "[wifi-driver-binding] driver=${wifi_lpri_driver_path##*/} has no bound runtime device"
+        fi
+    done
+
+    log_info "--- Qualcomm and network-class PCI devices ---"
+    for wifi_lpri_pci_device in /sys/bus/pci/devices/*; do
+        [ -d "$wifi_lpri_pci_device" ] || continue
+        wifi_lpri_vendor="$(cat "$wifi_lpri_pci_device/vendor" 2>/dev/null || true)"
+        wifi_lpri_device_id="$(cat "$wifi_lpri_pci_device/device" 2>/dev/null || true)"
+        wifi_lpri_class="$(cat "$wifi_lpri_pci_device/class" 2>/dev/null || true)"
+
+        case "$wifi_lpri_vendor:$wifi_lpri_class" in
+            0x17cb:*|*:0x02*)
+                wifi_lpri_pci_found=1
+                wifi_lpri_driver="unbound"
+                if [ -L "$wifi_lpri_pci_device/driver" ]; then
+                    wifi_lpri_driver_target="$(
+                        readlink -f "$wifi_lpri_pci_device/driver" 2>/dev/null || true
+                    )"
+                    if [ -n "$wifi_lpri_driver_target" ]; then
+                        wifi_lpri_driver="${wifi_lpri_driver_target##*/}"
+                    else
+                        wifi_lpri_driver="unknown"
+                    fi
+                fi
+                log_info \
+                    "[wifi-pci] device=${wifi_lpri_pci_device##*/} vendor=${wifi_lpri_vendor:-unknown} id=${wifi_lpri_device_id:-unknown} class=${wifi_lpri_class:-unknown} driver=$wifi_lpri_driver"
+                ;;
+        esac
+    done
+
+    if [ "$wifi_lpri_pci_found" -eq 0 ]; then
+        log_warn "[wifi-pci] No Qualcomm or network-class PCI device was enumerated"
+    fi
+}
+
+# Return success for a loaded or built-in module. An optional registered-driver
+# path covers built-in transport drivers that do not appear in /proc/modules.
+wifi_module_or_driver_active() {
+    wifi_moda_module="$1"
+    wifi_moda_driver_path="${2:-}"
+
+    if [ -d "/sys/module/$wifi_moda_module" ] ||
+       is_module_loaded "$wifi_moda_module"; then
+        return 0
+    fi
+
+    [ -n "$wifi_moda_driver_path" ] && [ -d "$wifi_moda_driver_path" ]
+}
+
+# Load the image-provided support and bus modules required by a recognized
+# platform. This does not install packages and remains a no-op elsewhere.
+wifi_prepare_platform_modules() {
+    wifi_ppm_rc=0
+
+    if [ -z "${WIFI_PLATFORM_NAME:-}" ] &&
+       ! wifi_detect_platform_requirements; then
+        return 0
+    fi
+
+    if ! wifi_module_or_driver_active \
+        "$WIFI_REQUIRED_SUPPORT_MODULE" \
+        "$WIFI_REQUIRED_SUPPORT_DRIVER_PATH"; then
+        if command -v modprobe >/dev/null 2>&1 &&
+           modprobe "$WIFI_REQUIRED_SUPPORT_MODULE" 2>/dev/null; then
+            log_info "Loaded WiFi platform support module: $WIFI_REQUIRED_SUPPORT_MODULE"
+        else
+            log_warn "Required WiFi platform support is inactive: module=$WIFI_REQUIRED_SUPPORT_MODULE driver=pwrseq-pcie-m2"
+            wifi_ppm_rc=1
+        fi
+    fi
+
+    if ! wifi_module_or_driver_active \
+        "$WIFI_REQUIRED_BUS_MODULE" \
+        "$WIFI_REQUIRED_BUS_DRIVER_PATH"; then
+        if command -v modprobe >/dev/null 2>&1 &&
+           modprobe "$WIFI_REQUIRED_BUS_MODULE" 2>/dev/null; then
+            log_info "Loaded WiFi bus driver module: $WIFI_REQUIRED_BUS_MODULE"
+        else
+            log_warn "Required WiFi bus driver is inactive: $WIFI_REQUIRED_BUS_MODULE"
+            wifi_ppm_rc=1
+        fi
+    fi
+
+    return "$wifi_ppm_rc"
+}
+
+# Validate all modules and driver bindings required by a recognized WiFi
+# platform. Module state and registered-driver evidence cover built-in drivers,
+# while bound-device evidence proves that mandatory hardware enumerated.
+wifi_verify_platform_modules() {
+    wifi_vpm_rc=0
+
+    if [ -z "${WIFI_PLATFORM_NAME:-}" ] &&
+       ! wifi_detect_platform_requirements; then
+        return 0
+    fi
+
+    if wifi_module_or_driver_active "$WIFI_REQUIRED_CORE_MODULE"; then
+        log_pass "Required WiFi core module is active: $WIFI_REQUIRED_CORE_MODULE"
+    else
+        log_fail "Required WiFi core module is inactive: $WIFI_REQUIRED_CORE_MODULE"
+        wifi_vpm_rc=1
+    fi
+
+    if wifi_module_or_driver_active \
+        "$WIFI_REQUIRED_BUS_MODULE" \
+        "$WIFI_REQUIRED_BUS_DRIVER_PATH"; then
+        log_pass "Required WiFi bus driver is active: $WIFI_REQUIRED_BUS_MODULE"
+    else
+        log_fail "Required WiFi bus driver is inactive: $WIFI_REQUIRED_BUS_MODULE"
+        wifi_vpm_rc=1
+    fi
+
+    if wifi_driver_has_bound_device "$WIFI_REQUIRED_BUS_DRIVER_PATH"; then
+        log_pass \
+            "Required WiFi bus driver has a bound runtime device: $WIFI_REQUIRED_BUS_MODULE"
+    else
+        log_fail \
+            "Required WiFi bus driver has no bound runtime device: $WIFI_REQUIRED_BUS_MODULE"
+        wifi_vpm_rc=1
+    fi
+
+    if wifi_module_or_driver_active \
+        "$WIFI_REQUIRED_SUPPORT_MODULE" \
+        "$WIFI_REQUIRED_SUPPORT_DRIVER_PATH"; then
+        log_pass "Required WiFi platform support is active: $WIFI_REQUIRED_SUPPORT_MODULE"
+    else
+        log_fail "Required WiFi platform support is inactive: $WIFI_REQUIRED_SUPPORT_MODULE"
+        wifi_vpm_rc=1
+    fi
+
+    if wifi_driver_has_bound_device "$WIFI_REQUIRED_SUPPORT_DRIVER_PATH"; then
+        log_pass \
+            "Required WiFi platform support has a bound runtime device: $WIFI_REQUIRED_SUPPORT_MODULE"
+    else
+        log_fail \
+            "Required WiFi platform support has no bound runtime device: $WIFI_REQUIRED_SUPPORT_MODULE"
+        wifi_vpm_rc=1
+    fi
+
+    if [ "$wifi_vpm_rc" -ne 0 ]; then
+        wifi_log_platform_runtime_info
+    fi
+
+    return "$wifi_vpm_rc"
 }
 
 # Print WiFi-related loaded modules and, when found, the resolved .ko path
@@ -175,7 +461,7 @@ wifi_log_module_info() {
     for mod in "$@"; do
         [ -n "$mod" ] || continue
  
-        if is_module_loaded "$mod"; then
+        if wifi_module_or_driver_active "$mod"; then
             log_pass "Module loaded: $mod"
         else
             log_info "Module not loaded: $mod"
@@ -239,11 +525,24 @@ wifi_stack_present() {
 infer_wifi_driver_cfgs() {
     cfgs=""
 
-    if is_module_loaded ath11k || get_kernel_log 2>/dev/null | grep -Eq '(^|[^[:alnum:]_])ath11k([^[:alnum:]_]|$)'; then
-        cfgs="CONFIG_ATH11K"
+    if wifi_detect_platform_requirements &&
+       [ "$WIFI_REQUIRED_CORE_MODULE" = "ath11k" ]; then
+        cfgs="CONFIG_ATH11K CONFIG_ATH11K_PCI"
     fi
 
-    if is_module_loaded ath12k || is_module_loaded ath12k_wifi7 || get_kernel_log 2>/dev/null | grep -Eq '(^|[^[:alnum:]_])ath12k([^[:alnum:]_]|$)|(^|[^[:alnum:]_])ath12k_wifi7([^[:alnum:]_]|$)'; then
+    if wifi_module_or_driver_active ath11k || get_kernel_log 2>/dev/null | grep -Eq '(^|[^[:alnum:]_])ath11k([^[:alnum:]_]|$)'; then
+        case " $cfgs " in
+            *" CONFIG_ATH11K "*)
+                ;;
+            *)
+                cfgs="${cfgs:+$cfgs }CONFIG_ATH11K"
+                ;;
+        esac
+    fi
+
+    if wifi_module_or_driver_active ath12k ||
+       wifi_module_or_driver_active ath12k_wifi7 ||
+       get_kernel_log 2>/dev/null | grep -Eq '(^|[^[:alnum:]_])ath12k([^[:alnum:]_]|$)|(^|[^[:alnum:]_])ath12k_wifi7([^[:alnum:]_]|$)'; then
         if [ -n "$cfgs" ]; then
             cfgs="$cfgs CONFIG_ATH12K"
         else
@@ -369,6 +668,10 @@ wifi_dump_runtime_info() {
 
     log_info "--- rfkill list ---"
     rfkill list 2>/dev/null || true
+
+    if [ -n "${WIFI_PLATFORM_NAME:-}" ]; then
+        wifi_log_platform_runtime_info
+    fi
 }
 
 # Emit a compact WiFi debug bundle to stdout using existing DT and runtime
@@ -584,13 +887,17 @@ wifi_verify_family_modules() {
             ath12k_core_ok=0
             ath12k_bus_ok=0
 
-            if is_module_loaded ath12k; then
+            if wifi_module_or_driver_active ath12k; then
                 ath12k_core_ok=1
             else
                 log_fail "ath12k core module is not loaded."
             fi
 
-            if is_module_loaded ath12k_wifi7 || is_module_loaded ath12k_pci || is_module_loaded ath12k_ahb; then
+            if wifi_module_or_driver_active ath12k_wifi7 ||
+               wifi_module_or_driver_active \
+                   ath12k_pci \
+                   /sys/bus/pci/drivers/ath12k_pci ||
+               wifi_module_or_driver_active ath12k_ahb; then
                 ath12k_bus_ok=1
             else
                 log_fail "No ath12k transport/top module detected: ath12k_wifi7/ath12k_pci/ath12k_ahb"
@@ -606,12 +913,30 @@ wifi_verify_family_modules() {
             log_info "Checking active ath11k-related kernel modules."
             wifi_log_module_info ath11k ath11k_pci ath11k_ahb ath11k_snoc cfg80211 mac80211
 
-            if is_module_loaded ath11k || is_module_loaded ath11k_pci || \
-               is_module_loaded ath11k_ahb || is_module_loaded ath11k_snoc; then
+            ath11k_core_ok=0
+            ath11k_bus_ok=0
+
+            if wifi_module_or_driver_active ath11k; then
+                ath11k_core_ok=1
+            else
+                log_fail "ath11k core module is not active."
+            fi
+
+            if wifi_module_or_driver_active \
+                ath11k_pci \
+                /sys/bus/pci/drivers/ath11k_pci ||
+               wifi_module_or_driver_active ath11k_ahb ||
+               wifi_module_or_driver_active ath11k_snoc; then
+                ath11k_bus_ok=1
+            else
+                log_fail "No ath11k bus driver is active: ath11k_pci/ath11k_ahb/ath11k_snoc"
+            fi
+
+            if [ "$ath11k_core_ok" -eq 1 ] &&
+               [ "$ath11k_bus_ok" -eq 1 ]; then
                 return 0
             fi
 
-            log_fail "No ath11k-related kernel module detected."
             return 1
             ;;
         ath10k)
@@ -621,13 +946,17 @@ wifi_verify_family_modules() {
             ath10k_core_ok=0
             ath10k_bus_ok=0
 
-            if is_module_loaded ath10k_core; then
+            if wifi_module_or_driver_active ath10k_core; then
                 ath10k_core_ok=1
             else
                 log_fail "ath10k_core module is not loaded."
             fi
 
-            if is_module_loaded ath10k_snoc || is_module_loaded ath10k_pci || is_module_loaded ath10k_sdio; then
+            if wifi_module_or_driver_active ath10k_snoc ||
+               wifi_module_or_driver_active \
+                   ath10k_pci \
+                   /sys/bus/pci/drivers/ath10k_pci ||
+               wifi_module_or_driver_active ath10k_sdio; then
                 ath10k_bus_ok=1
             else
                 log_fail "No ath10k bus driver module detected: ath10k_snoc/ath10k_pci/ath10k_sdio"
@@ -659,13 +988,13 @@ wifi_firmware_loaded() {
 
     case "$family" in
         ath12k)
-            pattern='ath12k|ath12k_wifi7|WCN7850|wcn7850|amss.bin|m3.bin|board-2.bin|Hardware name|firmware'
+            pattern='ath12k|ath12k_wifi7|amss.bin|m3.bin|board-2.bin'
             ;;
         ath11k)
-            pattern='ath11k|WCN6855|WCN6750|wcn6855|wcn6750|amss.bin|wpss.mbn|board-2.bin|remoteproc|firmware'
+            pattern='ath11k|amss.bin|wpss.mbn|board-2.bin'
             ;;
         ath10k)
-            pattern='ath10k|WCN3990|wcn3990|wlanmdsp.mbn|firmware-[0-9].bin|board-2.bin|firmware'
+            pattern='ath10k|wlanmdsp.mbn|firmware-[0-9].bin|board-2.bin'
             ;;
         *)
             log_warn "[$tag] Unsupported WiFi firmware family for load evidence check: $family"

@@ -2,7 +2,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Robustly find and source init_env
+# ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
     cd "$(dirname "$0")" || exit 1
     pwd
@@ -23,14 +23,19 @@ if [ -z "$INIT_ENV" ]; then
     exit 1
 fi
 
+# Only source once (idempotent)
+# NOTE: We intentionally **do not export** any new vars. They stay local to this shell.
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
+    __INIT_ENV_LOADED=1
 fi
 
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1090
+. "$INIT_ENV"
+# shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1091
 . "$TOOLS/lib_connectivity.sh"
 
 TESTNAME="WiFi_OnOff"
@@ -43,6 +48,8 @@ qcom,wcn7850
 qcom,wcn6855
 qcom,wcn6750
 qcom,wcn3950
+qcom,pcie-m2-1418-lga-connector
+pcie-m2-e-connector
 ath12k
 ath11k
 ath10k
@@ -58,11 +65,16 @@ ath12k_wifi7
 ath12k
 ath11k
 ath11k_pci
+ath11k_ahb
+ath11k_snoc
 ath10k_pci
 ath10k_snoc
+ath10k_sdio
+ath10k_core
 cfg80211
 mac80211
 mhi
+pwrseq_pcie_m2
 EOF
 )"
 
@@ -76,6 +88,9 @@ WIFI_DT_PATTERNS="${WIFI_DT_PATTERNS:-$WIFI_DT_PATTERNS_DEFAULT}"
 WIFI_DRIVER_MODULES="${WIFI_DRIVER_MODULES:-$WIFI_DRIVER_MODULES_DEFAULT}"
 
 wifi_iface=""
+wifi_platform_expected=0
+wifi_platform_dt_ok=1
+wifi_platform_modules_ok=1
 
 # Convert a newline-separated config list into normal shell arguments and call
 # the requested helper without needing unquoted expansion in run.sh.
@@ -131,14 +146,50 @@ else
 fi
 
 log_info "=== WiFi DT Validation ==="
-if run_with_line_args wifi_dt_present "$WIFI_DT_PATTERNS"; then
+if wifi_detect_platform_requirements; then
+    wifi_platform_expected=1
+    log_info "Detected platform-specific WiFi requirements: $WIFI_PLATFORM_NAME"
+
+    if wifi_platform_dt_present; then
+        log_pass "Required WiFi DT compatibles are present: $WIFI_REQUIRED_DT_COMPATIBLE, $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE node=$WIFI_DT_EVIDENCE"
+    else
+        wifi_platform_dt_ok=0
+        log_fail "Required WiFi DT compatibles are missing or incomplete for $WIFI_PLATFORM_NAME: $WIFI_REQUIRED_DT_COMPATIBLE, $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE"
+    fi
+elif run_with_line_args wifi_dt_present "$WIFI_DT_PATTERNS"; then
     log_pass "WiFi/combined WCN DT entry/compatible matched."
 else
     log_warn "No WiFi/combined WCN DT entry/compatible matched from configured patterns."
 fi
 
+log_info "=== WiFi Platform Module Preparation ==="
+if ! wifi_prepare_platform_modules; then
+    log_warn "One or more platform-required WiFi modules could not be activated"
+fi
+
 log_info "=== WiFi Module Visibility ==="
 run_with_line_args wifi_log_module_info "$WIFI_DRIVER_MODULES"
+
+if [ "$wifi_platform_expected" -eq 1 ] &&
+   ! wifi_verify_platform_modules; then
+    wifi_platform_modules_ok=0
+fi
+
+if [ "$wifi_platform_expected" -eq 1 ] &&
+   [ "$wifi_platform_dt_ok" -ne 1 ]; then
+    log_fail_exit \
+        "$TESTNAME" \
+        "$WIFI_PLATFORM_NAME requires enabled DT compatibles $WIFI_REQUIRED_DT_COMPATIBLE and $WIFI_REQUIRED_DT_SECONDARY_COMPATIBLE on the same QCA2066 connector node. Update the target DT or image before running interface validation" \
+        ""
+fi
+
+if [ "$wifi_platform_expected" -eq 1 ] &&
+   [ "$wifi_platform_modules_ok" -ne 1 ]; then
+    log_fail_exit \
+        "$TESTNAME" \
+        "$WIFI_PLATFORM_NAME requires active and bound $WIFI_REQUIRED_SUPPORT_MODULE, $WIFI_REQUIRED_CORE_MODULE, and $WIFI_REQUIRED_BUS_MODULE drivers. Fix device enumeration or image driver integration before running interface validation" \
+        ""
+fi
 
 log_info "=== WiFi Driver Kernel Config Validation ==="
 wifi_driver_cfgs="$(infer_wifi_driver_cfgs)"
@@ -171,7 +222,7 @@ if [ -z "$wifi_iface" ]; then
     if wifi_has_probe_failures "$WIFI_PROBE_LOG_DIR" "$WIFI_PROBE_LOG_TAG"; then
         log_fail_exit "$TESTNAME" "WiFi driver probe/runtime failures detected and no usable WiFi interface was found." ""
     fi
- 
+
     if wifi_stack_present; then
         log_fail_exit "$TESTNAME" "WiFi runtime stack is present, but no usable WiFi interface was found after retries." ""
     fi
