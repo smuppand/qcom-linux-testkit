@@ -36,6 +36,9 @@ fi
 . "$TOOLS/functestlib.sh"
 
 # shellcheck disable=SC1090,SC1091
+. "$TOOLS/lib_pkg_provider.sh"
+
+# shellcheck disable=SC1090,SC1091
 . "$TOOLS/lib_fastrpc.sh"
 
 # shellcheck disable=SC1090,SC1091
@@ -324,7 +327,28 @@ RUN_DIR="$BIN_DIR"
 RUN_BIN="$RUN_DIR/fastrpc_test"
 
 if [ ! -x "$RUN_BIN" ]; then
-    test_result_finish "SKIP" "$TESTNAME SKIP - image-provided fastrpc_test is unavailable, expected=$RUN_BIN"
+    if [ "$RUN_DIR" = "/usr/bin" ] &&
+       command -v pkg_ensure_host_distro_package_set_present >/dev/null 2>&1; then
+        log_info "FastRPC test binary is unavailable, attempting mapped package recovery"
+        pkg_ensure_host_distro_package_set_present fastrpc
+        package_recovery_rc=$?
+
+        case "$package_recovery_rc" in
+            0)
+                if [ ! -x "$RUN_BIN" ]; then
+                    test_result_finish "FAIL" "$TESTNAME FAIL - FastRPC package set was installed but fastrpc_test is still unavailable, expected=$RUN_BIN"
+                fi
+                ;;
+            2)
+                test_result_finish "SKIP" "$TESTNAME SKIP - fastrpc_test is unavailable and no exact package recovery mapping applies to this operating system, expected=$RUN_BIN, provision the test binary in the image or use --bin-dir"
+                ;;
+            *)
+                test_result_finish "FAIL" "$TESTNAME FAIL - failed to recover the mapped FastRPC package set, expected packages=fastrpc-support fastrpc-tests binary=$RUN_BIN"
+                ;;
+        esac
+    else
+        test_result_finish "SKIP" "$TESTNAME SKIP - fastrpc_test is unavailable at the requested location, expected=$RUN_BIN, provision the test binary or select its directory with --bin-dir"
+    fi
 fi
 
 # -------------------- Logging root -----------------------------
