@@ -251,8 +251,12 @@ test_result_record "PASS" "Bluetooth adapter $BT_ADAPTER is powered on"
 bdaddr="$(btgetbdaddr "$BT_ADAPTER" 2>/dev/null || true)"
 [ -n "$bdaddr" ] && log_info "Adapter $BT_ADAPTER BD_ADDR=$bdaddr"
 
-if ! btkmdpresent; then
-    log_warn "Bluetooth kernel modules / driver not clearly present (btkmdpresent failed)."
+if btkmdpresent; then
+    log_info \
+        "Bluetooth kernel driver evidence: ${BT_KMD_EVIDENCE:-runtime}"
+else
+    log_warn \
+        "Bluetooth kernel driver was not detected through registered drivers, loaded modules, or the $BT_ADAPTER sysfs ancestry"
 fi
 
 if ! btfwpresent >/dev/null 2>&1; then

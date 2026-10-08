@@ -1651,7 +1651,7 @@ btloghcidiag() {
     adapter="${1:-}"
     diag_mode="${2:-basic}"
     diag_test_path="${3:-}"
-    bt_dmesg_modules="bluetooth|hci0|qca|wcn|btqca|hci_uart|serdev|rfkill|firmware|timeout"
+    bt_dmesg_modules="bluetooth|hci[0-9]|qca|wcn|btqca|hci_uart_qca|hci_qca|hci_uart|btqcomsmd|btusb|serdev|rfkill|firmware|timeout"
 
     log_warn "Bluetooth diagnostics: controller visibility/state is inconsistent"
 
@@ -4004,6 +4004,7 @@ bt_ensure_runtime_ready() {
 
 btfwloaded() {
     adapter="${1:-}"
+    btfw_log_re='Bluetooth|hci[0-9]|QCA|wcn|btqca|hci_uart_qca|hci_qca|hci_uart|btqcomsmd|btusb|WCN'
  
     # ---- Configurable patterns (override via env if needed) ----
     # Success markers:
@@ -4023,13 +4024,13 @@ btfwloaded() {
     if command -v get_kernel_log >/dev/null 2>&1; then
         out="$(
             get_kernel_log 2>/dev/null \
-            | grep -i -E 'Bluetooth|hci[0-9]|QCA|wcn|btqca|WCN' \
+            | grep -i -E "$btfw_log_re" \
             | tail -n "${BTFW_DMESG_TAIL:-600}"
         )"
     else
         out="$(
             dmesg 2>/dev/null \
-            | grep -i -E 'Bluetooth|hci[0-9]|QCA|wcn|btqca|WCN' \
+            | grep -i -E "$btfw_log_re" \
             | tail -n "${BTFW_DMESG_TAIL:-600}"
         )"
     fi
@@ -4112,15 +4113,71 @@ btfwloaded() {
     return 0
 }
 
+# Return success when a Bluetooth core or transport driver is present through
+# module state, a registered kernel driver, or a bound HCI device.
 btkmdpresent() {
-    present=0
-    for m in bluetooth hci_uart btqca; do
-        if [ -d "/sys/module/$m" ]; then present=1; break; fi
+    BT_KMD_EVIDENCE=""
+
+    # Recent Qualcomm UART kernels register the QCA serdev transport as
+    # hci_uart_qca while retaining hci_uart as the backing kernel module.
+    for btkmd_driver in \
+        /sys/bus/serial/drivers/hci_uart_qca \
+        /sys/bus/serial/drivers/qca \
+        /sys/bus/platform/drivers/btqcomsmd \
+        /sys/bus/usb/drivers/btusb
+    do
+        if [ -d "$btkmd_driver" ]; then
+            BT_KMD_EVIDENCE="registered-driver:${btkmd_driver##*/}"
+            export BT_KMD_EVIDENCE
+            return 0
+        fi
     done
-    if [ $present -eq 1 ]; then return 0; fi
-    if dmesg 2>/dev/null | grep -qi 'HCI UART protocol QCA registered'; then
-        return 0
-    fi
+
+    for btkmd_module in \
+        hci_uart_qca \
+        hci_qca \
+        hci_uart \
+        btqca \
+        btqcomsmd \
+        btusb \
+        bluetooth
+    do
+        if [ -d "/sys/module/$btkmd_module" ]; then
+            BT_KMD_EVIDENCE="module:$btkmd_module"
+            export BT_KMD_EVIDENCE
+            return 0
+        fi
+
+        if grep -q "^${btkmd_module}[[:space:]]" \
+            /proc/modules 2>/dev/null; then
+            BT_KMD_EVIDENCE="proc-module:$btkmd_module"
+            export BT_KMD_EVIDENCE
+            return 0
+        fi
+    done
+
+    # Preserve portability for built-in or renamed transports by accepting a
+    # runtime HCI device whose sysfs ancestry is bound to a kernel driver.
+    for btkmd_adapter in /sys/class/bluetooth/hci*; do
+        [ -e "$btkmd_adapter" ] || continue
+
+        btkmd_device="$(readlink -f "$btkmd_adapter/device" 2>/dev/null || true)"
+        while [ -n "$btkmd_device" ] && \
+              [ "$btkmd_device" != "/" ] && \
+              [ "$btkmd_device" != "/sys" ]; do
+            if [ -L "$btkmd_device/driver" ]; then
+                btkmd_bound_driver="$(
+                    readlink -f "$btkmd_device/driver" 2>/dev/null || true
+                )"
+                BT_KMD_EVIDENCE="bound-driver:${btkmd_bound_driver##*/}"
+                export BT_KMD_EVIDENCE
+                return 0
+            fi
+
+            btkmd_device=$(dirname "$btkmd_device")
+        done
+    done
+
     return 1
 }
 

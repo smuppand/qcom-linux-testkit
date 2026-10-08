@@ -164,6 +164,7 @@ if dt_confirm_node_or_compatible_all \
     "qcom,wcn7850-bt" \
     "qcom,wcn6855-bt" \
     "qcom,wcn6750-bt" \
+    "qcom,qca2066-bt" \
     "qcom,bluetooth" \
     "pcie-m2-e-connector"
 then
@@ -268,9 +269,13 @@ fi
 
 # ---------- Kernel modules / KMD ----------
 if btkmdpresent; then
-    test_result_record "PASS" "Kernel BT driver stack is present"
+    test_result_record \
+        "PASS" \
+        "Kernel BT driver stack is present, evidence=${BT_KMD_EVIDENCE:-runtime}"
 else
-    test_result_record "FAIL" "Kernel BT driver stack was not detected"
+    test_result_record \
+        "FAIL" \
+        "Kernel BT driver stack was not detected through registered drivers, loaded modules, or HCI sysfs ancestry"
 fi
 
 # ---------- HCI presence ----------
@@ -372,7 +377,8 @@ else
 fi
 
 log_info "=== lsmod (subset: BT stack) ==="
-lsmod 2>/dev/null | grep -E '^(bluetooth|hci_uart|btqca|btbcm|rfkill|cfg80211)\b' || true
+lsmod 2>/dev/null | \
+    grep -E '^(bluetooth|hci_uart|hci_uart_qca|hci_qca|btqca|btqcomsmd|btusb|btbcm|rfkill|cfg80211)\b' || true
 
 # ---------- Final result ----------
 log_info "Completed with WARN=${WARN_COUNT}, FAIL=${TEST_RESULT_FAIL_COUNT}"
