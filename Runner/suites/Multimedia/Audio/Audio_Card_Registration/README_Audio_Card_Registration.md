@@ -119,6 +119,10 @@ The test reports `FAIL` when:
 
 ## Command Line Usage
 
+AudioReach is not enabled for Ubuntu. An explicit `--overlay` request reports
+SKIP before any AudioReach source refresh or package operation. Run without
+`--overlay` to validate Ubuntu ALSA card registration.
+
 On CentOS Stream 10, `--overlay` prepares EPEL and the Qualcomm aarch64 and
 noarch RPM repositories, refreshes DNF metadata, and installs
 `audioreach-dkms`, `audioreach-pal`, and `audioreach-pipewire-plugin`. The

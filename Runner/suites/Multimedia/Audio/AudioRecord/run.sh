@@ -135,6 +135,7 @@ Usage: $0 [options]
   --source {mic|null}
   --overlay              Prepare the Debian or CentOS Qualcomm AudioReach overlay
                          Without this flag, use the native/base stack.
+                         Ubuntu reports SKIP because AudioReach is not enabled.
   --config-name "record_config1" # Test specific config(s) by name (space-separated)
                                  # Also supports record_config1, record_config2, ..., record_config10
   --config-filter "48KHz" # Filter configs by pattern
@@ -208,6 +209,11 @@ case "$audio_prepare_rc" in
     ;;
   2)
     log_skip "$TESTNAME SKIP - AudioReach kernel package changed, reboot required"
+    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+    ;;
+  3)
+    log_skip "$TESTNAME SKIP - AudioReach is not enabled for Ubuntu, rerun without --overlay to validate the base Audio stack"
     echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
     exit 0
     ;;

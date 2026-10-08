@@ -97,6 +97,10 @@ If the matching remoteproc is `running`, the suite records its name and firmware
 
 ## Overlay Build Support
 
+AudioReach is not enabled for Ubuntu. An explicit `./run.sh --overlay` request
+reports SKIP before any AudioReach source refresh or package operation. Rerun
+without `--overlay` to validate the Ubuntu base Audio stack.
+
 On CentOS Stream 10, an explicit `./run.sh --overlay` request ensures EPEL and
 the Qualcomm aarch64 and noarch RPM repositories, refreshes DNF metadata, and
 installs `audioreach-dkms`, `audioreach-pal`, and

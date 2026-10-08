@@ -96,16 +96,38 @@ resolve_clip() {
 
 # audio_ensure_download_client
 # Ensures that curl or wget is available. Takes no arguments and emits no
-# machine-readable stdout. Returns 0 when an image-provided downloader is
-# available and 1 otherwise. Runtime package installation is intentionally not
-# attempted by an audio test.
+# machine-readable stdout. It may install the complete mapped audio-download
+# package set on Ubuntu and writes diagnostics through log_* helpers. Returns 0
+# when a downloader is available and 1 otherwise.
 audio_ensure_download_client() {
   if command -v curl >/dev/null 2>&1 ||
      command -v wget >/dev/null 2>&1; then
     return 0
   fi
 
-  log_error "No image-provided downloader is available, provision curl or wget"
+  if command -v pkg_ensure_host_distro_package_set_present >/dev/null 2>&1; then
+    log_info "Audio asset download requires curl or wget, attempting mapped package recovery"
+    pkg_ensure_host_distro_package_set_present audio-download
+    audio_download_recovery_rc=$?
+
+    case "$audio_download_recovery_rc" in
+      0)
+        ;;
+      2)
+        log_warn "Audio downloader package recovery is not configured for this operating system"
+        ;;
+      *)
+        log_error "Failed to recover the audio-download package set"
+        ;;
+    esac
+  fi
+
+  if command -v curl >/dev/null 2>&1 ||
+     command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log_error "No downloader is available, provision curl and wget in the image or enable Ubuntu package recovery"
   return 1
 }
 
@@ -162,9 +184,9 @@ audio_has_runnable_discovery_clips() {
 # audio_fetch_assets_from_url <url>
 # Downloads and extracts the audio archive URL into AUDIO_CLIPS_BASE_DIR. The
 # URL must be non-empty. The function writes diagnostic logs and temporary
-# archive files, uses only image-provided download clients, and emits no
-# machine-readable stdout. Returns 0 when runnable clips are ready and 1 when
-# download, extraction, or validation fails.
+# archive files, may recover the mapped Ubuntu downloader package set, and
+# emits no machine-readable stdout. Returns 0 when runnable clips are ready and
+# 1 when download, extraction, or validation fails.
 audio_fetch_assets_from_url() {
   url="$1"
   clips_dir="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
@@ -5174,6 +5196,7 @@ audio_prepare_audioreach_udev_rule() {
 #   Debian overlay    - ensure audio-base and Debian AudioReach package sets
 #   Ubuntu server     - ensure ALSA utilities
 #   Ubuntu desktop    - ensure ALSA, PipeWire, PipeWire-Pulse, and WirePlumber
+#   Ubuntu overlay    - not enabled, report not applicable without package work
 #   CentOS base       - defer client recovery until backend selection
 #   CentOS overlay    - ensure the documented Qualcomm AudioReach RPM set
 #   other distros     - no-op until their package mappings are verified
@@ -5186,6 +5209,7 @@ audio_prepare_audioreach_udev_rule() {
 #   0 - ready or not applicable
 #   1 - package preparation failed
 #   2 - AudioReach DKMS package changed; reboot required
+#   3 - requested AudioReach overlay is not enabled on this distribution
 audio_prepare_test_packages() {
   atp_overlay_requested="${1:-0}"
  
@@ -5238,6 +5262,13 @@ audio_prepare_test_packages() {
       return 0
       ;;
   esac
+
+  if [ "$atp_os_id" = "ubuntu" ] &&
+     [ "$atp_overlay_requested" -eq 1 ]; then
+    log_info "Ubuntu AudioReach overlay is not enabled"
+    log_info "Run without --overlay to validate the Ubuntu base Audio stack"
+    return 3
+  fi
  
   # Host-distribution package preparation must run from root orchestration.
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
@@ -5355,11 +5386,13 @@ audio_prepare_test_packages() {
       atp_plugin_package="audioreach-pipewire-plugin"
       atp_dkms_package="audioreach-dkms"
       atp_support_package="audioreach-pal"
+      atp_overlay_source="auto"
       ;;
     *)
       atp_plugin_package="audioreach-pipewire-plugin"
-      atp_dkms_package="audioreach-kernel-dkms"
-      atp_support_package="audioreach-config"
+      atp_dkms_package="audioreach-dkms"
+      atp_support_package="audioreach-conf"
+      atp_overlay_source="qli-staging"
       ;;
   esac
 
@@ -5389,7 +5422,7 @@ audio_prepare_test_packages() {
   # treat the request as base mode.
   if ! pkg_ensure_optional_package_set_present \
       audio \
-      qli-staging \
+      "$atp_overlay_source" \
       auto \
       --overlay \
       "$@"; then

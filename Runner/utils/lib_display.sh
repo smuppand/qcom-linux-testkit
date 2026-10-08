@@ -17,6 +17,92 @@ EGLI_LAST_GL_RENDERER=""
 EGLI_LAST_PIPE_KIND=""
 EGLI_LAST_OUT=""
 
+# display_detect_ubuntu_variant
+# Classify an Ubuntu image as desktop or server from immutable OS metadata,
+# installed desktop meta-packages, and systemd display-target evidence. Output
+# is exactly "desktop" or "server" on stdout. Returns 0.
+display_detect_ubuntu_variant() {
+    display_duv_variant_id="$(
+        sed -n 's/^VARIANT_ID=//p' /etc/os-release 2>/dev/null |
+            sed -n '1p' |
+            sed 's/^"//;s/"$//' |
+            tr '[:upper:]' '[:lower:]'
+    )"
+
+    case "$display_duv_variant_id" in
+        *desktop*)
+            printf '%s\n' "desktop"
+            return 0
+            ;;
+        *server*|minimal|core)
+            printf '%s\n' "server"
+            return 0
+            ;;
+    esac
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+        for display_duv_package in \
+            ubuntu-desktop \
+            ubuntu-desktop-minimal \
+            ubuntu-desktop-raspi
+        do
+            if dpkg-query -W -f='${Status}\n' "$display_duv_package" 2>/dev/null |
+                grep -q '^install ok installed$'; then
+                printf '%s\n' "desktop"
+                return 0
+            fi
+        done
+    fi
+
+    if [ -s /etc/X11/default-display-manager ]; then
+        printf '%s\n' "desktop"
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl is-active --quiet display-manager.service 2>/dev/null; then
+        printf '%s\n' "desktop"
+        return 0
+    fi
+
+    printf '%s\n' "server"
+    return 0
+}
+
+# display_resolve_graphics_mode <os-id> <requested-mode>
+# Resolve the internal default mode without changing explicit base, overlay, or
+# auto requests. Output is one mode on stdout. Returns 1 for invalid input.
+display_resolve_graphics_mode() {
+    display_rgm_os_id="${1:-unknown}"
+    display_rgm_requested="${2:-default}"
+
+    case "$display_rgm_requested" in
+        base|overlay|auto)
+            printf '%s\n' "$display_rgm_requested"
+            return 0
+            ;;
+        default)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    case "$display_rgm_os_id" in
+        ubuntu)
+            printf '%s\n' "overlay"
+            ;;
+        debian|centos|rhel|fedora)
+            printf '%s\n' "base"
+            ;;
+        *)
+            printf '%s\n' "auto"
+            ;;
+    esac
+
+    return 0
+}
+
 debugfs_is_mounted() {
     awk '$3=="debugfs" && $2=="/sys/kernel/debug" {found=1} END{exit(found?0:1)}' /proc/mounts 2>/dev/null
 }

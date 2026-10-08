@@ -73,6 +73,7 @@ Options:
       On Debian or CentOS, ensure the Qualcomm AudioReach package set before
       validating ALSA card registration. Without this flag, use the
       native/base audio stack. This test never starts or restarts PipeWire.
+      Ubuntu reports SKIP because AudioReach is not enabled there.
 
   --wait-secs N
       Wait time for ALSA sound card registration.
@@ -170,6 +171,11 @@ case "$audio_prepare_rc" in
         ;;
     2)
         log_skip "$TESTNAME SKIP: AudioReach kernel package changed; reboot required"
+        echo "$TESTNAME SKIP" > "$RES_FILE"
+        exit 0
+        ;;
+    3)
+        log_skip "$TESTNAME SKIP: AudioReach is not enabled for Ubuntu, rerun without --overlay to validate the base Audio stack"
         echo "$TESTNAME SKIP" > "$RES_FILE"
         exit 0
         ;;

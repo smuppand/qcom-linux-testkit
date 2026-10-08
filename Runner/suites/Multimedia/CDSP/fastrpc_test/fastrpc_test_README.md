@@ -41,7 +41,10 @@ Supported capabilities:
 
 Have these on the target (or specify paths with the flags below):
 
-- `fastrpc_test` binary (from [github.com/quic/fastrpc](https://github.com/quic/fastrpc))
+- `fastrpc_test` binary (from [github.com/quic/fastrpc](https://github.com/quic/fastrpc)).
+  Supported Debian and Ubuntu image repositories provide it through the
+  `fastrpc-tests` package. The mapped runtime set also includes
+  `fastrpc-support`.
 - Optional `fastrpc-healthcheck`. When installed, this is the primary distro-independent
   capability source. An installed healthcheck that fails, times out, or produces an
   unrecognized or malformed report fails the suite. Runtime fallback is used only when the tool
@@ -56,8 +59,13 @@ Have these on the target (or specify paths with the flags below):
   search entries. The same merged value is exported through the domain-specific library paths.
 - Optional but recommended:
   - `stdbuf` for line-buffered output. Execution remains bounded without it.
-- The suite does not install packages at runtime on Yocto, Debian, Ubuntu, CentOS, or other
-  distributions. Provision `fastrpc_test`, its host libraries, and DSP skeletons in the image.
+- When the default `/usr/bin/fastrpc_test` is missing on Debian or Ubuntu, the
+  suite uses the shared package provider to recover the complete mapped
+  `fastrpc-support fastrpc-tests` set from the target's configured APT sources.
+  It does not add Debian `qli` sources on Ubuntu.
+- Yocto, CentOS, and distributions without an exact package mapping remain
+  image-managed and report SKIP when the binary is absent. A missing binary in
+  an explicitly selected `--bin-dir` also reports SKIP without package changes.
 - Missing optional image assets are reported as SKIP unless the operator explicitly selected a
   domain whose required runtime library is absent.
 
