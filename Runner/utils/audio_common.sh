@@ -96,16 +96,38 @@ resolve_clip() {
 
 # audio_ensure_download_client
 # Ensures that curl or wget is available. Takes no arguments and emits no
-# machine-readable stdout. Returns 0 when an image-provided downloader is
-# available and 1 otherwise. Runtime package installation is intentionally not
-# attempted by an audio test.
+# machine-readable stdout. It may install the complete mapped audio-download
+# package set on Ubuntu and writes diagnostics through log_* helpers. Returns 0
+# when a downloader is available and 1 otherwise.
 audio_ensure_download_client() {
   if command -v curl >/dev/null 2>&1 ||
      command -v wget >/dev/null 2>&1; then
     return 0
   fi
 
-  log_error "No image-provided downloader is available, provision curl or wget"
+  if command -v pkg_ensure_host_distro_package_set_present >/dev/null 2>&1; then
+    log_info "Audio asset download requires curl or wget, attempting mapped package recovery"
+    pkg_ensure_host_distro_package_set_present audio-download
+    audio_download_recovery_rc=$?
+
+    case "$audio_download_recovery_rc" in
+      0)
+        ;;
+      2)
+        log_warn "Audio downloader package recovery is not configured for this operating system"
+        ;;
+      *)
+        log_error "Failed to recover the audio-download package set"
+        ;;
+    esac
+  fi
+
+  if command -v curl >/dev/null 2>&1 ||
+     command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log_error "No downloader is available, provision curl and wget in the image or enable Ubuntu package recovery"
   return 1
 }
 
@@ -162,9 +184,9 @@ audio_has_runnable_discovery_clips() {
 # audio_fetch_assets_from_url <url>
 # Downloads and extracts the audio archive URL into AUDIO_CLIPS_BASE_DIR. The
 # URL must be non-empty. The function writes diagnostic logs and temporary
-# archive files, uses only image-provided download clients, and emits no
-# machine-readable stdout. Returns 0 when runnable clips are ready and 1 when
-# download, extraction, or validation fails.
+# archive files, may recover the mapped Ubuntu downloader package set, and
+# emits no machine-readable stdout. Returns 0 when runnable clips are ready and
+# 1 when download, extraction, or validation fails.
 audio_fetch_assets_from_url() {
   url="$1"
   clips_dir="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"

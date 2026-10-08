@@ -85,10 +85,12 @@ Yocto continues to use image-provided clients.
 
 When run as root, the suite uses the shared package provider to install missing
 Ubuntu audio packages. It does not run a blanket distribution upgrade.
-Network download uses an image-provided `curl` or `wget` and never installs a
-downloader package at runtime. Each displayed download attempt runs one client
-invocation with a finite deadline. When neither tool is available, the suite
-skips the download and reports the missing image prerequisite.
+When network download is requested and neither downloader is present, Ubuntu
+uses the shared package provider to install the complete `audio-download` set,
+`curl wget`, from the image's configured APT sources. Other distributions keep
+their image-provided downloader policy. Each displayed download attempt has a
+finite deadline. If recovery is unavailable or fails, the suite skips and
+reports the missing prerequisite.
 
 If the target already has a valid global IPv4 address but the generic ICMP
 probe is blocked, the suite preserves the active interface and lets the bounded

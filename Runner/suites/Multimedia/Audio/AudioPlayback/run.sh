@@ -777,7 +777,7 @@ if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
           log_info "Audio clips downloaded and extracted successfully"
         else
           log_error "Failed to download or extract audio clips from: $AUDIO_TAR_URL"
-          log_skip "$TESTNAME SKIP - Audio clips download failed"
+          log_skip "$TESTNAME SKIP - audio clips could not be downloaded or extracted, enable Ubuntu package recovery for curl and wget with HTTPS access or pre-provision clips under ${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
           echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
           exit 0
         fi
