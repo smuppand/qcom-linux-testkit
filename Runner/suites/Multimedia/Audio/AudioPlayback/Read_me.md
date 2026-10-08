@@ -105,6 +105,9 @@ when network activation is actually required. The absence of
 - `server` ensures `alsa-utils` for ALSA playback.
 - `desktop` ensures `alsa-utils`, `pipewire`, `pipewire-pulse`, `wireplumber`,
   `pipewire-bin`, and `pulseaudio-utils`.
+- AudioReach is not enabled for Ubuntu. An explicit `--overlay` request reports
+  SKIP before any AudioReach source refresh or package operation. Rerun without
+  `--overlay` to validate the Ubuntu base Audio stack.
 - Set `AUDIO_PACKAGE_UPDATE=1` only when installed packages should be upgraded
   as part of the test preparation.
 

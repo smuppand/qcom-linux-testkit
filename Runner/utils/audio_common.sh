@@ -5196,6 +5196,7 @@ audio_prepare_audioreach_udev_rule() {
 #   Debian overlay    - ensure audio-base and Debian AudioReach package sets
 #   Ubuntu server     - ensure ALSA utilities
 #   Ubuntu desktop    - ensure ALSA, PipeWire, PipeWire-Pulse, and WirePlumber
+#   Ubuntu overlay    - not enabled, report not applicable without package work
 #   CentOS base       - defer client recovery until backend selection
 #   CentOS overlay    - ensure the documented Qualcomm AudioReach RPM set
 #   other distros     - no-op until their package mappings are verified
@@ -5208,6 +5209,7 @@ audio_prepare_audioreach_udev_rule() {
 #   0 - ready or not applicable
 #   1 - package preparation failed
 #   2 - AudioReach DKMS package changed; reboot required
+#   3 - requested AudioReach overlay is not enabled on this distribution
 audio_prepare_test_packages() {
   atp_overlay_requested="${1:-0}"
  
@@ -5260,6 +5262,13 @@ audio_prepare_test_packages() {
       return 0
       ;;
   esac
+
+  if [ "$atp_os_id" = "ubuntu" ] &&
+     [ "$atp_overlay_requested" -eq 1 ]; then
+    log_info "Ubuntu AudioReach overlay is not enabled"
+    log_info "Run without --overlay to validate the Ubuntu base Audio stack"
+    return 3
+  fi
  
   # Host-distribution package preparation must run from root orchestration.
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
@@ -5377,11 +5386,13 @@ audio_prepare_test_packages() {
       atp_plugin_package="audioreach-pipewire-plugin"
       atp_dkms_package="audioreach-dkms"
       atp_support_package="audioreach-pal"
+      atp_overlay_source="auto"
       ;;
     *)
       atp_plugin_package="audioreach-pipewire-plugin"
-      atp_dkms_package="audioreach-kernel-dkms"
-      atp_support_package="audioreach-config"
+      atp_dkms_package="audioreach-dkms"
+      atp_support_package="audioreach-conf"
+      atp_overlay_source="qli-staging"
       ;;
   esac
 
@@ -5411,7 +5422,7 @@ audio_prepare_test_packages() {
   # treat the request as base mode.
   if ! pkg_ensure_optional_package_set_present \
       audio \
-      qli-staging \
+      "$atp_overlay_source" \
       auto \
       --overlay \
       "$@"; then

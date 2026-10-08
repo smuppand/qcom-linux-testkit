@@ -2601,6 +2601,9 @@ pkg_ensure_host_distro_package_set_present() {
 }
 
 # Avoid package-manager/network work when an optional package set is complete.
+# When an APT-backed optional set is incomplete, invalidate the shared update
+# marker so newly provisioned *.sources artifacts are installed and their
+# package indexes are downloaded before recovery is attempted.
 pkg_ensure_optional_package_set_present() {
     peops_set="$1"
     peops_source="$2"
@@ -2613,6 +2616,15 @@ pkg_ensure_optional_package_set_present() {
 
     if pkg_verify_package_set_installed "$peops_set"; then
         return 0
+    fi
+
+    peops_provider="$(pkg_active_provider)"
+
+    if [ "$peops_provider" = "apt" ]; then
+        peops_update_mark="${PKG_APT_UPDATED_MARK:-/tmp/qcom_testkit_apt_updated}"
+        rm -f "$peops_update_mark" 2>/dev/null || true
+        pkg_log_info "Optional APT package set is incomplete, refreshing source artifacts and package indexes"
+        pkg_log_info "Optional APT refresh target, set=$peops_set"
     fi
 
     if ! command -v pkg_ensure_optional_package_set >/dev/null 2>&1; then

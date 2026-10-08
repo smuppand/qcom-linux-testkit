@@ -154,6 +154,7 @@ Usage: $0 [options]
       On Debian or CentOS, ensure the Qualcomm AudioReach package set before
       playback. Both prepare the regular-user PipeWire runtime. Without this flag,
       use the native/base audio stack. qcom-distro/Yocto remains unchanged.
+      Ubuntu reports SKIP because AudioReach is not enabled there.
   --formats "wav" # Legacy matrix mode only
   --durations "short|short medium" # Legacy matrix mode only (not recommended for new tests)
   --clip-name "play_48KHz_16b_2ch" # Test specific clip(s) by name (space-separated)
@@ -288,6 +289,11 @@ case "$audio_prepare_rc" in
     ;;
   2)
     log_skip "$TESTNAME SKIP - AudioReach kernel package changed, reboot required"
+    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+    ;;
+  3)
+    log_skip "$TESTNAME SKIP - AudioReach is not enabled for Ubuntu, rerun without --overlay to validate the base Audio stack"
     echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
     exit 0
     ;;
