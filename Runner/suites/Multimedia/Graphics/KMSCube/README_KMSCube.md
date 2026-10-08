@@ -67,13 +67,27 @@ Direct runner usage:
 
 ```sh
 ./run.sh
+./run.sh --base
 ./run.sh --overlay
+./run.sh --auto
+./run.sh --timeout 90
 ./run.sh --help
 ```
 
-`--overlay` requests the Qualcomm graphics overlay on supported desktop
-distributions. `-h` and `--help` print usage and exit without changing package,
-GPU, display-manager, or Weston state. Unknown arguments are reported as FAIL.
+Ubuntu Desktop defaults to `--overlay`, so a plain `./run.sh` validates the
+Qualcomm KGSL/Adreno stack without requiring an explicit mode argument. Ubuntu
+Server is treated as headless and reports SKIP before graphics package or DRM
+runtime preparation. Debian, CentOS, RHEL, and Fedora default to `--base`. Use
+`--base`, `--overlay`, or `--auto` to override that policy explicitly on
+applicable desktop systems. An explicit `--base` request on Ubuntu Desktop
+reports SKIP because the supported Ubuntu graphics configuration is the
+Qualcomm overlay.
+
+KMSCube execution is bounded to 60 seconds by default. `--timeout SECONDS`
+changes that limit. A timeout is reported as FAIL, and display-manager or Weston
+state stopped by the suite is restored before exit. `-h` and `--help` print
+usage and exit without changing package, GPU, display-manager, or Weston state.
+Unknown arguments are reported as FAIL.
 
 #### Sample output:
 ```

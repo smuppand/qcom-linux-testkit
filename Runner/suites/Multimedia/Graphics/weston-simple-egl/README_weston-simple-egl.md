@@ -23,6 +23,15 @@ Yocto images must provide the required client and Weston runtime. Debian and Ubu
 
 ## Desktop distribution modes
 
+- Ubuntu Desktop defaults to `--overlay`, so a plain `./run.sh` validates the
+  Qualcomm KGSL/Adreno stack without requiring an explicit mode argument.
+- Ubuntu Server is treated as headless and reports SKIP before graphics package
+  or display-runtime preparation. Run the suite on Ubuntu Desktop to validate
+  graphics.
+- An explicit `--base` request on Ubuntu Desktop reports SKIP because the
+  supported Ubuntu graphics configuration is the Qualcomm overlay.
+- Debian, CentOS, RHEL, and Fedora default to `--base` for compatibility with
+  their selectable base and overlay package flows.
 - `./run.sh --base` selects the upstream MSM/freedreno stack and ensures the OS-specific Mesa package set.
 - `./run.sh --overlay` selects the Qualcomm KGSL/Adreno stack. A ready runtime is reused without package changes. Otherwise, the focused EGL/GLES package set is recovered and DKMS changes can require a reboot before validation continues.
 - Debian uses the `adreno-*` packages from `qli-staging`. Ubuntu uses the `qcom-adreno-*` packages and existing image APT sources, never Debian `qli` or `qli-staging`. CentOS uses the `adreno-*` RPMs from the configured Qualcomm RPM repositories.

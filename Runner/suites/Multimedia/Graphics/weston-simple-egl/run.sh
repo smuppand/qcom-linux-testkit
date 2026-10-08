@@ -5,7 +5,9 @@
 # Validate weston-simple-egl through a usable Weston compositor.
 #
 # Desktop distributions:
-# - default to the upstream MSM/freedreno base stack
+# - Ubuntu Desktop defaults to the Qualcomm KGSL/Adreno stack
+# - Ubuntu Server is headless and skips as not applicable
+# - Debian, CentOS, RHEL, and Fedora default to upstream MSM/freedreno
 # - --overlay selects the Qualcomm KGSL/Adreno package and boot stack
 # - --auto validates the currently selected stack without changing it
 # - use the unsynchronized client benchmark with a 60 FPS functional target in
@@ -47,7 +49,9 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     __INIT_ENV_LOADED=1
 fi
 
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1090
+. "$INIT_ENV"
+# shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/lib_display.sh"
@@ -63,6 +67,7 @@ if [ -r "$TOOLS/lib_module_reload.sh" ]; then
 fi
 
 TESTNAME="weston-simple-egl"
+RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
 
 DURATION="${DURATION:-30s}"
 STOP_GRACE="${STOP_GRACE:-3s}"
@@ -86,6 +91,7 @@ GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-}"
 
 OS_ID="unknown"
 DISTRO_GPU_HANDLING_SUPPORTED=0
+UBUNTU_GRAPHICS_VARIANT=""
 APP_PID=""
 
 while [ "$#" -gt 0 ]; do
@@ -246,13 +252,12 @@ test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || true)"
 
 if [ -z "$test_path" ] || [ ! -d "$test_path" ]; then
     log_fail "$TESTNAME FAIL - test directory not found"
-    echo "$TESTNAME FAIL" >"./${TESTNAME}.res"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
     exit 1
 fi
 
 cd "$test_path" || exit 1
 
-RES_FILE="./${TESTNAME}.res"
 RUN_LOG="./${TESTNAME}_run.log"
 
 : >"$RES_FILE"
@@ -307,21 +312,53 @@ if [ -z "$GPU_OVERLAY_GBM_PACKAGE" ]; then
 fi
 
 case "$OS_ID" in
-    debian|ubuntu|centos|rhel|fedora)
+    ubuntu)
         DISTRO_GPU_HANDLING_SUPPORTED=1
-
-        if [ "$REQUESTED_GRAPHICS_MODE" = "default" ]; then
-            REQUESTED_GRAPHICS_MODE="base"
-        fi
-
         ;;
 
-    *)
-        if [ "$REQUESTED_GRAPHICS_MODE" = "default" ]; then
-            REQUESTED_GRAPHICS_MODE="auto"
-        fi
+    debian|centos|rhel|fedora)
+        DISTRO_GPU_HANDLING_SUPPORTED=1
         ;;
 esac
+
+if ! command -v display_resolve_graphics_mode >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL - required graphics policy helper is unavailable: display_resolve_graphics_mode"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+    exit 0
+fi
+
+REQUESTED_GRAPHICS_MODE="$(
+    display_resolve_graphics_mode \
+        "$OS_ID" \
+        "$REQUESTED_GRAPHICS_MODE"
+)" || {
+    log_fail "$TESTNAME FAIL - unable to resolve graphics mode for os=$OS_ID"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+    exit 0
+}
+
+if [ "$OS_ID" = "ubuntu" ]; then
+    if ! command -v display_detect_ubuntu_variant >/dev/null 2>&1; then
+        log_fail "$TESTNAME FAIL - required Ubuntu profile helper is unavailable: display_detect_ubuntu_variant"
+        echo "$TESTNAME FAIL" >"$RES_FILE"
+        exit 0
+    fi
+
+    UBUNTU_GRAPHICS_VARIANT="$(display_detect_ubuntu_variant)"
+    log_info "Ubuntu graphics profile, $UBUNTU_GRAPHICS_VARIANT"
+
+    if [ "$UBUNTU_GRAPHICS_VARIANT" = "server" ]; then
+        log_skip "$TESTNAME SKIP - Ubuntu Server is headless, run this graphics test on Ubuntu Desktop with a graphical target and display manager"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+    fi
+
+    if [ "$REQUESTED_GRAPHICS_MODE" = "base" ]; then
+        log_skip "$TESTNAME SKIP - Ubuntu Desktop supports the Qualcomm overlay graphics configuration, use the default mode or --overlay"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+    fi
+fi
 
 log_info "Weston log directory, $SCRIPT_DIR"
 log_info "--------------------------------------------------------------------------"
@@ -765,7 +802,7 @@ fi
 log_info "Client finished, rc=${rc} elapsed=${elapsed}s"
 
 if [ "$clock_stepped" -eq 1 ]; then
-    log_warn "System clock stepped by ${clock_step}s during the run; FPS samples from the client are not trustworthy"
+    log_warn "System clock stepped by ${clock_step}s during the run, FPS samples from the client are not trustworthy"
 fi
 
 fps_count=0
