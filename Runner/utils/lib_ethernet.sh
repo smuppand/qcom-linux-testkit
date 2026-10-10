@@ -3,6 +3,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Shared helpers for Ethernet functional validation.
 
+QPS615_OVERLAY_NAME="VendorDtbOverlays"
+QPS615_OVERLAY_VALUE="staging"
+# QPS615 bring-up firmware namespace, used only for explicit first-time setup.
+QPS615_OVERLAY_DEFAULT_GUID="882f8c2b-9646-435f-8de5-f208ff80c1bd"
+
 # ethv_sanitize_text <text>
 #   Normalize text for a single-line, pipe-delimited result record.
 #   stdout: sanitized text with repeated whitespace collapsed.
@@ -258,11 +263,381 @@ ethv_get_physical_interfaces() {
     done
 }
 
+# ethv_qps615_collect_overlay_state <result-dir>
+#   Inspect the dynamically discovered VendorDtbOverlays EFI variable for the
+#   QPS615 FIT compatibility value without changing target state. stdout:
+#   diagnostics, returned state is exported through QPS615_OVERLAY_*.
+#   return: 0 when staging is selected, 1 when absent or set to another value,
+#   2 when EFI inspection is unavailable, and 3 for invalid arguments. Side
+#   effects: exports QPS615_OVERLAY_* state and refreshes retained evidence.
+ethv_qps615_collect_overlay_state() {
+    ethv_qos_result_dir="${1:-}"
+    ethv_qos_list_log="$ethv_qos_result_dir/qps615_efi_variables.log"
+    ethv_qos_print_log="$ethv_qos_result_dir/qps615_overlay_print.log"
+    ethv_qos_diag_log="$ethv_qos_result_dir/qps615_overlay_diagnostics.log"
+    ethv_qos_state_file="$ethv_qos_result_dir/qps615_overlay.tsv"
+
+    [ -n "$ethv_qos_result_dir" ] || return 3
+    mkdir -p "$ethv_qos_result_dir" || return 3
+    : >"$ethv_qos_list_log" || return 3
+    : >"$ethv_qos_print_log" || return 3
+    : >"$ethv_qos_diag_log" || return 3
+    : >"$ethv_qos_state_file" || return 3
+
+    QPS615_OVERLAY_VARIABLE=""
+    QPS615_OVERLAY_STATE="unavailable"
+    QPS615_OVERLAY_REASON="EFI FIT overlay inspection is unavailable"
+
+    for ethv_qos_helper in \
+        efi_find_variable_by_name \
+        efi_text_variable_matches \
+        efi_mount_exists; do
+        if ! command -v "$ethv_qos_helper" >/dev/null 2>&1; then
+            QPS615_OVERLAY_REASON="required EFI helper is unavailable: $ethv_qos_helper"
+            break
+        fi
+    done
+
+    if [ "$QPS615_OVERLAY_REASON" = "EFI FIT overlay inspection is unavailable" ]; then
+        for ethv_qos_command in efivar awk grep mktemp od sed tr; do
+            if ! command -v "$ethv_qos_command" >/dev/null 2>&1; then
+                QPS615_OVERLAY_REASON="image-provided EFI inspection command is unavailable: $ethv_qos_command"
+                break
+            fi
+        done
+    fi
+
+    if [ "$QPS615_OVERLAY_REASON" = "EFI FIT overlay inspection is unavailable" ]; then
+        if ! efi_mount_exists; then
+            QPS615_OVERLAY_REASON="efivarfs is not mounted at ${EFIVARFS_PATH:-/sys/firmware/efi/efivars}"
+        else
+            ethv_qos_lookup_status=0
+            QPS615_OVERLAY_VARIABLE="$(
+                efi_find_variable_by_name \
+                    "$QPS615_OVERLAY_NAME" \
+                    "$ethv_qos_list_log" \
+                    2>"$ethv_qos_diag_log"
+            )" || ethv_qos_lookup_status=$?
+
+            if [ "$ethv_qos_lookup_status" -eq 2 ]; then
+                QPS615_OVERLAY_REASON="EFI variable listing failed, inspect $ethv_qos_list_log and EFI runtime permissions"
+            elif [ "$ethv_qos_lookup_status" -eq 1 ] &&
+                 ! grep -Eq -- "-$QPS615_OVERLAY_NAME$" "$ethv_qos_list_log"; then
+                QPS615_OVERLAY_STATE="absent"
+                QPS615_OVERLAY_REASON="$QPS615_OVERLAY_NAME is absent from the successfully read EFI inventory"
+            elif [ -z "$QPS615_OVERLAY_VARIABLE" ]; then
+                QPS615_OVERLAY_REASON="$QPS615_OVERLAY_NAME was not uniquely discovered in the EFI variable inventory"
+            else
+                ethv_qos_read_status=0
+                efi_text_variable_matches \
+                    "$QPS615_OVERLAY_VARIABLE" \
+                    "$QPS615_OVERLAY_VALUE" \
+                    "$ethv_qos_print_log" || ethv_qos_read_status=$?
+                case "$ethv_qos_read_status" in
+                    0)
+                        QPS615_OVERLAY_STATE="configured"
+                        QPS615_OVERLAY_REASON="$QPS615_OVERLAY_VARIABLE contains $QPS615_OVERLAY_VALUE"
+                        ;;
+                    1)
+                        QPS615_OVERLAY_STATE="value-mismatch"
+                        QPS615_OVERLAY_REASON="$QPS615_OVERLAY_VARIABLE does not contain the required QPS615 FIT value $QPS615_OVERLAY_VALUE"
+                        ;;
+                    *)
+                        QPS615_OVERLAY_REASON="EFI variable $QPS615_OVERLAY_VARIABLE could not be inspected, see $ethv_qos_print_log"
+                        ;;
+                esac
+            fi
+        fi
+    fi
+
+    printf 'variable\t%s\nexpected_value\t%s\nstate\t%s\nreason\t%s\n' \
+        "${QPS615_OVERLAY_VARIABLE:-unavailable}" \
+        "$QPS615_OVERLAY_VALUE" \
+        "$QPS615_OVERLAY_STATE" \
+        "$QPS615_OVERLAY_REASON" >"$ethv_qos_state_file"
+
+    export QPS615_OVERLAY_VARIABLE QPS615_OVERLAY_STATE
+    export QPS615_OVERLAY_REASON
+    log_info "[QPS615-FIT] state=$QPS615_OVERLAY_STATE variable=${QPS615_OVERLAY_VARIABLE:-unavailable} expected_value=$QPS615_OVERLAY_VALUE reason=$QPS615_OVERLAY_REASON"
+
+    case "$QPS615_OVERLAY_STATE" in
+        configured)
+            return 0
+            ;;
+        absent|value-mismatch)
+            return 1
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+
+# ethv_qps615_prepare_overlay <result-dir>
+#   Explicitly select staging, mounting efivarfs when necessary and retaining it.
+#   Callers must arrange efi_restore_efivarfs_ro on exit and signals first.
+#   stdout: diagnostics.
+#   return: 0 when already selected, 1 on write or verification failure,
+#   2 when EFI mutation is unavailable, 3 for invalid arguments, and 4 after a
+#   verified update requiring reboot. Side effects: retains new mounts, restores
+#   initially read-only mounts, and writes one EFI variable after operator opt-in.
+ethv_qps615_prepare_overlay() {
+    ethv_qpo_result_dir="${1:-}"
+
+    [ -n "$ethv_qpo_result_dir" ] || return 3
+    mkdir -p "$ethv_qpo_result_dir" || return 3
+    EFI_REMOUNT_LOG="$ethv_qpo_result_dir/qps615_efi_remount.log"
+    export EFI_REMOUNT_LOG
+
+    for ethv_qpo_helper in \
+        efi_ensure_mounted \
+        efi_restore_efivarfs_ro \
+        efi_write_text_variable; do
+        if ! command -v "$ethv_qpo_helper" >/dev/null 2>&1; then
+            QPS615_OVERLAY_REASON="required EFI mutation helper is unavailable: $ethv_qpo_helper"
+            export QPS615_OVERLAY_REASON
+            return 2
+        fi
+    done
+
+    for ethv_qpo_command in efivar awk cp grep mktemp mount od sed sync tr; do
+        if ! command -v "$ethv_qpo_command" >/dev/null 2>&1; then
+            QPS615_OVERLAY_REASON="image-provided EFI mutation command is unavailable: $ethv_qpo_command"
+            export QPS615_OVERLAY_REASON
+            return 2
+        fi
+    done
+
+    ethv_qpo_status=0
+    if efi_ensure_mounted "$ethv_qpo_result_dir/qps615_efi_mount.log"; then
+        ethv_qps615_update_overlay "$ethv_qpo_result_dir" || ethv_qpo_status=$?
+    else
+        QPS615_OVERLAY_REASON="Could not mount EFI variable storage at $EFIVARFS_PATH, check EFI runtime support and mount permissions"
+        ethv_qpo_status=1
+    fi
+    if ! efi_restore_efivarfs_ro >>"$ethv_qpo_result_dir/qps615_efi_cleanup.log" 2>&1; then
+        QPS615_OVERLAY_REASON="${QPS615_OVERLAY_REASON:-Overlay preparation completed}, restoring EFI mount to read-only failed at $EFIVARFS_PATH, inspect qps615_efi_cleanup.log"
+        ethv_qpo_status=1
+    fi
+    export QPS615_OVERLAY_REASON
+    return "$ethv_qpo_status"
+}
+
+# ethv_qps615_update_overlay <result-dir>
+#   Update an accessible EFI overlay selection. Only the explicit preparation
+#   wrapper may call this helper. A successfully listed absent variable uses
+#   the documented QPS615 GUID. stdout: diagnostics. return: 0 already set,
+#   4 written, 1 write failure, 2 inspection unavailable. Side effects: retains
+#   before/after evidence and persists staging without a newline.
+ethv_qps615_update_overlay() {
+    ethv_qu_result_dir="$1"
+    ethv_qpo_state_status=0
+    ethv_qps615_collect_overlay_state "$ethv_qu_result_dir" || ethv_qpo_state_status=$?
+    case "$ethv_qpo_state_status" in
+        0)
+            return 0
+            ;;
+        2|3)
+            return 2
+            ;;
+    esac
+
+    for ethv_qu_before in qps615_overlay.tsv qps615_efi_variables.log qps615_overlay_print.log; do
+        if ! cp "$ethv_qu_result_dir/$ethv_qu_before" \
+            "$ethv_qu_result_dir/before_$ethv_qu_before"; then
+            QPS615_OVERLAY_REASON="Could not preserve EFI state before updating $QPS615_OVERLAY_NAME"
+            return 1
+        fi
+    done
+    if [ "$QPS615_OVERLAY_STATE" = "absent" ]; then
+        QPS615_OVERLAY_VARIABLE="$QPS615_OVERLAY_DEFAULT_GUID-$QPS615_OVERLAY_NAME"
+        log_info "Creating $QPS615_OVERLAY_VARIABLE using the QPS615 bring-up firmware namespace"
+    fi
+
+    if ! efi_write_text_variable \
+        "$QPS615_OVERLAY_VARIABLE" \
+        "$QPS615_OVERLAY_VALUE" \
+        "$ethv_qu_result_dir/qps615_overlay_write.log"; then
+        QPS615_OVERLAY_REASON="could not write $QPS615_OVERLAY_VALUE to $QPS615_OVERLAY_VARIABLE"
+        export QPS615_OVERLAY_REASON
+        return 1
+    fi
+
+    if ! ethv_qps615_collect_overlay_state "$ethv_qu_result_dir"; then
+        QPS615_OVERLAY_REASON="QPS615 FIT selection was written but EFI verification did not find $QPS615_OVERLAY_VALUE"
+        export QPS615_OVERLAY_REASON
+        return 1
+    fi
+
+    QPS615_OVERLAY_REASON="$QPS615_OVERLAY_VARIABLE was updated to $QPS615_OVERLAY_VALUE, reboot the target to load the QPS615 FIT device tree"
+    export QPS615_OVERLAY_REASON
+    return 4
+}
+
+# ethv_qps615_collect_dt_state <result-dir> <runtime-tsv>
+#   Discover enabled QPS615-compatible runtime DT nodes and validate the
+#   supply-backed public pwrctrl-tc9563 contract when declared. Nodes without
+#   supplies remain valid for integration forms that do not use the platform
+#   power-control driver. stdout: none. return: 0 when DT evidence is healthy,
+#   1 when a declared contract is malformed or unbound, and 3 for invalid
+#   arguments. Side effects: exports QPS615_DT_* and QPS615_PWRCTRL_* state.
+ethv_qps615_collect_dt_state() {
+    ethv_qds_result_dir="${1:-}"
+    ethv_qds_inventory="${2:-}"
+    ethv_qds_nodes="$ethv_qds_result_dir/qps615_dt_nodes.log"
+    ethv_qds_evidence="$ethv_qds_result_dir/qps615_dt_platform.tsv"
+
+    [ -n "$ethv_qds_result_dir" ] && [ -n "$ethv_qds_inventory" ] || return 3
+    mkdir -p "$ethv_qds_result_dir" || return 3
+    : >"$ethv_qds_nodes" || return 3
+    : >"$ethv_qds_evidence" || return 3
+
+    QPS615_DT_NODE_COUNT=0
+    QPS615_PWRCTRL_EXPECTED_COUNT=0
+    QPS615_PWRCTRL_BOUND_COUNT=0
+    QPS615_PWRCTRL_FAILURE_REASON=""
+
+    if command -v dt_list_compatible_nodes >/dev/null 2>&1; then
+        dt_list_compatible_nodes 'pci1179,0623' >"$ethv_qds_nodes" || true
+    fi
+
+    while IFS= read -r ethv_qds_node; do
+        [ -n "$ethv_qds_node" ] || continue
+        QPS615_DT_NODE_COUNT=$((QPS615_DT_NODE_COUNT + 1))
+        ethv_qds_compatible="$(
+            dt_property_text "$ethv_qds_node" compatible 2>/dev/null || true
+        )"
+        ethv_qds_status="$(
+            dt_property_text "$ethv_qds_node" status 2>/dev/null || true
+        )"
+        [ -n "$ethv_qds_status" ] || ethv_qds_status="okay"
+        ethv_qds_supply_count=0
+
+        for ethv_qds_property in \
+            vddc-supply \
+            vdd18-supply \
+            vdd09-supply \
+            vddio1-supply \
+            vddio2-supply \
+            vddio18-supply; do
+            if [ -e "$ethv_qds_node/$ethv_qds_property" ]; then
+                ethv_qds_supply_count=$((ethv_qds_supply_count + 1))
+            fi
+        done
+
+        ethv_qds_i2c="absent"
+        ethv_qds_resx="absent"
+        ethv_qds_platform="unavailable"
+        ethv_qds_driver="unbound"
+        [ -e "$ethv_qds_node/i2c-parent" ] && ethv_qds_i2c="present"
+        [ -e "$ethv_qds_node/resx-gpios" ] && ethv_qds_resx="present"
+
+        if [ "$ethv_qds_supply_count" -gt 0 ]; then
+            QPS615_PWRCTRL_EXPECTED_COUNT=$((QPS615_PWRCTRL_EXPECTED_COUNT + 1))
+            if [ "$ethv_qds_supply_count" -ne 6 ]; then
+                ethv_qds_reason="QPS615 DT node $ethv_qds_node declares $ethv_qds_supply_count of 6 required power supplies, provide vddc, vdd18, vdd09, vddio1, vddio2, and vddio18 supplies"
+                if [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+                    QPS615_PWRCTRL_FAILURE_REASON="$QPS615_PWRCTRL_FAILURE_REASON, $ethv_qds_reason"
+                else
+                    QPS615_PWRCTRL_FAILURE_REASON="$ethv_qds_reason"
+                fi
+            elif [ "$ethv_qds_i2c" != "present" ] || \
+                 [ "$ethv_qds_resx" != "present" ]; then
+                ethv_qds_reason="QPS615 DT node $ethv_qds_node declares all supplies but the power-control contract requires i2c-parent and resx-gpios, observed i2c_parent=$ethv_qds_i2c resx_gpios=$ethv_qds_resx"
+                if [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+                    QPS615_PWRCTRL_FAILURE_REASON="$QPS615_PWRCTRL_FAILURE_REASON, $ethv_qds_reason"
+                else
+                    QPS615_PWRCTRL_FAILURE_REASON="$ethv_qds_reason"
+                fi
+            else
+                ethv_qds_platform="$(
+                    find_platform_device_for_dt_node "$ethv_qds_node" \
+                        2>/dev/null || true
+                )"
+                if [ -n "$ethv_qds_platform" ]; then
+                    ethv_qds_driver="$(
+                        platform_device_driver_name "$ethv_qds_platform" \
+                            2>/dev/null || true
+                    )"
+                    [ -n "$ethv_qds_driver" ] || ethv_qds_driver="unbound"
+                fi
+
+                if [ "$ethv_qds_driver" = "pwrctrl-tc9563" ]; then
+                    QPS615_PWRCTRL_BOUND_COUNT=$((QPS615_PWRCTRL_BOUND_COUNT + 1))
+                else
+                    ethv_qds_reason="QPS615 DT node $ethv_qds_node requires pwrctrl-tc9563 but platform device ${ethv_qds_platform:-unavailable} is bound to $ethv_qds_driver"
+                    if [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+                        QPS615_PWRCTRL_FAILURE_REASON="$QPS615_PWRCTRL_FAILURE_REASON, $ethv_qds_reason"
+                    else
+                        QPS615_PWRCTRL_FAILURE_REASON="$ethv_qds_reason"
+                    fi
+                fi
+            fi
+        fi
+
+        printf 'dt-node\t%s\tcompatible=%s\tstatus=%s\tsupplies=%s/6\ti2c_parent=%s\tresx_gpios=%s\tplatform_device=%s\tplatform_driver=%s\n' \
+            "$ethv_qds_node" \
+            "${ethv_qds_compatible:-unavailable}" \
+            "$ethv_qds_status" \
+            "$ethv_qds_supply_count" \
+            "$ethv_qds_i2c" \
+            "$ethv_qds_resx" \
+            "$ethv_qds_platform" \
+            "$ethv_qds_driver" >>"$ethv_qds_evidence"
+        printf 'dt-node\t%s\tcompatible=%s\tstatus=%s\tsupplies=%s/6\ti2c_parent=%s\tresx_gpios=%s\tplatform_device=%s\tplatform_driver=%s\n' \
+            "$ethv_qds_node" \
+            "${ethv_qds_compatible:-unavailable}" \
+            "$ethv_qds_status" \
+            "$ethv_qds_supply_count" \
+            "$ethv_qds_i2c" \
+            "$ethv_qds_resx" \
+            "$ethv_qds_platform" \
+            "$ethv_qds_driver" >>"$ethv_qds_inventory"
+        log_info "[QPS615-DT] node=$ethv_qds_node compatible=${ethv_qds_compatible:-unavailable} status=$ethv_qds_status supplies=$ethv_qds_supply_count/6 i2c_parent=$ethv_qds_i2c resx_gpios=$ethv_qds_resx platform_device=$ethv_qds_platform platform_driver=$ethv_qds_driver"
+    done <"$ethv_qds_nodes"
+
+    printf 'dt-summary\tnodes=%s\tpwrctrl_expected=%s\tpwrctrl_bound=%s\tfailure=%s\n' \
+        "$QPS615_DT_NODE_COUNT" \
+        "$QPS615_PWRCTRL_EXPECTED_COUNT" \
+        "$QPS615_PWRCTRL_BOUND_COUNT" \
+        "${QPS615_PWRCTRL_FAILURE_REASON:-none}" >>"$ethv_qds_inventory"
+
+    export QPS615_DT_NODE_COUNT QPS615_PWRCTRL_EXPECTED_COUNT
+    export QPS615_PWRCTRL_BOUND_COUNT QPS615_PWRCTRL_FAILURE_REASON
+    [ -z "$QPS615_PWRCTRL_FAILURE_REASON" ]
+}
+
+# ethv_qps615_is_switch_root <resolved-pci-device-path>
+#   Identify an outermost 1179:0623 bridge by its sysfs ancestry. The caller
+#   has already verified this device's PCI ID. stdout: none. return: 0 for
+#   a root, 1 for a descendant bridge, 3 for invalid input. Side effects: none.
+ethv_qps615_is_switch_root() {
+    ethv_qsr_path="${1:-}"
+    case "$ethv_qsr_path" in
+        /*)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    ethv_qsr_parent="${ethv_qsr_path%/*}"
+    while [ -n "$ethv_qsr_parent" ] && [ "$ethv_qsr_parent" != "/" ]; do
+        ethv_qsr_vendor=$(ethv_read_first_line "$ethv_qsr_parent/vendor" 2>/dev/null || true)
+        ethv_qsr_device=$(ethv_read_first_line "$ethv_qsr_parent/device" 2>/dev/null || true)
+        if [ "$ethv_qsr_vendor" = "0x1179" ] && [ "$ethv_qsr_device" = "0x0623" ]; then
+            return 1
+        fi
+        ethv_qsr_parent="${ethv_qsr_parent%/*}"
+    done
+    return 0
+}
+
 # ethv_qps615_collect_runtime <result-dir> [pci-devices-root]
 #   Collect and validate the runtime QPS615/TC956x PCIe Ethernet topology.
-#   QPS615 applicability comes from the enumerated Toshiba 1179:0623 switch,
-#   not from an installed package or module alone. Exported QPS615_* values
-#   summarize the result for PCIe and Ethernet suite orchestration.
+#   Applicability comes from enabled pci1179,0623 runtime DT nodes or an
+#   enumerated Toshiba 1179:0623 switch, never an installed package or module
+#   alone. Exported QPS615_* values summarize the result for PCIe and Ethernet
+#   suite orchestration.
 #   return: 0 when applicable and healthy, 1 when declared hardware is broken,
 #   2 when QPS615 is not present, and 3 for invalid arguments.
 ethv_qps615_collect_runtime() {
@@ -277,6 +652,8 @@ ethv_qps615_collect_runtime() {
     : >"$ethv_qcr_switches" || return 1
 
     QPS615_SWITCH_COUNT=0
+    QPS615_BRIDGE_COUNT=0
+    export QPS615_BRIDGE_COUNT
     QPS615_DOWNSTREAM_COUNT=0
     QPS615_ETHERNET_DEVICE_COUNT=0
     QPS615_ETHERNET_DECLARED_COUNT=0
@@ -295,15 +672,34 @@ ethv_qps615_collect_runtime() {
     QPS615_PCI_DRIVER_PATH=""
     QPS615_PCI_DRIVER_STATE="absent"
     QPS615_PCI_AUTOPROBE="unknown"
+    QPS615_DT_NODE_COUNT=0
+    QPS615_PWRCTRL_EXPECTED_COUNT=0
+    QPS615_PWRCTRL_BOUND_COUNT=0
+    QPS615_PWRCTRL_FAILURE_REASON=""
     QPS615_TOPOLOGY_FAILURE_REASON=""
     QPS615_ETHERNET_FAILURE_REASON=""
     QPS615_ETHERNET_SKIP_REASON=""
+    QPS615_READINESS_SUMMARY=""
     QPS615_FAILURE_REASON=""
+
+    ethv_qps615_collect_dt_state \
+        "$ethv_qcr_result_dir" \
+        "$ethv_qcr_inventory" || true
 
     log_info "QPS615 validation: scanning PCI devices under $ethv_qcr_pci_root for switch 1179:0623"
 
     if [ ! -d "$ethv_qcr_pci_root" ]; then
-        log_info "QPS615 validation is not applicable because the PCI sysfs inventory is not exposed"
+        if [ "$QPS615_DT_NODE_COUNT" -gt 0 ]; then
+            QPS615_TOPOLOGY_FAILURE_REASON="$QPS615_DT_NODE_COUNT enabled QPS615 DT node(s) were found but PCI sysfs is not exposed at $ethv_qcr_pci_root"
+            QPS615_FAILURE_REASON="$QPS615_TOPOLOGY_FAILURE_REASON"
+            if [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+                QPS615_FAILURE_REASON="$QPS615_FAILURE_REASON, power-control failure: $QPS615_PWRCTRL_FAILURE_REASON"
+            fi
+            ethv_qcr_pci_missing_status=1
+        else
+            log_info "QPS615 validation is not applicable because the PCI sysfs inventory is not exposed and no enabled QPS615 DT node was found"
+            ethv_qcr_pci_missing_status=2
+        fi
         export QPS615_SWITCH_COUNT QPS615_DOWNSTREAM_COUNT QPS615_ETHERNET_DEVICE_COUNT
         export QPS615_ETHERNET_DECLARED_COUNT QPS615_DRIVER_DEVICE_COUNT
         export QPS615_DECLARED_DRIVER_DEVICE_COUNT QPS615_UNBOUND_ETHERNET_COUNT QPS615_NETDEV_COUNT
@@ -313,9 +709,12 @@ ethv_qps615_collect_runtime() {
         export QPS615_MODULE_PORT_BDFS QPS615_MODULE_PORT_CONFIG
         export QPS615_PCI_DRIVER_PATH QPS615_PCI_DRIVER_STATE
         export QPS615_PCI_AUTOPROBE
+        export QPS615_DT_NODE_COUNT QPS615_PWRCTRL_EXPECTED_COUNT
+        export QPS615_PWRCTRL_BOUND_COUNT QPS615_PWRCTRL_FAILURE_REASON
         export QPS615_TOPOLOGY_FAILURE_REASON QPS615_ETHERNET_FAILURE_REASON
-        export QPS615_ETHERNET_SKIP_REASON QPS615_FAILURE_REASON
-        return 2
+        export QPS615_ETHERNET_SKIP_REASON QPS615_READINESS_SUMMARY
+        export QPS615_FAILURE_REASON
+        return "$ethv_qcr_pci_missing_status"
     fi
 
     for ethv_qcr_device in "$ethv_qcr_pci_root"/*; do
@@ -326,10 +725,19 @@ ethv_qps615_collect_runtime() {
         if [ "$ethv_qcr_vendor" = "0x1179" ] && \
            [ "$ethv_qcr_id" = "0x0623" ]; then
             ethv_qcr_resolved="$(readlink -f "$ethv_qcr_device" 2>/dev/null || true)"
-            QPS615_SWITCH_COUNT=$((QPS615_SWITCH_COUNT + 1))
-            if [ -n "$ethv_qcr_resolved" ]; then
-                printf '%s\n' "$ethv_qcr_resolved" >>"$ethv_qcr_switches"
+            QPS615_BRIDGE_COUNT=$((QPS615_BRIDGE_COUNT + 1))
+            if [ -z "$ethv_qcr_resolved" ]; then
+                QPS615_TOPOLOGY_FAILURE_REASON="Cannot resolve QPS615 PCI sysfs path $ethv_qcr_device, rerun with readable PCI topology"
+                continue
             fi
+            printf 'bridge-function\t%s\t%s\t%s\t%s\n' \
+                "${ethv_qcr_device##*/}" \
+                "$ethv_qcr_vendor" \
+                "$ethv_qcr_id" \
+                "$ethv_qcr_resolved" >>"$ethv_qcr_inventory"
+            ethv_qps615_is_switch_root "$ethv_qcr_resolved" || continue
+            QPS615_SWITCH_COUNT=$((QPS615_SWITCH_COUNT + 1))
+            printf '%s\n' "$ethv_qcr_resolved" >>"$ethv_qcr_switches"
             printf 'switch\t%s\t%s\t%s\t%s\n' \
                 "${ethv_qcr_device##*/}" \
                 "$ethv_qcr_vendor" \
@@ -339,8 +747,21 @@ ethv_qps615_collect_runtime() {
         fi
     done
 
-    if [ "$QPS615_SWITCH_COUNT" -eq 0 ]; then
-        log_info "QPS615 validation is not applicable because switch 1179:0623 was not enumerated"
+    printf 'topology-summary\tswitches=%s\tbridge_functions=%s\n' \
+        "$QPS615_SWITCH_COUNT" "$QPS615_BRIDGE_COUNT" >>"$ethv_qcr_inventory"
+
+    if [ "$QPS615_SWITCH_COUNT" -eq 0 ] && [ "$QPS615_BRIDGE_COUNT" -eq 0 ]; then
+        if [ "$QPS615_DT_NODE_COUNT" -gt 0 ]; then
+            QPS615_TOPOLOGY_FAILURE_REASON="$QPS615_DT_NODE_COUNT enabled QPS615 DT node(s) were found but switch 1179:0623 was not enumerated"
+            QPS615_FAILURE_REASON="$QPS615_TOPOLOGY_FAILURE_REASON"
+            if [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+                QPS615_FAILURE_REASON="$QPS615_FAILURE_REASON, power-control failure: $QPS615_PWRCTRL_FAILURE_REASON"
+            fi
+            ethv_qcr_absent_status=1
+        else
+            log_info "QPS615 validation is not applicable because switch 1179:0623 was not enumerated and no enabled QPS615 DT node was found"
+            ethv_qcr_absent_status=2
+        fi
         export QPS615_SWITCH_COUNT QPS615_DOWNSTREAM_COUNT QPS615_ETHERNET_DEVICE_COUNT
         export QPS615_ETHERNET_DECLARED_COUNT QPS615_DRIVER_DEVICE_COUNT
         export QPS615_DECLARED_DRIVER_DEVICE_COUNT QPS615_UNBOUND_ETHERNET_COUNT QPS615_NETDEV_COUNT
@@ -350,9 +771,12 @@ ethv_qps615_collect_runtime() {
         export QPS615_MODULE_PORT_BDFS QPS615_MODULE_PORT_CONFIG
         export QPS615_PCI_DRIVER_PATH QPS615_PCI_DRIVER_STATE
         export QPS615_PCI_AUTOPROBE
+        export QPS615_DT_NODE_COUNT QPS615_PWRCTRL_EXPECTED_COUNT
+        export QPS615_PWRCTRL_BOUND_COUNT QPS615_PWRCTRL_FAILURE_REASON
         export QPS615_TOPOLOGY_FAILURE_REASON QPS615_ETHERNET_FAILURE_REASON
-        export QPS615_ETHERNET_SKIP_REASON QPS615_FAILURE_REASON
-        return 2
+        export QPS615_ETHERNET_SKIP_REASON QPS615_READINESS_SUMMARY
+        export QPS615_FAILURE_REASON
+        return "$ethv_qcr_absent_status"
     fi
 
     for ethv_qcr_device in "$ethv_qcr_pci_root"/*; do
@@ -524,10 +948,14 @@ ethv_qps615_collect_runtime() {
         log_warn "[QPS615-ETH] module=tc956x_pcie_eth was not found for the running kernel"
     fi
 
-    log_info "[QPS615] summary bridge_functions=$QPS615_SWITCH_COUNT downstream=$QPS615_DOWNSTREAM_COUNT ethernet_devices=$QPS615_ETHERNET_DEVICE_COUNT declared_ethernet_ports=$QPS615_ETHERNET_DECLARED_COUNT bound_ethernet_devices=$QPS615_DRIVER_DEVICE_COUNT bound_declared_ports=$QPS615_DECLARED_DRIVER_DEVICE_COUNT unbound_ethernet_devices=$QPS615_UNBOUND_ETHERNET_COUNT of_nodes=$QPS615_ETHERNET_OF_NODE_COUNT driver_overrides=$QPS615_ETHERNET_OVERRIDE_COUNT netdevs=$QPS615_NETDEV_COUNT declared_port_netdevs=$QPS615_DECLARED_NETDEV_COUNT artifact=$ethv_qcr_inventory"
+    log_info "[QPS615] summary switches=$QPS615_SWITCH_COUNT bridge_functions=$QPS615_BRIDGE_COUNT downstream=$QPS615_DOWNSTREAM_COUNT ethernet_devices=$QPS615_ETHERNET_DEVICE_COUNT declared_ethernet_ports=$QPS615_ETHERNET_DECLARED_COUNT bound_ethernet_devices=$QPS615_DRIVER_DEVICE_COUNT bound_declared_ports=$QPS615_DECLARED_DRIVER_DEVICE_COUNT unbound_ethernet_devices=$QPS615_UNBOUND_ETHERNET_COUNT of_nodes=$QPS615_ETHERNET_OF_NODE_COUNT driver_overrides=$QPS615_ETHERNET_OVERRIDE_COUNT netdevs=$QPS615_NETDEV_COUNT declared_port_netdevs=$QPS615_DECLARED_NETDEV_COUNT artifact=$ethv_qcr_inventory"
 
-    if [ "$QPS615_DOWNSTREAM_COUNT" -eq 0 ]; then
+    if [ -n "$QPS615_TOPOLOGY_FAILURE_REASON" ]; then
+        log_warn "$QPS615_TOPOLOGY_FAILURE_REASON"
+    elif [ "$QPS615_DOWNSTREAM_COUNT" -eq 0 ]; then
         QPS615_TOPOLOGY_FAILURE_REASON="QPS615 bridge is enumerated but exposes no downstream PCIe functions"
+    elif [ "$QPS615_DT_NODE_COUNT" -gt "$QPS615_SWITCH_COUNT" ]; then
+        QPS615_TOPOLOGY_FAILURE_REASON="$QPS615_DT_NODE_COUNT enabled QPS615 DT node(s) were found but only $QPS615_SWITCH_COUNT switch instance(s) enumerated"
     elif [ -z "$QPS615_FIRMWARE_PATH" ]; then
         QPS615_TOPOLOGY_FAILURE_REASON="required TC956X_Firmware_PCIeBridge.bin is not readable in a standard firmware root"
     fi
@@ -560,10 +988,29 @@ ethv_qps615_collect_runtime() {
         QPS615_ETHERNET_FAILURE_REASON="$QPS615_DRIVER_DEVICE_COUNT TC956x Ethernet function(s) are bound without an explicit runtime DT port declaration, but only $QPS615_NETDEV_COUNT netdev(s) are exposed"
     fi
 
+    QPS615_READINESS_SUMMARY="dt_nodes=$QPS615_DT_NODE_COUNT pwrctrl_expected=$QPS615_PWRCTRL_EXPECTED_COUNT pwrctrl_bound=$QPS615_PWRCTRL_BOUND_COUNT switches=$QPS615_SWITCH_COUNT ethernet_devices=$QPS615_ETHERNET_DEVICE_COUNT declared_ports=$QPS615_ETHERNET_DECLARED_COUNT bound_devices=$QPS615_DRIVER_DEVICE_COUNT bound_declared_ports=$QPS615_DECLARED_DRIVER_DEVICE_COUNT netdevs=$QPS615_NETDEV_COUNT module_state=$QPS615_MODULE_STATE pci_driver_state=$QPS615_PCI_DRIVER_STATE pci_autoprobe=$QPS615_PCI_AUTOPROBE"
+
     if [ -n "$QPS615_TOPOLOGY_FAILURE_REASON" ]; then
         QPS615_FAILURE_REASON="$QPS615_TOPOLOGY_FAILURE_REASON"
-    else
+        if [ -n "$QPS615_ETHERNET_FAILURE_REASON" ]; then
+            QPS615_FAILURE_REASON="$QPS615_FAILURE_REASON, Ethernet readiness failure: $QPS615_ETHERNET_FAILURE_REASON"
+        elif [ -n "$QPS615_ETHERNET_SKIP_REASON" ]; then
+            QPS615_FAILURE_REASON="$QPS615_FAILURE_REASON, Ethernet provisioning note: $QPS615_ETHERNET_SKIP_REASON"
+        fi
+    elif [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+        QPS615_FAILURE_REASON="$QPS615_PWRCTRL_FAILURE_REASON"
+    elif [ -n "$QPS615_ETHERNET_FAILURE_REASON" ]; then
         QPS615_FAILURE_REASON="$QPS615_ETHERNET_FAILURE_REASON"
+    fi
+
+    if [ -n "$QPS615_FAILURE_REASON" ] && \
+       [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ] && \
+       [ "$QPS615_FAILURE_REASON" != "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+        QPS615_FAILURE_REASON="$QPS615_FAILURE_REASON, power-control failure: $QPS615_PWRCTRL_FAILURE_REASON"
+    fi
+
+    if [ -n "$QPS615_FAILURE_REASON" ]; then
+        QPS615_FAILURE_REASON="$QPS615_FAILURE_REASON, $QPS615_READINESS_SUMMARY"
     fi
 
     export QPS615_SWITCH_COUNT QPS615_DOWNSTREAM_COUNT QPS615_ETHERNET_DEVICE_COUNT
@@ -575,10 +1022,74 @@ ethv_qps615_collect_runtime() {
     export QPS615_MODULE_PORT_BDFS QPS615_MODULE_PORT_CONFIG
     export QPS615_PCI_DRIVER_PATH QPS615_PCI_DRIVER_STATE
     export QPS615_PCI_AUTOPROBE
+    export QPS615_DT_NODE_COUNT QPS615_PWRCTRL_EXPECTED_COUNT
+    export QPS615_PWRCTRL_BOUND_COUNT QPS615_PWRCTRL_FAILURE_REASON
     export QPS615_TOPOLOGY_FAILURE_REASON QPS615_ETHERNET_FAILURE_REASON
-    export QPS615_ETHERNET_SKIP_REASON QPS615_FAILURE_REASON
+    export QPS615_ETHERNET_SKIP_REASON QPS615_READINESS_SUMMARY
+    export QPS615_FAILURE_REASON
 
     [ -z "$QPS615_FAILURE_REASON" ]
+}
+
+# ethv_qps615_list_netdevs <qps615-runtime-tsv>
+#   Read a QPS615 runtime TSV and print unique correlated netdev names.
+#   stdout: one netdev name per line in first-observed inventory order.
+#   return: 0 when the readable inventory is parsed, 1 when it is unavailable,
+#   or a nonzero awk status. Side effects: none.
+ethv_qps615_list_netdevs() {
+    ethv_qln_inventory="${1:-}"
+
+    [ -r "$ethv_qln_inventory" ] || return 1
+    awk -F '\t' '
+        $1 == "netdev" && $3 != "" && !seen[$3]++ {
+            print $3
+        }
+    ' "$ethv_qln_inventory"
+}
+
+# ethv_validate_qps615_traffic_config <fixture> <interfaces> <peer> <count> <wait>
+#   Validate QPS615 traffic policy before runtime discovery. Empty interface
+#   and peer values select dynamic discovery. stdout: none. return: 0 when
+#   valid, 1 otherwise, or 3 for missing arguments. Side effects: exports
+#   QPS615_CONFIG_ERROR with an actionable reason.
+ethv_validate_qps615_traffic_config() {
+    [ "$#" -ge 5 ] || return 3
+    ethv_vqtc_fixture="$1"
+    ethv_vqtc_interfaces="$2"
+    ethv_vqtc_peer="$3"
+    ethv_vqtc_count="$4"
+    ethv_vqtc_wait="$5"
+    QPS615_CONFIG_ERROR=""
+
+    if ! ethv_is_boolean "$ethv_vqtc_fixture"; then
+        QPS615_CONFIG_ERROR="fixture-must-be-0-or-1"
+    elif ! ethv_is_uint "$ethv_vqtc_count" ||
+         ! ethv_is_uint "$ethv_vqtc_wait"; then
+        QPS615_CONFIG_ERROR="ping-count-and-wait-must-be-unsigned-integers"
+    elif ! awk \
+        -v count="$ethv_vqtc_count" \
+        -v wait_seconds="$ethv_vqtc_wait" '
+            BEGIN {
+                exit !(count >= 1 && count <= 20 &&
+                       wait_seconds >= 1 && wait_seconds <= 5)
+            }
+        '; then
+        QPS615_CONFIG_ERROR="ping-count-or-wait-out-of-range"
+    elif [ -n "$ethv_vqtc_peer" ] &&
+         ! ethv_valid_unicast_ipv4 "$ethv_vqtc_peer"; then
+        QPS615_CONFIG_ERROR="peer-is-not-usable-unicast-ipv4"
+    else
+        case "$ethv_vqtc_interfaces" in
+            ""|all)
+                ;;
+            ,*|*,|*,,*|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:,-]*)
+                QPS615_CONFIG_ERROR="interface-list-is-malformed"
+                ;;
+        esac
+    fi
+
+    export QPS615_CONFIG_ERROR
+    [ -z "$QPS615_CONFIG_ERROR" ]
 }
 
 # ethv_get_driver <interface>
@@ -739,6 +1250,21 @@ ethv_valid_ipv4() {
             }
         }
     '
+}
+
+# ethv_valid_unicast_ipv4 <address>
+#   Validate one dotted-decimal IPv4 peer address suitable for unicast traffic.
+#   Rejects unspecified, link-local, loopback, multicast, and 240/4 addresses.
+#   stdout: none. return: 0 for a usable unicast peer, nonzero otherwise.
+#   Side effects: none.
+ethv_valid_unicast_ipv4() {
+    ethv_vui_addr="${1:-}"
+
+    ethv_valid_ipv4 "$ethv_vui_addr" || return 1
+    ethv_vui_first_octet=${ethv_vui_addr%%.*}
+    [ "$ethv_vui_first_octet" -ge 1 ] &&
+        [ "$ethv_vui_first_octet" -ne 127 ] &&
+        [ "$ethv_vui_first_octet" -lt 224 ]
 }
 
 # ethv_get_carrier <interface>
@@ -973,7 +1499,7 @@ ethv_select_ping_target() {
 
 # ethv_ping_interface <interface> <target> [count] [wait-seconds]
 #   Run ping with traffic explicitly bound to the requested interface.
-#   stdout/stderr: unmodified ping output.
+#   stdout/stderr: C-locale ping output for portable result parsing.
 #   return: ping command exit status.
 ethv_ping_interface() {
     ethv_pi_iface="${1:-}"
@@ -981,7 +1507,7 @@ ethv_ping_interface() {
     ethv_pi_count="${3:-4}"
     ethv_pi_wait="${4:-2}"
 
-    ping -I "$ethv_pi_iface" \
+    LC_ALL=C ping -I "$ethv_pi_iface" \
         -c "$ethv_pi_count" \
         -W "$ethv_pi_wait" \
         "$ethv_pi_target"
@@ -1005,6 +1531,48 @@ ethv_get_counter() {
     fi
 
     printf '%s\n' 0
+}
+
+# ethv_counter_available <interface> <statistics-counter>
+#   Verify that a standard network counter is readable and contains an
+#   unsigned decimal value. stdout: none. return: 0 when usable and 1 when the
+#   interface, counter, or value is unavailable. Side effects: none.
+ethv_counter_available() {
+    ethv_ca_iface="${1:-}"
+    ethv_ca_counter="${2:-}"
+    ethv_ca_file="/sys/class/net/$ethv_ca_iface/statistics/$ethv_ca_counter"
+
+    [ -n "$ethv_ca_iface" ] && [ -n "$ethv_ca_counter" ] || return 1
+    [ -r "$ethv_ca_file" ] || return 1
+    if ! ethv_ca_value=$(ethv_read_first_line "$ethv_ca_file" 2>/dev/null); then
+        return 1
+    fi
+    ethv_is_uint "$ethv_ca_value"
+}
+
+# ethv_counters_available <interface> <statistics-counter>...
+#   Verify a required set of standard network counters without emitting
+#   stdout. return: 0 when every counter is usable, 1 when any counter is
+#   unavailable, or 3 when no counter is supplied. Side effects: exports
+#   ETHV_COUNTER_FAILURE with the first unavailable counter name.
+ethv_counters_available() {
+    ETHV_COUNTER_FAILURE=""
+    export ETHV_COUNTER_FAILURE
+    [ "$#" -gt 0 ] || return 3
+    ethv_cas_iface="${1:-}"
+    shift
+
+    [ -n "$ethv_cas_iface" ] && [ "$#" -gt 0 ] || return 3
+    for ethv_cas_counter in "$@"; do
+        if ! ethv_counter_available "$ethv_cas_iface" "$ethv_cas_counter"; then
+            ETHV_COUNTER_FAILURE="$ethv_cas_counter"
+            export ETHV_COUNTER_FAILURE
+            return 1
+        fi
+    done
+
+    export ETHV_COUNTER_FAILURE
+    return 0
 }
 
 # ethv_counter_delta <before> <after>

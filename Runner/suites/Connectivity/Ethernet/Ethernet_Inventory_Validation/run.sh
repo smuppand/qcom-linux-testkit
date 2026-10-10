@@ -141,7 +141,21 @@ case "$qps615_status" in
                 "$RESULT_TABLE" \
                 "QPS615 PCIe topology and firmware" \
                 "PASS" \
-                "bridge_functions=$QPS615_SWITCH_COUNT downstream=$QPS615_DOWNSTREAM_COUNT firmware=$QPS615_FIRMWARE_PATH"
+                "switches=$QPS615_SWITCH_COUNT bridge_functions=$QPS615_BRIDGE_COUNT downstream=$QPS615_DOWNSTREAM_COUNT firmware=$QPS615_FIRMWARE_PATH"
+        fi
+
+        if [ -n "$QPS615_PWRCTRL_FAILURE_REASON" ]; then
+            ethv_record_result \
+                "$RESULT_TABLE" \
+                "QPS615 PCIe power-control binding" \
+                "FAIL" \
+                "$QPS615_PWRCTRL_FAILURE_REASON"
+        elif [ "$QPS615_PWRCTRL_EXPECTED_COUNT" -gt 0 ]; then
+            ethv_record_result \
+                "$RESULT_TABLE" \
+                "QPS615 PCIe power-control binding" \
+                "PASS" \
+                "$QPS615_PWRCTRL_BOUND_COUNT supply-backed DT node(s) are bound to pwrctrl-tc9563"
         fi
 
         if [ -n "$QPS615_ETHERNET_FAILURE_REASON" ]; then
