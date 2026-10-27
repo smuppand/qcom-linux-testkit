@@ -2,6 +2,11 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 
+# Keep test-owned artifacts under the invocation directory, not inherited TMPDIR.
+AUDIO_WORK_DIR="$(pwd -P)" || exit 1
+TMPDIR="$AUDIO_WORK_DIR"
+export TMPDIR
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ---- Source init_env & tools ----
@@ -92,6 +97,8 @@ export AUDIO_OVERLAY_REQUESTED
 
 # ---------------- Defaults / CLI ----------------
 AUDIO_BACKEND="${AUDIO_BACKEND:-}"
+EXPECTED_DT_COMPATIBLE=""
+DT_FIT_IMAGE=""
 if [ "${SRC_CHOICE+x}" = x ]; then
   AUDIO_CAPTURE_ROUTE_EXPLICIT=1
   AUDIO_CAPTURE_ROUTE_SOURCE="SRC_CHOICE environment"
@@ -143,12 +150,18 @@ usage() {
   cat <<EOF
 Usage: $0 [options]
   --backend {pipewire|pulseaudio|alsa}
+  --expected-dt-compatible TEXT  Require this exact active DT compatible
+  --fit-image PATH               Verify EFI selection using the supplied boot FIT
   --source {auto|mic|microphone|headset-mic|headset_mic|"headset mic"|null}
   --overlay              Prepare the Debian or CentOS Qualcomm AudioReach overlay
-                         Without this flag, use the native/base stack.
+                         Yocto uses image-provided components and device permissions.
+                         Selects PipeWire only, no base ALSA fallback.
+                         Without this flag, detect loaded AudioReach modules,
+                         otherwise use the native/base stack.
                          Ubuntu reports SKIP because AudioReach is not enabled.
   --config-name "record_config1" # Test specific config(s) by name (space-separated)
                                  # Also supports record_config1, record_config2, ..., record_config10
+                                 # Explicit mono DMIC case: record_48KHz_1ch
   --config-filter "48KHz" # Filter configs by pattern
   --res-suffix SUFFIX # Suffix for unique result file (e.g., "Config1")
                       # Generates AudioRecord_SUFFIX.res instead of AudioRecord.res
@@ -194,14 +207,23 @@ fi
 
 # Resolve root-owned result and log paths before privileged preparation.
 if [ -n "$RES_SUFFIX" ]; then
-  RES_FILE="$SCRIPT_DIR/${TESTNAME}_${RES_SUFFIX}.res"
-  LOGDIR="$SCRIPT_DIR/results/${TESTNAME}_${RES_SUFFIX}"
+  RES_FILE="$AUDIO_WORK_DIR/${TESTNAME}_${RES_SUFFIX}.res"
+  LOGDIR="$AUDIO_WORK_DIR/results/${TESTNAME}_${RES_SUFFIX}"
   log_info "Using unique result file: $RES_FILE"
   log_info "Using unique log directory: $LOGDIR"
 else
-  RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
-  LOGDIR="$SCRIPT_DIR/results/${TESTNAME}"
+  RES_FILE="$AUDIO_WORK_DIR/${TESTNAME}.res"
+  LOGDIR="$AUDIO_WORK_DIR/results/${TESTNAME}"
 fi
+
+if ! LOGDIR="$(audio_create_run_directory "$LOGDIR")"; then
+  log_fail "$TESTNAME FAIL - cannot create artifacts under CWD=$AUDIO_WORK_DIR"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+log_info "Run artifacts: $LOGDIR"
+TMPDIR="$LOGDIR"
+export TMPDIR
 
 # Package and udev preparation remain privileged. The complete runner stays
 # the root orchestrator on Debian and CentOS.
@@ -260,6 +282,21 @@ fi
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
+    --expected-dt-compatible|--fit-image)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        log_fail "$TESTNAME FAIL - $1 requires a value"
+        return 1
+      fi
+      case "$1" in
+        --expected-dt-compatible)
+          EXPECTED_DT_COMPATIBLE="$2"
+          ;;
+        --fit-image)
+          DT_FIT_IMAGE="$2"
+          ;;
+      esac
+      shift 2
+      ;;
     --overlay)
       AUDIO_OVERLAY_REQUESTED=1
       export AUDIO_OVERLAY_REQUESTED
@@ -360,7 +397,18 @@ parse_args() {
   done
 }
 
-parse_args "$@"
+if ! parse_args "$@"; then
+  test_result_init "$RESULT_TESTNAME" "$RES_FILE" || exit 1
+  test_result_record FAIL "$TESTNAME FAIL - invalid command line"
+  test_result_finish
+fi
+
+if ! audio_dt_fit_preflight "$LOGDIR/dt-fit-preflight" \
+    "$EXPECTED_DT_COMPATIBLE" "$DT_FIT_IMAGE"; then
+  test_result_init "$RESULT_TESTNAME" "$RES_FILE" || exit 1
+  test_result_record FAIL "$TESTNAME FAIL - DT/FIT preflight failed, inspect $LOGDIR/dt-fit-preflight"
+  test_result_finish
+fi
 
 SOURCE_REQUESTED="$SRC_CHOICE"
 SRC_CHOICE="$(
@@ -375,8 +423,16 @@ if [ "$SRC_CHOICE" = "auto" ]; then
 fi
 export SRC_CHOICE AUDIO_CAPTURE_ROUTE_EXPLICIT AUDIO_CAPTURE_ROUTE_SOURCE
 
+# Resolve the effective runtime independently of explicit package preparation.
+audio_detect_runtime_mode "$AUDIO_OVERLAY_REQUESTED"
+
 # Preserve an explicit backend request. Automatic fallback is only appropriate
 # when backend selection was left in auto mode.
+AUDIO_BACKEND="$(audio_backend_for_mode "$AUDIO_BACKEND" "$AUDIO_OVERLAY_ACTIVE")" || {
+  log_fail "$TESTNAME FAIL - AudioReach runtime requires --backend pipewire or automatic backend selection"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+}
 AUDIO_BACKEND_REQUESTED="$AUDIO_BACKEND"
 export AUDIO_BACKEND_REQUESTED
 
@@ -397,7 +453,7 @@ export AUDIO_RECORD_STRICT_SIGNAL
 # Explicit base ALSA capture needs group membership but no systemd user
 # manager. Overlay and managed backends require the user session.
 AUDIO_RECORD_USER_MANAGER_REQUIRED=1
-if [ "$AUDIO_OVERLAY_REQUESTED" -eq 0 ] &&
+if [ "$AUDIO_OVERLAY_ACTIVE" -eq 0 ] &&
    [ "$AUDIO_BACKEND" = "alsa" ]; then
   AUDIO_RECORD_USER_MANAGER_REQUIRED=0
 fi
@@ -492,42 +548,12 @@ if [ "$AUDIO_RECORD_DESKTOP_ROOT_MODE" -eq 1 ]; then
   log_pass "Prepared desktop Audio capture workspace: $AUDIO_RECORD_USER_CAPTURE_DIR"
 fi
 
-# Desktop overlay runtime preparation runs from the root orchestrator after
-# normal CLI parsing. Only its device and PipeWire probes execute as the
-# prepared regular user.
-if [ "$AUDIO_OVERLAY_REQUESTED" -eq 1 ]; then
-  if ! command -v audio_prepare_overlay_runtime >/dev/null 2>&1; then
-    log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_overlay_runtime"
-    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
-    exit 1
-  fi
-
-  audio_prepare_overlay_runtime "$AUDIO_OVERLAY_REQUESTED"
-  audio_runtime_rc=$?
-
-  case "$audio_runtime_rc" in
-    0)
-      ;;
-    2)
-      log_skip "$TESTNAME SKIP - AudioReach kernel package changed, reboot required"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
-      ;;
-    *)
-      log_fail "$TESTNAME FAIL - AudioReach runtime preparation failed"
-      echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
-      exit 1
-      ;;
-  esac
-elif [ "$SYSTEMD_AVAILABLE" -eq 1 ] &&
-     [ "$AUDIO_RECORD_DESKTOP_ROOT_MODE" -ne 1 ]; then
-  # Preserve the existing native/Yocto validation path. Desktop base mode uses
-  # command-level user probes during backend discovery instead.
-  if ! setup_overlay_audio_environment; then
-    log_warn "Existing overlay audio environment validation failed, continuing with backend recovery flow"
-  fi
-else
-  log_info "systemd not available, skipping legacy overlay environment check"
+# A requested package transition that needs reboot must not start the DSP.
+if [ "$AUDIO_OVERLAY_REQUESTED" -eq 1 ] &&
+   [ "${AUDIO_OVERLAY_REBOOT_REQUIRED:-0}" -eq 1 ]; then
+  test_result_init "$RESULT_TESTNAME" "$RES_FILE" || exit 1
+  test_result_record SKIP "$TESTNAME SKIP - AudioReach kernel package changed, reboot required"
+  test_result_finish
 fi
 
 # Start an image-provisioned audio remoteproc before backend and device
@@ -537,18 +563,37 @@ audio_remoteproc_rc=$?
 
 case "$audio_remoteproc_rc" in
   0)
+    if [ "$AUDIO_OVERLAY_ACTIVE" -eq 0 ] &&
+       [ "$SRC_CHOICE" != "null" ] &&
+       { [ -z "$AUDIO_BACKEND" ] || [ "$AUDIO_BACKEND" = "alsa" ]; } &&
+       ! audio_wait_for_alsa_registration capture; then
+      log_fail "$TESTNAME FAIL - ${AUDIO_REMOTE_PROC_REASON:-audio remoteproc prepared but ALSA capture registration is incomplete}, inspect the diagnostic artifacts and inventory above"
+      echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+      exit 1
+    fi
     ;;
   2)
     log_info "Audio remoteproc preflight not applicable: ${AUDIO_REMOTE_PROC_REASON:-no matching remoteproc}"
     ;;
   *)
-    log_skip "$TESTNAME SKIP - audio remoteproc preflight failed: ${AUDIO_REMOTE_PROC_REASON:-unknown remoteproc error}"
-    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-    exit 0
+    audio_collect_remoteproc_diagnostics "$LOGDIR/remoteproc-preflight" || true
+    log_fail "$TESTNAME FAIL - audio remoteproc preflight failed: ${AUDIO_REMOTE_PROC_REASON:-unknown remoteproc error}"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
     ;;
 esac
 
-# Minimal ramdisk detection and cleanup trap (kills any manually bootstrapped daemons)
+# Install cleanup before any overlay service reset, including early failures.
+trap 'audio_cleanup_runtime' EXIT
+trap 'exit 1' HUP INT TERM
+
+# Shared readiness checks clients before service preparation for both explicit
+# and runtime-detected overlays. Package opt-in remains separate.
+if [ "$AUDIO_OVERLAY_ACTIVE" -eq 1 ] &&
+   ! audio_validate_overlay_readiness capture "$SRC_CHOICE"; then
+  audio_discovery_finish capture "AudioReach overlay readiness failed after DSP preparation"
+fi
+
 if [ "$SYSTEMD_AVAILABLE" -eq 0 ]; then
   MINIMAL_RAMDISK_MODE=1
   export MINIMAL_RAMDISK_MODE
@@ -556,8 +601,6 @@ if [ "$SYSTEMD_AVAILABLE" -eq 0 ]; then
 else
   log_info "Detected standard userspace environment (systemd available)"
 fi
-
-trap 'audio_cleanup_started_daemons' EXIT HUP INT TERM
 
 # Ensure we run from the testcase dir
 test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
@@ -605,7 +648,7 @@ if [ -n "$CONFIG_NAMES" ] && [ -n "$CONFIG_FILTER" ]; then
   CONFIG_FILTER=""
 fi
 
-log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE overlay=$AUDIO_OVERLAY_REQUESTED loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT start_grace=${AUDIO_RECORD_START_GRACE:-5} strict=$STRICT signal_strict=$AUDIO_RECORD_STRICT_SIGNAL dmesg=$DMESG_SCAN bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
+log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE overlay=$AUDIO_OVERLAY_ACTIVE overlay_requested=$AUDIO_OVERLAY_REQUESTED loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT start_grace=${AUDIO_RECORD_START_GRACE:-5} strict=$STRICT signal_strict=$AUDIO_RECORD_STRICT_SIGNAL dmesg=$DMESG_SCAN bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
 log_info "AUDIO_ROUTE_DISCOVERY scope=record requested='$SOURCE_REQUESTED' request_source='$AUDIO_CAPTURE_ROUTE_SOURCE' explicit=$AUDIO_CAPTURE_ROUTE_EXPLICIT policy=$SRC_CHOICE automatic_order='mic headset-mic'"
 
 # Resolve backend (allow minimal-build ALSA capture fallback)
@@ -622,6 +665,9 @@ fi
 export AUDIO_SYSTEMD_MANAGED
 
 BACKENDS_TO_TRY="$(build_backend_chain 2>/dev/null || echo "")"
+if [ "$AUDIO_OVERLAY_ACTIVE" -eq 1 ]; then
+  BACKENDS_TO_TRY=pipewire
+fi
 log_info "Backend fallback chain: ${BACKENDS_TO_TRY:-unknown}"
 
 ALSA_CAPTURE_PROBED=0
@@ -650,9 +696,7 @@ if [ -z "$AUDIO_BACKEND" ]; then
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - no audio backend running and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
-      echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "no audio backend running and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
     fi
   fi
 fi
@@ -714,7 +758,8 @@ if [ "$backend_ok" -ne 1 ] && [ -z "$AUDIO_BACKEND_REQUESTED" ] &&
   fi
 fi
 
-if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
+if [ "$backend_ok" -ne 1 ] && [ -z "$AUDIO_BACKEND_REQUESTED" ] &&
+   [ "$AUDIO_BACKEND" != "alsa" ]; then
   if audio_record_probe_selected_alsa_capture_profile; then
     ALSA_CAPTURE_PROBED=1
     AUDIO_BACKEND="alsa"
@@ -738,9 +783,7 @@ if [ "$backend_ok" -ne 1 ]; then
     exit 1
   fi
 
-  log_skip "$TESTNAME SKIP - no applicable recording backend or ALSA capture path was discovered"
-  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-  exit 0
+  audio_discovery_finish capture "no applicable recording backend or ALSA capture path was discovered"
 fi
 
 # Package recovery above installs the complete client set for the selected
@@ -756,9 +799,7 @@ case "$AUDIO_BACKEND" in
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - automatic capture discovery requires image-provided wpctl and pw-record for the active PipeWire backend"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "automatic capture discovery requires image-provided wpctl and pw-record for the active PipeWire backend"
     fi
     ;;
   pulseaudio)
@@ -771,9 +812,7 @@ case "$AUDIO_BACKEND" in
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - automatic capture discovery requires image-provided pactl and parecord for the active PulseAudio backend"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "automatic capture discovery requires image-provided pactl and parecord for the active PulseAudio backend"
     fi
     ;;
   alsa)
@@ -785,15 +824,11 @@ case "$AUDIO_BACKEND" in
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - automatic ALSA capture discovery requires image-provided arecord"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "automatic ALSA capture discovery requires image-provided arecord"
     fi
     ;;
   *)
-    log_skip "$TESTNAME SKIP - unsupported backend: $AUDIO_BACKEND"
-    echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-    exit 0
+    audio_discovery_finish capture "unsupported backend: $AUDIO_BACKEND"
     ;;
 esac
 
@@ -819,13 +854,9 @@ if [ "$AUDIO_BACKEND" = "pipewire" ]; then
         log_warn "$TESTNAME: PipeWire control-plane is unavailable, using the validated direct ALSA capture route"
       elif [ "$AUDIO_CAPTURE_ROUTE_EXPLICIT" -eq 1 ] ||
            [ -n "$AUDIO_BACKEND_REQUESTED" ]; then
-        log_fail "$TESTNAME FAIL - requested source '$SOURCE_REQUESTED' cannot be validated because the PipeWire control-plane is unavailable and no matching direct ALSA route opened"
-        echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
-        exit 1
+        audio_discovery_finish capture "requested source '$SOURCE_REQUESTED' cannot be validated because the PipeWire control-plane is unavailable and no matching direct ALSA route opened"
       else
-        log_skip "$TESTNAME SKIP - PipeWire control-plane is unavailable and automatic ALSA capture discovery found no usable mic or headset-mic route"
-        echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-        exit 0
+        audio_discovery_finish capture "PipeWire control-plane is unavailable and automatic ALSA capture discovery found no usable mic or headset-mic route"
       fi
     fi
   fi
@@ -850,13 +881,9 @@ elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
         log_warn "$TESTNAME: PulseAudio control-plane is unavailable, using the validated direct ALSA capture route"
       elif [ "$AUDIO_CAPTURE_ROUTE_EXPLICIT" -eq 1 ] ||
            [ -n "$AUDIO_BACKEND_REQUESTED" ]; then
-        log_fail "$TESTNAME FAIL - requested source '$SOURCE_REQUESTED' cannot be validated because the PulseAudio control-plane is unavailable and no matching direct ALSA route opened"
-        echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
-        exit 1
+        audio_discovery_finish capture "requested source '$SOURCE_REQUESTED' cannot be validated because the PulseAudio control-plane is unavailable and no matching direct ALSA route opened"
       else
-        log_skip "$TESTNAME SKIP - PulseAudio control-plane is unavailable and automatic ALSA capture discovery found no usable mic or headset-mic route"
-        echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-        exit 0
+        audio_discovery_finish capture "PulseAudio control-plane is unavailable and automatic ALSA capture discovery found no usable mic or headset-mic route"
       fi
     fi
   fi
@@ -923,9 +950,7 @@ if [ -z "$SRC_ID" ] && [ -z "$AUDIO_BACKEND_REQUESTED" ] &&
       exit 1
     fi
 
-    log_skip "$TESTNAME SKIP - no real capture source available, PipeWire mic source missing and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
-    echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-    exit 0
+    audio_discovery_finish capture "no real capture source available, PipeWire mic source missing and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
   fi
 fi
 
@@ -1004,9 +1029,7 @@ if [ -z "$SRC_ID" ]; then
     exit 1
   fi
 
-  log_skip "$TESTNAME SKIP - automatic capture discovery found no usable mic or headset-mic route on any backend (${BACKENDS_TO_TRY:-unknown})"
-  echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-  exit 0
+  audio_discovery_finish capture "automatic capture discovery found no usable mic or headset-mic route on any backend (${BACKENDS_TO_TRY:-unknown})"
 fi
 
 # ---- Normalize ALSA device id (fix "hw:0 1," → "hw:0,1") ----
@@ -1044,9 +1067,7 @@ if [ "$AUDIO_BACKEND" = "alsa" ]; then
           exit 1
         fi
 
-        log_skip "$TESTNAME SKIP - no valid ALSA capture device found"
-        echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
-        exit 0
+        audio_discovery_finish capture "no valid ALSA capture device found"
       fi
       ;;
   esac
@@ -1081,7 +1102,7 @@ if [ "$AUDIO_BACKEND" = "pipewire" ]; then
       exit 1
     fi
     SRC_LABEL="$(audio_run_helper_as_test_user --require-session pw_source_label_safe "$SRC_ID")"
-    # The explicit pw-record target avoids changing the session's default input.
+    log_info "PipeWire capture will resolve and pin this route with --target on every attempt, session default is unchanged"
     [ -z "$SRC_LABEL" ] && SRC_LABEL="unknown"
     log_info "Routing to source: id/name=$SRC_ID label='$SRC_LABEL' choice=$SRC_CHOICE"
     log_info "AUDIO_RECORD_TARGET source_id='$SRC_ID' recorder_target='$PW_RECORD_TARGET'"
@@ -1123,9 +1144,7 @@ case "$AUDIO_BACKEND" in
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - selected PipeWire capture route cannot run because wpctl or pw-record is missing"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "selected PipeWire capture route cannot run because wpctl or pw-record is missing"
     fi
     ;;
   pulseaudio)
@@ -1138,9 +1157,7 @@ case "$AUDIO_BACKEND" in
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - selected PulseAudio capture route cannot run because pactl or parecord is missing"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "selected PulseAudio capture route cannot run because pactl or parecord is missing"
     fi
     ;;
   alsa)
@@ -1152,9 +1169,7 @@ case "$AUDIO_BACKEND" in
         exit 1
       fi
 
-      log_skip "$TESTNAME SKIP - selected ALSA capture route cannot run because arecord is missing"
-      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
-      exit 0
+      audio_discovery_finish capture "selected ALSA capture route cannot run because arecord is missing"
     fi
     ;;
 esac
@@ -1239,6 +1254,12 @@ audio_record_validate_final_output() {
 
   AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=FAIL reason=not-run"
   export AUDIO_WAV_VALIDATION_SUMMARY
+
+  if [ "${AUDIO_PIPEWIRE_CAPTURE_VOLUME_FAILED:-0}" -eq 1 ]; then
+    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=FAIL reason=capture-volume-setup-or-restoration-failed"
+    log_fail "Capture volume setup or restoration failed, inspect $logf.volume"
+    return 1
+  fi
 
   if audio_validate_recording_result \
       "$record_out" \
@@ -1364,12 +1385,8 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
       validation_channels="$channels"
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-        log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels --target \"$PW_RECORD_TARGET\" \"$record_user_out\""
-        audio_run_helper_as_test_user --require-session \
-          audio_record_with_progress \
-          "$record_user_out" "$secs" "$AUDIO_RECORD_START_GRACE" "$TIMEOUT" \
-          --pipewire-links \
-          pw-record -v --rate="$rate" --channels="$channels" --target "$PW_RECORD_TARGET" "$record_user_out" >> "$logf" 2>&1
+        audio_record_pipewire_capture "$TIMEOUT" "$SRC_CHOICE" "$record_user_out" "$logf" \
+          "$rate" "$channels" "$secs" "$AUDIO_RECORD_START_GRACE"
         rc=$?
         bytes="$(audio_record_capture_size)"
       else
@@ -1523,12 +1540,13 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
         asoc_ev=1
       fi
 
-      log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}'"
+      log_info "[$case_name] post-execution snapshot: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}' (inactive now does not invalidate a completed stream)"
 
       if [ "$recording_valid" -eq 1 ]; then
         log_pass "[$case_name] loop $i OK (rc=$rc, ${last_elapsed}s, bytes=$bytes, WAV payload validated)"
         ok_runs=$((ok_runs + 1))
       else
+        log_file_with_label AUDIO-RECORD-CLIENT "$logf" 40
         log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}, validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}') - see $logf"
         audio_record_failure_diagnostics "$logf" "$AUDIO_BACKEND" "$SRC_ID"
       fi
@@ -1538,7 +1556,8 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
     # Aggregate result for this config
     status="FAIL"
-    if [ "$ok_runs" -ge 1 ]; then
+    if [ "$ok_runs" -ge 1 ] &&
+       [ "${AUDIO_PIPEWIRE_CAPTURE_VOLUME_FAILED:-0}" -eq 0 ]; then
       status="PASS"
     fi
 
@@ -1613,12 +1632,8 @@ else
       validation_channels=0
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-        log_info "[$case_name] exec: pw-record -v --target \"$PW_RECORD_TARGET\" \"$record_user_out\""
-        audio_run_helper_as_test_user --require-session \
-          audio_record_with_progress \
-          "$record_user_out" "$secs" "$AUDIO_RECORD_START_GRACE" "$TIMEOUT" \
-          --pipewire-links \
-          pw-record -v --target "$PW_RECORD_TARGET" "$record_user_out" >> "$logf" 2>&1
+        audio_record_pipewire_capture "$TIMEOUT" "$SRC_CHOICE" "$record_user_out" "$logf" \
+          "" "" "$secs" "$AUDIO_RECORD_START_GRACE"
         rc=$?
         bytes="$(audio_record_capture_size)"
       else
@@ -1756,12 +1771,13 @@ else
         asoc_ev=1
       fi
 
-      log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}'"
+      log_info "[$case_name] post-execution snapshot: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}' (inactive now does not invalidate a completed stream)"
 
       if [ "$recording_valid" -eq 1 ]; then
         log_pass "[$case_name] loop $i OK (rc=$rc, ${last_elapsed}s, bytes=$bytes, WAV payload validated)"
         ok_runs=$((ok_runs + 1))
       else
+        log_file_with_label AUDIO-RECORD-CLIENT "$logf" 40
         log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}, validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}') - see $logf"
         audio_record_failure_diagnostics "$logf" "$AUDIO_BACKEND" "$SRC_ID"
       fi
@@ -1771,7 +1787,8 @@ else
 
     # Aggregate result for this duration
     status="FAIL"
-    if [ "$ok_runs" -ge 1 ]; then
+    if [ "$ok_runs" -ge 1 ] &&
+       [ "${AUDIO_PIPEWIRE_CAPTURE_VOLUME_FAILED:-0}" -eq 0 ]; then
       status="PASS"
     fi
 
@@ -1798,6 +1815,9 @@ fi
 # Collect evidence once at end
 if [ "$DMESG_SCAN" -eq 1 ]; then
   scan_audio_dmesg "$LOGDIR"
+  if ! audio_remoteproc_report_health "$LOGDIR"; then
+    suite_rc=1
+  fi
   audio_record_dump_mixers "$LOGDIR/mixer_dump.txt"
 fi
 
