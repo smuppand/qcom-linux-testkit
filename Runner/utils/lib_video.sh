@@ -1426,6 +1426,35 @@ video_extract_input_clips() {
 # -----------------------------------------------------------------------------
 # Network-aware clip ensure/fetch
 # -----------------------------------------------------------------------------
+# video_ensure_archive_extractor <url-or-path>
+# Check tar and, for gzip bundles, gzip support before local or remote extraction.
+# Keep diagnostics in LOG_DIR or CWD. Return 0 ready, 1 preparation failed.
+video_ensure_archive_extractor() (
+    veae_dir="${LOG_DIR:-$PWD}"
+    if ! mkdir -p "$veae_dir"; then
+        log_error "Cannot create video asset artifact directory: $veae_dir"
+        return 1
+    fi
+    veae_path="${1%%\?*}"
+    case "$veae_path" in
+        *.gz|*.tgz)
+            veae_mode=gzip
+            ;;
+        *)
+            veae_mode=tar
+            ;;
+    esac
+    ensure_tar_extractor "$veae_dir" video-extract "$veae_mode"
+)
+
+# video_fetch_clip_bundle <url>
+# Ensure tools before the shared early or per-test fetch, preserving status 0/1/2.
+# No driver, firmware or stack changes. Preparation failure returns 1.
+video_fetch_clip_bundle() (
+    video_ensure_archive_extractor "$1" || return 1
+    extract_tar_from_url "$1"
+)
+
 video_ensure_clips_present_or_fetch() {
     cfg="$1"
     tu="$2"
@@ -1482,7 +1511,7 @@ video_ensure_clips_present_or_fetch() {
 
     if [ -n "$tu" ]; then
         log_info "Attempting fetch via TAR_URL=$tu"
-        extract_tar_from_url "$tu"
+        video_fetch_clip_bundle "$tu"
         video_fetch_rc=$?
         rm -f "$tmp_list" 2>/dev/null || true
 
