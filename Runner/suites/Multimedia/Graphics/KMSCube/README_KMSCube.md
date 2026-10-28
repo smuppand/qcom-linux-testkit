@@ -23,6 +23,31 @@ Ensure the following components are present in the target image:
 - Weston should be killed while running KMSCube Test
 - Write access to root filesystem (for environment setup)
 
+On every supported OS, `kmscube` must already be executable in `PATH`.
+After argument and platform-applicability checks, the runner checks this
+prerequisite before graphics package preparation, GPU boot-policy changes or
+stopping the display runtime. If it is absent, the result is SKIP, with no
+attempt to install `kmscube` or run a rendering test. This avoids reporting a
+package-installation FAIL followed by a testcase SKIP. Provision the binary in
+the image, or add its existing installation directory to `PATH`, then rerun:
+
+```sh
+command -v kmscube
+./run.sh --overlay --timeout 60
+```
+
+For an existing installation outside `PATH` (replace the example directory):
+
+```sh
+PATH="/opt/graphics/bin:$PATH" ./run.sh --overlay --timeout 60
+```
+
+Use `--base` for an intentionally selected Mesa stack or `--auto` to preserve
+the active stack. Neither mode bypasses the application prerequisite. The
+existing finite-frame and continuous-run validation remains unchanged when
+the application is present. The graphics-stack and `modetest` preparation
+policies below are separate from the image-provided `kmscube` requirement.
+
 Yocto uses image-provided components. On Debian, Ubuntu, RHEL, and Fedora, a
 missing `modetest` command is recovered through the shared package provider
 before display detection. CentOS currently has no verified package providing
@@ -134,6 +159,8 @@ sh-5.2#
 - Output markers are retained in `KMSCube_failure_markers.log` and the complete
   command output remains in `KMSCube_run.log`.
 - Capability-probe output is retained in `KMSCube_capabilities.log`.
+- Temporary display-manager state is kept in the testcase working directory
+  and removed after restoration, not stored under `/tmp`.
 
 ## CentOS Stream 10 base preparation
 
@@ -162,10 +189,10 @@ validates the Qualcomm GBM backend before running KMSCube. Yocto execution
 continues to use image-provided components.
 
 `modetest` remains optional on CentOS because no verified `libdrm-tests`
-package is available there. When `kmscube` is absent, the suite requests the
-`kmscube` RPM from the configured CentOS repositories. If those repositories
-do not publish the package, the suite reports an actionable SKIP asking for
-the package to be published or provisioned in the image.
+package is available there. Missing `kmscube` is reported by the early
+image-prerequisite check, without querying or installing an unverified RPM.
+An installed Adreno/GBM stack or passing Weston EGL test does not supply the
+`kmscube` application and does not establish KMSCube rendering success.
 
 When the requested GPU stack has been installed but the running kernel still
 uses the opposite `msm.skip_gpu` policy, the suite reports SKIP with a reboot
