@@ -1567,6 +1567,74 @@ wait_for_time_sync() {
     return 1
 }
 
+# ensure_tar_extractor <artifact-directory> <package-set> [gzip|tar]
+# Probe tar support, optionally gzip, without requiring an external gzip binary.
+# Recover the complete caller-selected set through the provider only if needed.
+# Artifacts remain in the caller's CWD workspace. Log diagnostics, return 0 ready
+# or 1 unavailable. Package policy and permissions remain owned by the provider.
+ensure_tar_extractor() (
+    egte_dir="$1"
+    egte_set="$2"
+    egte_mode="${3:-gzip}"
+    if [ -z "$egte_dir" ] || [ ! -d "$egte_dir" ] || [ ! -w "$egte_dir" ] ||
+       [ -z "$egte_set" ]; then
+        log_error "Archive extraction requires a writable artifact directory and a package set"
+        return 1
+    fi
+    egte_probe="$(mktemp "$egte_dir/archive-extract-probe.XXXXXX")" || return 1
+    egte_log="$egte_probe.log"
+    trap 'rm -f "$egte_probe"' EXIT
+
+    case "$egte_mode" in
+        gzip)
+            # Gzip-compressed 1024 zero bytes, two end-of-archive tar blocks.
+            printf '\037\213\010\000\000\000\000\000\002\377\143\140\030\005\243\140\024\214\124\000\000\056\257\265\357\000\004\000\000' >"$egte_probe" || return 1
+            egte_flags=-tzf
+            ;;
+        tar)
+            # Other archive formats must not gain an external gzip requirement.
+            printf '%1024s' '' | tr ' ' '\000' >"$egte_probe" || return 1
+            egte_flags=-tf
+            ;;
+        *)
+            log_error "Unsupported archive capability probe: $egte_mode"
+            return 1
+            ;;
+    esac
+    for egte_phase in initial recovered; do
+        if command -v tar >/dev/null 2>&1; then
+            if run_with_managed_timeout 10 "$egte_dir" archive-extract \
+                tar "$egte_flags" "$egte_probe" >"$egte_log" 2>&1; then
+                log_info "Archive extraction tools are ready"
+                return 0
+            fi
+        else
+            printf '%s\n' 'tar: command not found' >"$egte_log"
+        fi
+        log_warn "Archive extraction capability is unavailable, diagnostics: $egte_log"
+        log_file_with_label ARCHIVE-EXTRACT-TOOLS "$egte_log" 20
+        if [ "$egte_phase" = recovered ]; then
+            break
+        fi
+        if ! command -v pkg_ensure_host_distro_package_set_present >/dev/null 2>&1; then
+            break
+        fi
+        log_info "Checking mapped $egte_set package recovery before fetching clips"
+        egte_rc=0
+        pkg_ensure_host_distro_package_set_present "$egte_set" || egte_rc=$?
+        if [ "$egte_rc" -ne 0 ]; then
+            if [ "$egte_rc" -eq 2 ]; then
+                log_warn "This OS uses image-provided archive extraction tools"
+            else
+                log_error "Archive extraction package recovery failed or is disabled"
+            fi
+            break
+        fi
+    done
+    log_error "Clips require working $egte_mode archive extraction, provision tar and any required compression support. Diagnostics: $egte_log"
+    return 1
+)
+
 # If the tar file already exists,then function exit. Otherwise function to check the network connectivity and it will download tar from internet.
 extract_tar_from_url() {
     url="$1"
@@ -4331,11 +4399,12 @@ dt_profile_id() {
 ###############################################################################
 # dt_list_enabled_property_nodes <dt-root> <property>
 # Prints enabled DT node directories that expose the exact property name.
+# Return 0 for matches, 1 for none, 2 for discovery errors, 3 for invalid input.
+# Discovery uses no temporary files and does not depend on TMPDIR.
 ###############################################################################
 dt_list_enabled_property_nodes() {
     dtlep_root="$1"
     dtlep_property="$2"
-    dtlep_file=""
     [ -d "$dtlep_root" ] && [ -n "$dtlep_property" ] || return 3
 
     if [ -r "${DT_PROPERTY_INDEX:-}" ]; then
@@ -4343,22 +4412,20 @@ dt_list_enabled_property_nodes() {
         return $?
     fi
 
-    dtlep_file=$(mktemp "${TMPDIR:-/tmp}/dt-property.XXXXXX") || return 1
-    find "$dtlep_root" -type f -name "$dtlep_property" 2>/dev/null |
-    while IFS= read -r dtlep_property_file; do
-        dtlep_node=$(dirname "$dtlep_property_file")
-        dt_node_enabled "$dtlep_node" || continue
-        printf '%s\n' "$dtlep_node" >>"$dtlep_file"
-    done
-
-    if [ -s "$dtlep_file" ]; then
-        sort -u "$dtlep_file"
-        rm -f "$dtlep_file"
-        return 0
-    fi
-
-    rm -f "$dtlep_file"
-    return 1
+    dtlep_root=$(CDPATH='' cd "$dtlep_root" && pwd -P) || return 2
+    dtlep_files=$(find "$dtlep_root" -type f -name "$dtlep_property") || return 2
+    dtlep_nodes=$(
+        while IFS= read -r dtlep_property_file; do
+            [ -n "$dtlep_property_file" ] || continue
+            dtlep_node=${dtlep_property_file%/*}
+            dt_node_enabled "$dtlep_node" || continue
+            printf '%s\n' "$dtlep_node"
+        done <<EOF
+$dtlep_files
+EOF
+    ) || return 2
+    [ -n "$dtlep_nodes" ] || return 1
+    printf '%s\n' "$dtlep_nodes" | sort -u || return 2
 }
 
 ###############################################################################
