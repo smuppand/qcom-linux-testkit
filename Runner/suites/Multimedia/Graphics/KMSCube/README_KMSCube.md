@@ -135,6 +135,18 @@ sh-5.2#
   command output remains in `KMSCube_run.log`.
 - Capability-probe output is retained in `KMSCube_capabilities.log`.
 
+## CentOS Stream 10 base preparation
+
+`./run.sh --base` (also the CentOS default) uses the shared `graphics-base`
+mapping: `mesa-libEGL mesa-dri-drivers mesa-libgbm libglvnd-egl libglvnd-gles`.
+The mapping is checked before overlay package removal or KGSL boot cleanup.
+An unavailable mapping reports FAIL without performing those operations.
+The existing package provider verifies the complete set and recovers missing
+packages from the configured repositories. Recovery failure reports FAIL.
+If overlay removal or boot cleanup changes the system, reboot and rerun after
+the reported SKIP. Rendering is validated only when the base runtime is ready.
+Yocto continues to use image-provided components.
+
 ## CentOS Stream 10 overlay preparation
 
 An explicit `./run.sh --overlay` request uses the shared package provider to
