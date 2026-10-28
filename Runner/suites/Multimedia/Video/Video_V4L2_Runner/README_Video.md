@@ -112,6 +112,29 @@ Runner/
 
 ## Quick Start
 
+On LRH/CentOS, early bundle downloads, per-test missing-clip fetches and local
+`--clips-tar` extraction first check tar support, including gzip for gzip bundles.
+If it is unavailable, the shared package provider
+recovers the complete `video-extract` set, `tar gzip`, and checks it again before
+fetching. Provider permissions and installation policy still apply. Existing
+working extractors are reused without package work. Debian, Ubuntu, RHEL and
+Yocto retain their image-provided extractor policy, including tar implementations
+with built-in gzip support. Probe diagnostics are retained under the run's
+artifact directory and printed on failure. Preparation failure preserves the
+existing online fetch-failure result, it does not become a codec failure.
+
+```sh
+./run.sh --config overlay_vp9Decoder.json --extract-input-clips true
+./run.sh --config overlay_vp9Decoder.json --clips-tar /path/to/video_clips_iris.tar.gz
+```
+
+When the configured clips are already present, per-test asset recovery is
+bypassed. `--extract-input-clips false` retains the existing no-fetch behavior.
+Local `--clips-tar` remains an explicit extraction request even with automatic
+fetching disabled. Non-gzip tar formats retain their existing compression-tool
+requirements, ZIP handling is unchanged. No driver or base/overlay stack policy
+is changed by extractor preparation.
+
 ```bash
 git clone <this-repo>
 cd <this-repo>

@@ -422,10 +422,11 @@ if [ -n "$CLIPS_TAR" ]; then
     video_step "" "Extract custom clips tar → $clips_dest_resolved"
     case "$CLIPS_TAR" in
         *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.zst|*.tar.bz2|*.tbz2)
-            if command -v tar >/dev/null 2>&1; then
-                tar -xf "$CLIPS_TAR" -C "$clips_dest_resolved" 2>/dev/null || true
+            if video_ensure_archive_extractor "$CLIPS_TAR"; then
+                tar -xf "$CLIPS_TAR" -C "$clips_dest_resolved" ||
+                    log_warn "Failed to extract --clips-tar $CLIPS_TAR"
             else
-                log_warn "tar not available; cannot extract --clips-tar"
+                log_warn "Archive tools unavailable, cannot extract --clips-tar $CLIPS_TAR"
             fi
             ;;
         *.zip)
@@ -524,11 +525,11 @@ if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
                         if [ "$early_network_rc" -eq 2 ]; then
                             log_info "Generic reachability is inconclusive, trying the configured media endpoint"
                         fi
-                        extract_tar_from_url "$TAR_URL" || true
+                        video_fetch_clip_bundle "$TAR_URL" || true
                         ;;
                 esac
             else
-                extract_tar_from_url "$TAR_URL" || true
+                video_fetch_clip_bundle "$TAR_URL" || true
             fi
 
             LOG_DIR="$saved_log_dir"
